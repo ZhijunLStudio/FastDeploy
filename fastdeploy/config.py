@@ -134,6 +134,20 @@ class ModelConfig:
         self.lm_head_fp32: bool = False
         self.model_format = "auto"
         self.partial_rotary_factor: float = 1.0
+        
+        self.attn_type_list: list = []
+        self.layernorm_full_attention_alpha: float = 1.0
+        self.layernorm_full_attention_beta: float = 1.0
+        self.layernorm_linear_attention_alpha: float = 1.0
+        self.layernorm_linear_attention_beta: float = 1.0
+        self.layernorm_mlp_alpha: float = 1.0
+        self.layernorm_mlp_beta: float = 1.0
+        self.postnorm: bool = False
+        self.num_experts_per_tok: int = 1
+        self.n_routed_experts: int = 1
+        self.shared_moe_mode: str = "sigmoid"
+        self.shared_intermediate_size: int = 0
+        
         for key, value in args.items():
             if hasattr(self, key) and value != "None":
                 setattr(self, key, value)
