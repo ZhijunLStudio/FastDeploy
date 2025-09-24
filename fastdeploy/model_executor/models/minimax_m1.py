@@ -29,6 +29,7 @@ from fastdeploy.model_executor.models.model_base import (ModelForCasualLM,
                                                           ModelRegistry)
 from fastdeploy.model_executor.utils import (default_weight_loader,
                                                process_weights_after_loading)
+# 导入经过验证的 Triton 算子
 from fastdeploy.model_executor.ops.triton_ops.minimax_mamba_ops import (
     lightning_attention_fd,
     linear_decode_forward_triton_fd,
@@ -50,8 +51,7 @@ class MiniMaxM1MLP(nn.Layer):
             prefix=f"{prefix}.up_gate_proj",
             input_size=config.hidden_size,
             output_size=intermediate_size * 2,
-            with_bias=False,
-            weight_key="w13" # 只是一个占位符，实际加载由 load_weights 控制
+            with_bias=False
         )
         self.down_proj = RowParallelLinear(
             fd_config,
@@ -59,8 +59,7 @@ class MiniMaxM1MLP(nn.Layer):
             input_size=intermediate_size,
             output_size=config.hidden_size,
             with_bias=False,
-            reduce_results=reduce_results,
-            weight_key="w2.weight"
+            reduce_results=reduce_results
         )
         self.act_fn = SiluAndMul()
 
@@ -85,10 +84,12 @@ class MiniMaxM1MoEBlock(nn.Layer):
             weight_dtype="float32",
         )
         
+        # 定义专家权重在 HuggingFace checkpoint 中的名字格式
         weight_key_map = {
-            "gate_proj_expert_weight_key": "w1.weight",
-            "up_proj_expert_weight_key": "w3.weight",
-            "down_proj_expert_weight_key": "w2.weight",
+            # FastDeploy FusedMoE 内部会将 w1 和 w3 映射到 up_gate_proj
+            "gate_proj_expert_weight_key": "experts.{{}}.w1.weight",
+            "up_proj_expert_weight_key": "experts.{{}}.w3.weight",
+            "down_proj_expert_weight_key": "experts.{{}}.w2.weight",
         }
 
         self.experts = FusedMoE(
@@ -108,7 +109,7 @@ class MiniMaxM1StandardAttention(nn.Layer):
     """标准注意力 (GQA + Partial RoPE)。"""
     def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str = ""):
         super().__init__()
-        self.qkv_proj = QKVParallelLinear(fd_config, prefix=f"{prefix}.qkv_proj", with_bias=False)
+        self.qkv_proj = QKVParallelLinear(fd_config, prefix=f"{prefix}", with_bias=False)
         self.o_proj = RowParallelLinear(
             fd_config, prefix=f"{prefix}.o_proj",
             input_size=fd_config.model_config.num_attention_heads * fd_config.model_config.head_dim,
@@ -136,16 +137,13 @@ class MiniMaxM1LinearAttention(nn.Layer):
         
         self.qkv_proj = RowParallelLinear(
             fd_config, prefix=f"{prefix}.qkv_proj",
-            input_size=config.hidden_size,
-            output_size=hidden_inner_size * 3, with_bias=False)
+            input_size=config.hidden_size, output_size=hidden_inner_size * 3, with_bias=False)
         self.output_gate = RowParallelLinear(
             fd_config, prefix=f"{prefix}.output_gate",
-            input_size=config.hidden_size,
-            output_size=hidden_inner_size, with_bias=False)
+            input_size=config.hidden_size, output_size=hidden_inner_size, with_bias=False)
         self.out_proj = RowParallelLinear(
             fd_config, prefix=f"{prefix}.out_proj",
-            input_size=hidden_inner_size,
-            output_size=config.hidden_size, with_bias=False)
+            input_size=hidden_inner_size, output_size=config.hidden_size, with_bias=False)
         self.norm = RMSNorm(fd_config, hidden_size=hidden_inner_size, eps=1e-5, prefix=f"{prefix}.norm")
 
         slope_rate = self._build_slope_tensor(config.num_attention_heads)
@@ -155,19 +153,17 @@ class MiniMaxM1LinearAttention(nn.Layer):
 
     @staticmethod
     def _build_slope_tensor(n_attention_heads: int):
+        # ... (此函数保持不变)
         def get_slopes(n):
             def get_slopes_power_of_2(n):
                 start = 2**(-(2**-(math.log2(n) - 3)))
                 ratio = start
                 return [start * ratio**i for i in range(n)]
-            if math.log2(n).is_integer():
-                return get_slopes_power_of_2(n)
+            if math.log2(n).is_integer(): return get_slopes_power_of_2(n)
             else:
                 closest_power_of_2 = 2**math.floor(math.log2(n))
-                return (get_slopes_power_of_2(closest_power_of_2) + get_slopes(
-                    2 * closest_power_of_2)[0::2][:n - closest_power_of_2])
-        slopes = paddle.to_tensor(get_slopes(n_attention_heads), dtype='float32').reshape(
-            [n_attention_heads, 1, 1])
+                return (get_slopes_power_of_2(closest_power_of_2) + get_slopes(2 * closest_power_of_2)[0::2][:n - closest_power_of_2])
+        slopes = paddle.to_tensor(get_slopes(n_attention_heads), dtype='float32').reshape([n_attention_heads, 1, 1])
         return slopes
 
     def forward(self, forward_meta: ForwardMeta, hidden_states: paddle.Tensor):
@@ -188,9 +184,7 @@ class MiniMaxM1LinearAttention(nn.Layer):
             k = k.reshape([B, N, H, D]).transpose([0, 2, 1, 3])
             v = v.reshape([B, N, H, D]).transpose([0, 2, 1, 3])
             kv_history = forward_meta.caches[self.layer_id][0]
-            attn_hidden, updated_kv_history = lightning_attention_fd(
-                q, k, v, self.slope_rate, kv_history=kv_history
-            )
+            attn_hidden, updated_kv_history = lightning_attention_fd(q, k, v, self.slope_rate, kv_history=kv_history)
             forward_meta.caches[self.layer_id][0] = updated_kv_history
             attn_hidden = attn_hidden.transpose([0, 2, 1, 3]).reshape([num_tokens, H * D])
         elif forward_meta.forward_mode.is_decode():
@@ -200,9 +194,7 @@ class MiniMaxM1LinearAttention(nn.Layer):
             v = v.reshape([B, H, 1, D])
             kv_caches = forward_meta.caches[self.layer_id][0]
             slot_idx = forward_meta.block_tables[:, 0].squeeze(-1)
-            attn_hidden = linear_decode_forward_triton_fd(
-                q, k, v, kv_caches, self.slope_rate.squeeze(), slot_idx
-            )
+            attn_hidden = linear_decode_forward_triton_fd(q, k, v, kv_caches, self.slope_rate.squeeze(), slot_idx)
         else:
             raise NotImplementedError("Mixed mode is not supported for Linear Attention yet.")
             
@@ -213,7 +205,6 @@ class MiniMaxM1LinearAttention(nn.Layer):
         return output
 
 class MiniMaxM1DecoderLayer(nn.Layer):
-    """核心解码器层，动态选择注意力类型并应用 DeepNorm。"""
     def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str = ""):
         super().__init__()
         config = fd_config.model_config
@@ -233,6 +224,7 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         else:
             raise ValueError(f"Unknown attention type for layer {layer_id}: {attn_type}")
 
+        # MoE 块的前缀现在与 vLLM 和 HF checkpoint 对齐
         self.mlp = MiniMaxM1MoEBlock(fd_config, layer_id, prefix=f"{prefix}.block_sparse_moe")
         
         self.shared_moe = config.shared_intermediate_size > 0
@@ -260,8 +252,29 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         hidden_states = (residual * self.layernorm_attention_alpha) + (attn_output * self.layernorm_attention_beta)
 
         residual = hidden_states
+        layernorm_output = self.post_attention_layernorm(hidden_states)
         
+        moe_output = self.mlp(layernorm_output)
+        
+        if self.shared_moe:
+            shared_mlp_output = self.shared_mlp(layernorm_output)
+            coef = self.coefficient(layernorm_output.cast("float32"))
+            coef = F.sigmoid(coef)
+            mlp_output = (moe_output.cast("float32") * (1 - coef) + 
+                          shared_mlp_output.cast("float32") * coef).cast(hidden_states.dtype)
+        else:
+            mlp_output = moe_output
+
+        hidden_states = (residual * self.layernorm_mlp_alpha) + (mlp_output * self.layernorm_mlp_beta)
+        
+        return hidden_states, None
+
+@support_graph_optimization
+class MiniMaxM1Model(nn.Layer):
+    def __init__(self, fd_config: FDConfig):
         super().__init__()
+        # 将 fd_config 保存为实例属性，以便子模块可以访问
+        self.fd_config = fd_config
         self.config = fd_config.model_config
         prefix = "model"
         self.embed_tokens = VocabParallelEmbedding(fd_config, prefix=f"{prefix}.embed_tokens")
@@ -286,6 +299,7 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
         config = self.fd_config.model_config
         if hasattr(config, "rotary_dim") and hasattr(config, "head_dim") and config.rotary_dim < config.head_dim:
             config.partial_rotary_factor = config.rotary_dim / config.head_dim
+        
         self.model = MiniMaxM1Model(fd_config)
         self.lm_head = ParallelLMHead(fd_config, prefix="lm_head")
 
@@ -306,18 +320,15 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
             ("up_gate_proj", "w1", "gate"), ("up_gate_proj", "w3", "up"),
             ("shared_mlp.up_gate_proj", "shared_mlp.w1", "gate"),
             ("shared_mlp.up_gate_proj", "shared_mlp.w3", "up"),
-            ("embed_tokens.embeddings", "embed_tokens", None),
-            ("lm_head.linear", "lm_head", None),
         ]
         
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             num_experts=self.fd_config.model_config.num_local_experts,
-            ckpt_gate_proj_name="w1.weight",
-            ckpt_up_proj_name="w3.weight",
+            ckpt_gate_proj_name="w1.weight", ckpt_up_proj_name="w3.weight",
             ckpt_down_proj_name="w2.weight",
             param_gate_up_proj_name="mlp.experts.up_gate_proj_",
             param_down_proj_name="mlp.experts.down_proj_",
-            ckpt_expert_key_name="block_sparse_moe.experts",
+            ckpt_expert_key_name="block_sparse_moe.experts"
         )
         
         params_dict = dict(self.named_parameters())
@@ -325,22 +336,27 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
         for loaded_weight_name, loaded_weight in weights_iterator:
             model_param_name = loaded_weight_name
             found = False
-            
-            # 优先匹配专家权重
+
+            # 统一将 HF 的 MoE 块名转为 FD 内部名
             if "block_sparse_moe.experts" in loaded_weight_name:
-                for param_name, ckpt_name_pattern, expert_id, shard_id in expert_params_mapping:
-                    if ckpt_name_pattern.format(expert_id) in loaded_weight_name:
-                        model_param_name = loaded_weight_name.replace(ckpt_name_pattern.format(expert_id), param_name)
-                        param = params_dict[model_param_name]
-                        param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
-                        found = True
-                        break
+                for p_name, ckpt_pattern, expert_id, shard_id in expert_params_mapping:
+                    # 构建精确的 checkpoint 权重名模式
+                    full_ckpt_pattern = ckpt_pattern.replace("{}", str(expert_id))
+                    if full_ckpt_pattern in loaded_weight_name:
+                        # 替换成 FD 内部参数名
+                        model_param_name = loaded_weight_name.replace(full_ckpt_pattern, p_name)
+                        if model_param_name in params_dict:
+                            param = params_dict[model_param_name]
+                            param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
+                            found = True
+                            break
             if found: continue
 
             # 匹配标准融合层
-            for param_name, ckpt_name, shard_id in stacked_params_mapping:
+            for p_name, ckpt_name, shard_id in stacked_params_mapping:
+                # 构造精确匹配模式，避免误匹配 (e.g., matching ".w1." not just "w1")
                 if f".{ckpt_name}." in loaded_weight_name:
-                    model_param_name = loaded_weight_name.replace(ckpt_name, param_name)
+                    model_param_name = loaded_weight_name.replace(ckpt_name, p_name)
                     if model_param_name in params_dict:
                         param = params_dict[model_param_name]
                         getattr(param, "weight_loader", default_weight_loader(self.fd_config))(param, loaded_weight, shard_id)
@@ -349,10 +365,14 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
             if found: continue
             
             # 匹配剩余的单体权重
-            name_map = {".w2.weight": ".down_proj.weight"}
-            for k, v in name_map.items():
-                if k in model_param_name:
-                    model_param_name = model_param_name.replace(k, v)
+            name_map = {
+                ".w2.weight": ".down_proj.weight",
+                ".shared_mlp.w2.weight": ".shared_mlp.down_proj.weight"
+            }
+            for ckpt_suffix, fd_suffix in name_map.items():
+                if loaded_weight_name.endswith(ckpt_suffix):
+                    model_param_name = loaded_weight_name.replace(ckpt_suffix, fd_suffix)
+                    break
 
             if model_param_name in params_dict:
                 param = params_dict[model_param_name]
@@ -373,5 +393,5 @@ class MiniMaxM1PretrainedModel(PretrainedModel):
 
     @classmethod
     def _get_tensor_parallel_mappings(cls, config, is_split=True):
-        logger.warning("Tensor parallel mappings for MiniMax-M1 are placeholders.")
+        logger.warning("Tensor parallel mappings for MiniMax-M1 are placeholders and not yet implemented.")
         return {}
