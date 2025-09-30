@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import re
-from functools import partial
 
 import paddle
 import paddle.nn.functional as F
@@ -27,16 +26,15 @@ from fastdeploy.model_executor.layers.moe.moe import FusedMoE
 from fastdeploy.model_executor.layers.normalization import RMSNorm
 from fastdeploy.model_executor.models.model_base import (ModelForCasualLM,
                                                           ModelRegistry)
-from fastdeploy.model_executor.utils import (default_weight_loader,
-                                               process_weights_after_loading)
-# 导入经过验证的 Triton 算子
 from fastdeploy.model_executor.ops.triton_ops.minimax_mamba_ops import (
     lightning_attention_fd,
     linear_decode_forward_triton_fd,
 )
+from fastdeploy.model_executor.utils import default_weight_loader
+
 
 class MiniMaxM1MLP(nn.Layer):
-    """标准的 MLP 模块，用于 MoE 中的共享专家。"""
+    """标准的 MLP 模块，仅用于 MoE 中的共享专家 (如果启用)。"""
     def __init__(
         self,
         fd_config: FDConfig,
@@ -51,7 +49,7 @@ class MiniMaxM1MLP(nn.Layer):
             prefix=f"{prefix}.up_gate_proj",
             input_size=config.hidden_size,
             output_size=intermediate_size * 2,
-            with_bias=False
+            with_bias=False,
         )
         self.down_proj = RowParallelLinear(
             fd_config,
@@ -59,7 +57,7 @@ class MiniMaxM1MLP(nn.Layer):
             input_size=intermediate_size,
             output_size=config.hidden_size,
             with_bias=False,
-            reduce_results=reduce_results
+            reduce_results=reduce_results,
         )
         self.act_fn = SiluAndMul()
 
@@ -84,9 +82,7 @@ class MiniMaxM1MoEBlock(nn.Layer):
             weight_dtype="float32",
         )
         
-        # 定义专家权重在 HuggingFace checkpoint 中的名字格式
         weight_key_map = {
-            # FastDeploy FusedMoE 内部会将 w1 和 w3 映射到 up_gate_proj
             "gate_proj_expert_weight_key": "experts.{{}}.w1.weight",
             "up_proj_expert_weight_key": "experts.{{}}.w3.weight",
             "down_proj_expert_weight_key": "experts.{{}}.w2.weight",
@@ -109,7 +105,7 @@ class MiniMaxM1StandardAttention(nn.Layer):
     """标准注意力 (GQA + Partial RoPE)。"""
     def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str = ""):
         super().__init__()
-        self.qkv_proj = QKVParallelLinear(fd_config, prefix=f"{prefix}", with_bias=False)
+        self.qkv_proj = QKVParallelLinear(fd_config, prefix=prefix, with_bias=False)
         self.o_proj = RowParallelLinear(
             fd_config, prefix=f"{prefix}.o_proj",
             input_size=fd_config.model_config.num_attention_heads * fd_config.model_config.head_dim,
@@ -135,6 +131,7 @@ class MiniMaxM1LinearAttention(nn.Layer):
         config = fd_config.model_config
         hidden_inner_size = config.head_dim * config.num_attention_heads
         
+        # HF权重是 [out, in]，FD并行层是 [in, out]，加载时需转置
         self.qkv_proj = RowParallelLinear(
             fd_config, prefix=f"{prefix}.qkv_proj",
             input_size=config.hidden_size, output_size=hidden_inner_size * 3, with_bias=False)
@@ -153,7 +150,6 @@ class MiniMaxM1LinearAttention(nn.Layer):
 
     @staticmethod
     def _build_slope_tensor(n_attention_heads: int):
-        # ... (此函数保持不变)
         def get_slopes(n):
             def get_slopes_power_of_2(n):
                 start = 2**(-(2**-(math.log2(n) - 3)))
@@ -199,7 +195,7 @@ class MiniMaxM1LinearAttention(nn.Layer):
             raise NotImplementedError("Mixed mode is not supported for Linear Attention yet.")
             
         hidden_norm = self.norm(attn_hidden)
-        gate = self.output_gate(hidden_states)
+        gate, _ = self.output_gate(hidden_states)
         gated_hidden = F.sigmoid(gate) * hidden_norm
         output = self.out_proj(gated_hidden.cast(hidden_states.dtype))
         return output
@@ -209,7 +205,6 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         super().__init__()
         config = fd_config.model_config
         self.layer_id = layer_id
-        self.postnorm = config.postnorm
 
         attn_type = config.attn_type_list[layer_id]
         attn_prefix = f"{prefix}.self_attn"
@@ -224,10 +219,9 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         else:
             raise ValueError(f"Unknown attention type for layer {layer_id}: {attn_type}")
 
-        # MoE 块的前缀现在与 vLLM 和 HF checkpoint 对齐
-        self.mlp = MiniMaxM1MoEBlock(fd_config, layer_id, prefix=f"{prefix}.block_sparse_moe")
+        self.block_sparse_moe = MiniMaxM1MoEBlock(fd_config, layer_id, prefix=f"{prefix}.block_sparse_moe")
         
-        self.shared_moe = config.shared_intermediate_size > 0
+        self.shared_moe = hasattr(config, "shared_intermediate_size") and config.shared_intermediate_size > 0
         if self.shared_moe:
             self.shared_mlp = MiniMaxM1MLP(
                 fd_config, config.shared_intermediate_size, 
@@ -245,7 +239,6 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         self.post_attention_layernorm = RMSNorm(fd_config, prefix=f"{prefix}.post_attention_layernorm")
 
     def forward(self, forward_meta: ForwardMeta, hidden_states: paddle.Tensor, residual: paddle.Tensor | None):
-        # 严格对齐 VLLM 的 DeepNorm + PostNorm 实现
         residual = hidden_states
         layernorm_output = self.input_layernorm(hidden_states)
         attn_output = self.self_attn(forward_meta, layernorm_output)
@@ -254,18 +247,18 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         residual = hidden_states
         layernorm_output = self.post_attention_layernorm(hidden_states)
         
-        moe_output = self.mlp(layernorm_output)
+        mlp_output = self.block_sparse_moe(layernorm_output)
         
         if self.shared_moe:
             shared_mlp_output = self.shared_mlp(layernorm_output)
-            coef = self.coefficient(layernorm_output.cast("float32"))
+            coef, _ = self.coefficient(layernorm_output.cast("float32"))
             coef = F.sigmoid(coef)
-            mlp_output = (moe_output.cast("float32") * (1 - coef) + 
-                          shared_mlp_output.cast("float32") * coef).cast(hidden_states.dtype)
+            final_mlp_output = (mlp_output.cast("float32") * (1 - coef) + 
+                                shared_mlp_output.cast("float32") * coef).cast(hidden_states.dtype)
         else:
-            mlp_output = moe_output
+            final_mlp_output = mlp_output
 
-        hidden_states = (residual * self.layernorm_mlp_alpha) + (mlp_output * self.layernorm_mlp_beta)
+        hidden_states = (residual * self.layernorm_mlp_alpha) + (final_mlp_output * self.layernorm_mlp_beta)
         
         return hidden_states, None
 
@@ -273,8 +266,6 @@ class MiniMaxM1DecoderLayer(nn.Layer):
 class MiniMaxM1Model(nn.Layer):
     def __init__(self, fd_config: FDConfig):
         super().__init__()
-        # 将 fd_config 保存为实例属性，以便子模块可以访问
-        self.fd_config = fd_config
         self.config = fd_config.model_config
         prefix = "model"
         self.embed_tokens = VocabParallelEmbedding(fd_config, prefix=f"{prefix}.embed_tokens")
@@ -297,6 +288,11 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
     def __init__(self, fd_config: FDConfig):
         super().__init__(fd_config)
         config = self.fd_config.model_config
+        
+        if config.pad_token_id is None:
+            config.pad_token_id = -1
+            logger.warning("config.pad_token_id is None, setting it to -1 as a default.")
+        
         if hasattr(config, "rotary_dim") and hasattr(config, "head_dim") and config.rotary_dim < config.head_dim:
             config.partial_rotary_factor = config.rotary_dim / config.head_dim
         
@@ -318,33 +314,36 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"), ("qkv_proj", "k_proj", "k"), ("qkv_proj", "v_proj", "v"),
             ("up_gate_proj", "w1", "gate"), ("up_gate_proj", "w3", "up"),
-            ("shared_mlp.up_gate_proj", "shared_mlp.w1", "gate"),
-            ("shared_mlp.up_gate_proj", "shared_mlp.w3", "up"),
+            ("shared_mlp.up_gate_proj", "w1", "gate"),
+            ("shared_mlp.up_gate_proj", "w3", "up"),
         ]
         
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             num_experts=self.fd_config.model_config.num_local_experts,
-            ckpt_gate_proj_name="w1.weight", ckpt_up_proj_name="w3.weight",
+            ckpt_gate_proj_name="w1.weight",
+            ckpt_up_proj_name="w3.weight",
             ckpt_down_proj_name="w2.weight",
-            param_gate_up_proj_name="mlp.experts.up_gate_proj_",
-            param_down_proj_name="mlp.experts.down_proj_",
-            ckpt_expert_key_name="block_sparse_moe.experts"
+            param_gate_up_proj_name="block_sparse_moe.experts.up_gate_proj_",
+            param_down_proj_name="block_sparse_moe.experts.down_proj_",
+            ckpt_expert_key_name="experts"
         )
         
         params_dict = dict(self.named_parameters())
         
         for loaded_weight_name, loaded_weight in weights_iterator:
-            model_param_name = loaded_weight_name
+            # 权重名适配: 移除 'model.' 前缀
+            param_key = loaded_weight_name[len("model."):] if loaded_weight_name.startswith("model.") else loaded_weight_name
             found = False
-
-            # 统一将 HF 的 MoE 块名转为 FD 内部名
-            if "block_sparse_moe.experts" in loaded_weight_name:
-                for p_name, ckpt_pattern, expert_id, shard_id in expert_params_mapping:
-                    # 构建精确的 checkpoint 权重名模式
-                    full_ckpt_pattern = ckpt_pattern.replace("{}", str(expert_id))
-                    if full_ckpt_pattern in loaded_weight_name:
-                        # 替换成 FD 内部参数名
-                        model_param_name = loaded_weight_name.replace(full_ckpt_pattern, p_name)
+            
+            # 1. 匹配专家权重
+            if ".block_sparse_moe.experts." in loaded_weight_name:
+                for p_name_prefix, ckpt_pattern, expert_id, shard_id in expert_params_mapping:
+                    # 构造HF权重名 e.g., layers.0.block_sparse_moe.experts.0.w1.weight
+                    hf_weight_name = f"layers.{expert_id // self.fd_config.model_config.num_local_experts}.{ckpt_pattern.format(expert_id)}"
+                    # 简化匹配，检查尾部
+                    if loaded_weight_name.endswith(hf_weight_name):
+                        # 构造FD参数名 e.g., model.layers.0.block_sparse_moe.mlp.experts.up_gate_proj_
+                        model_param_name = loaded_weight_name.replace(hf_weight_name, p_name_prefix)
                         if model_param_name in params_dict:
                             param = params_dict[model_param_name]
                             param.weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
@@ -352,36 +351,40 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                             break
             if found: continue
 
-            # 匹配标准融合层
+            # 2. 匹配标准融合层
             for p_name, ckpt_name, shard_id in stacked_params_mapping:
-                # 构造精确匹配模式，避免误匹配 (e.g., matching ".w1." not just "w1")
-                if f".{ckpt_name}." in loaded_weight_name:
-                    model_param_name = loaded_weight_name.replace(ckpt_name, p_name)
-                    if model_param_name in params_dict:
-                        param = params_dict[model_param_name]
+                if f".{ckpt_name}." in param_key:
+                    # 构造FD参数名，注意 self_attn 和 mlp 的前缀
+                    fd_param_key = param_key.replace(f".{ckpt_name}.", f".{p_name}.")
+                    if fd_param_key in params_dict:
+                        param = params_dict[fd_param_key]
                         getattr(param, "weight_loader", default_weight_loader(self.fd_config))(param, loaded_weight, shard_id)
                         found = True
                         break
             if found: continue
-            
-            # 匹配剩余的单体权重
+
+            # 3. 匹配单体权重
+            # HF checkpoint name -> FD param name
             name_map = {
                 ".w2.weight": ".down_proj.weight",
-                ".shared_mlp.w2.weight": ".shared_mlp.down_proj.weight"
+                ".shared_mlp.w2.weight": ".down_proj.weight", # 注意prefix
             }
-            for ckpt_suffix, fd_suffix in name_map.items():
-                if loaded_weight_name.endswith(ckpt_suffix):
-                    model_param_name = loaded_weight_name.replace(ckpt_suffix, fd_suffix)
+            
+            model_param_name = param_key
+            for hf_suffix, fd_suffix in name_map.items():
+                if model_param_name.endswith(hf_suffix):
+                    model_param_name = model_param_name.rsplit(hf_suffix, 1)[0] + fd_suffix
                     break
 
             if model_param_name in params_dict:
                 param = params_dict[model_param_name]
                 getattr(param, "weight_loader", default_weight_loader(self.fd_config))(param, loaded_weight)
-            elif "rotary_emb.inv_freq" not in loaded_weight_name:
-                logger.warning(f"Weight {loaded_weight_name} (mapped to {model_param_name}) not found in model.")
+            elif "rotary_emb.inv_freq" not in model_param_name:
+                logger.warning(f"Weight '{loaded_weight_name}' (mapped to '{model_param_name}') was not found in the model.")
+
 
     def set_state_dict(self, state_dict):
-        raise NotImplementedError("MiniMax-M1 uses the `load_weights` method.")
+        raise NotImplementedError("MiniMax-M1 uses the `load_weights` method with the default_v1 loader.")
 
 @ModelRegistry.register_pretrained_model
 class MiniMaxM1PretrainedModel(PretrainedModel):
@@ -393,5 +396,6 @@ class MiniMaxM1PretrainedModel(PretrainedModel):
 
     @classmethod
     def _get_tensor_parallel_mappings(cls, config, is_split=True):
-        logger.warning("Tensor parallel mappings for MiniMax-M1 are placeholders and not yet implemented.")
+        # TODO: 为 minimax-m1 实现张量并行切分
+        logger.warning("Tensor parallel mappings for MiniMax-M1 are placeholders and not yet fully implemented.")
         return {}
