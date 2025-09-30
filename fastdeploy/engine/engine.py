@@ -118,6 +118,16 @@ class LLMEngine:
         self._init_worker_signals()
 
         self.data_processor = self.input_processor.create_processor()
+        
+        if self.data_processor.pad_token_id is None:
+            # We also need to update the config object itself, because worker processes
+            # will create their own config based on the command-line arguments we pass.
+            # -1 is a safe default for a non-existent pad token.
+            self.data_processor.pad_token_id = -1
+            self.cfg.model_config.pad_token_id = -1
+            console_logger.warning("Tokenizer's pad_token_id is None. Setting it to -1 globally.")
+            # ==========================================================
+
         self.engine.data_processor = self.data_processor
 
         self.engine.start()
@@ -513,6 +523,17 @@ class LLMEngine:
                 arguments = arguments + f" --{worker_flag}"
         if self.cfg.nnode > 1:
             pd_cmd = pd_cmd + f" --ips {ips} --nnodes {len(self.cfg.ips)}"
+        
+        # ==================== 确保这段调试代码在这里！ ====================
+        print("="*80)
+        print(">>> FINAL COMMAND TO LAUNCH WORKER PROCESS <<<")
+        print(pd_cmd)
+        print("="*80)
+        # 我们可以再单独检查一下 pad_token_id
+        print(f">>> DEBUG: Value of self.data_processor.pad_token_id is: {self.data_processor.pad_token_id}")
+        print("="*80)
+        # =================================================================
+
         pd_cmd = pd_cmd + arguments + f" 2>{log_dir}/launch_worker.log"
         llm_logger.info(f"Launch worker service command: {pd_cmd}")
         p = subprocess.Popen(

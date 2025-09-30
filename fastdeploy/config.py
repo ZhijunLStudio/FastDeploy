@@ -172,9 +172,6 @@ class ModelConfig:
         self.read_from_env()
         self.read_model_config()
         
-        if self.pad_token_id is None:
-            self.pad_token_id = -1 
-            logger.warning(f"Model config has pad_token_id=None. Overriding it to -1 to avoid worker launch error.")
 
     def override_name_from_config(self):
         """

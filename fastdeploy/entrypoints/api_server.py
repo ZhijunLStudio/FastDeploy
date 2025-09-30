@@ -121,7 +121,6 @@ def launch_api_server(args) -> None:
 def main():
     """main函数"""
     
-    print("我进来啦")
     parser = FlexibleArgumentParser()
     parser.add_argument("--port", default=9904, type=int, help="port to the http server")
     parser.add_argument("--host", default="0.0.0.0", type=str, help="host to the http server")
