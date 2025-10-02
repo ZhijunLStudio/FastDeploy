@@ -47,6 +47,8 @@ from fastdeploy.platforms import current_platform
 from fastdeploy.utils import get_logger
 from fastdeploy.worker.worker_base import WorkerBase
 
+print(">>> [WORKER_MAIN] worker_process.py HAS BEEN LOADED <<<")
+
 logger = get_logger("worker_process", "worker_process.log")
 
 
@@ -145,14 +147,28 @@ class PaddleDisWorkerProc:
                 attributes such as weight_dtype, act_dtype, mp_size, hidden_size, head_dim,
                 num_attention_heads, and ffn_hidden_size.
         """
+        # ==================== 探针 5 ====================
+        print(">>> [WORKER_MAIN] Entering PaddleDisWorkerProc.__init__")
+        # ===============================================
         self.ranks = ranks
         self.local_rank = local_rank
         self.fd_config = fd_config
         self.parallel_config = fd_config.parallel_config
         self.cache_config = fd_config.cache_config
+        
+        # ==================== 探针 6 ====================
+        print(">>> [WORKER_MAIN] About to call get_worker()")
+        # ===============================================
+        
+
 
         # TODO(gongshaotian): Use worker factory to get worker
         self.worker = get_worker(fd_config=fd_config, local_rank=self.local_rank, rank=self.ranks)
+        
+        
+        # ==================== 探针 7 ====================
+        print(f">>> [WORKER_MAIN] get_worker() finished. Worker type: {type(self.worker).__name__}")
+        # ===============================================
 
         self.max_chips_per_node = 16 if current_platform.is_iluvatar() else 8
 
@@ -792,13 +808,30 @@ def run_worker_proc() -> None:
     """
     start worker process
     """
+    # ==================== 探针 1 ====================
+    print(">>> [WORKER_MAIN] Entering run_worker_proc()")
+    # ===============================================
     # Get args form Engine
     args = parse_args()
+    
+    # ==================== 探针 2 ====================
+    print(f">>> [WORKER_MAIN] args parsed. Model path: {args.model}")
+    # ===============================================
 
     ranks, local_rank = init_distributed_environment()
+    # ==================== 探针 3 ====================
+    print(f">>> [WORKER_MAIN] Distributed env initialized. Ranks: {ranks}, Local Rank: {local_rank}")
+    # ===============================================
 
     # Get fd_config
     fd_config = initialize_fd_config(args, ranks, local_rank)
+    
+    # ==================== 探针 4 ====================
+    print(">>> [WORKER_MAIN] FDConfig initialized successfully.")
+    import pprint
+    pprint.pprint(fd_config.model_config.__dict__)
+    # ===============================================
+
 
     # Create worker process
     if current_platform.is_iluvatar():
@@ -807,9 +840,17 @@ def run_worker_proc() -> None:
         worker_proc = IluvatarPaddleDisWorkerProc(fd_config, ranks, local_rank)
     else:
         worker_proc = PaddleDisWorkerProc(fd_config, ranks, local_rank)
+        
+    # ==================== 探针 8 ====================
+    print(">>> [WORKER_MAIN] PaddleDisWorkerProc instance created.")
+    # ===============================================
+
 
     # Initialize device and create model runner
     worker_proc.init_device()
+    # ==================== 探针 9 ====================
+    print(">>> [WORKER_MAIN] worker_proc.init_device() finished.")
+    # ===============================================
 
     # Load model
     worker_proc.load_model()
@@ -829,4 +870,5 @@ def run_worker_proc() -> None:
 
 
 if __name__ == "__main__":
+    print(">>> [WORKER_MAIN] Starting worker process from __main__")
     run_worker_proc()

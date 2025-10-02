@@ -24,15 +24,17 @@ from fastdeploy.model_executor.layers.linear import (
 from fastdeploy.model_executor.layers.lm_head import ParallelLMHead
 from fastdeploy.model_executor.layers.moe.moe import FusedMoE
 from fastdeploy.model_executor.layers.normalization import RMSNorm
-from fastdeploy.model_executor.models.model_base import (ModelForCasualLM,
-                                                          ModelRegistry)
+# 注意：移除了 ModelRegistry 的导入，因为我们不再需要它
+from fastdeploy.model_executor.models.model_base import ModelForCasualLM
+# 你的 triton op 导入保持不变
 from fastdeploy.model_executor.ops.triton_ops.minimax_mamba_ops import (
-    lightning_attention_fd,
-    linear_decode_forward_triton_fd,
+    lightning_attention,
+    linear_decode_forward_triton,
 )
 from fastdeploy.model_executor.utils import default_weight_loader
 
-
+# --- 所有子模块 (MiniMaxM1MLP, MiniMaxM1MoEBlock 等) 保持不变 ---
+# (这里省略了子模块的代码，使用你原来的即可)
 class MiniMaxM1MLP(nn.Layer):
     """标准的 MLP 模块，仅用于 MoE 中的共享专家 (如果启用)。"""
     def __init__(
@@ -131,7 +133,6 @@ class MiniMaxM1LinearAttention(nn.Layer):
         config = fd_config.model_config
         hidden_inner_size = config.head_dim * config.num_attention_heads
         
-        # HF权重是 [out, in]，FD并行层是 [in, out]，加载时需转置
         self.qkv_proj = RowParallelLinear(
             fd_config, prefix=f"{prefix}.qkv_proj",
             input_size=config.hidden_size, output_size=hidden_inner_size * 3, with_bias=False)
@@ -180,7 +181,7 @@ class MiniMaxM1LinearAttention(nn.Layer):
             k = k.reshape([B, N, H, D]).transpose([0, 2, 1, 3])
             v = v.reshape([B, N, H, D]).transpose([0, 2, 1, 3])
             kv_history = forward_meta.caches[self.layer_id][0]
-            attn_hidden, updated_kv_history = lightning_attention_fd(q, k, v, self.slope_rate, kv_history=kv_history)
+            attn_hidden, updated_kv_history = lightning_attention(q, k, v, self.slope_rate, kv_history=kv_history)
             forward_meta.caches[self.layer_id][0] = updated_kv_history
             attn_hidden = attn_hidden.transpose([0, 2, 1, 3]).reshape([num_tokens, H * D])
         elif forward_meta.forward_mode.is_decode():
@@ -190,7 +191,7 @@ class MiniMaxM1LinearAttention(nn.Layer):
             v = v.reshape([B, H, 1, D])
             kv_caches = forward_meta.caches[self.layer_id][0]
             slot_idx = forward_meta.block_tables[:, 0].squeeze(-1)
-            attn_hidden = linear_decode_forward_triton_fd(q, k, v, kv_caches, self.slope_rate.squeeze(), slot_idx)
+            attn_hidden = linear_decode_forward_triton(q, k, v, kv_caches, self.slope_rate.squeeze(), slot_idx)
         else:
             raise NotImplementedError("Mixed mode is not supported for Linear Attention yet.")
             
@@ -282,19 +283,35 @@ class MiniMaxM1Model(nn.Layer):
             hidden_states, residual = layer(forward_meta, hidden_states, residual)
         hidden_states = self.norm(hidden_states)
         return hidden_states
+# --- 结束子模块 ---
 
-@ModelRegistry.register_model_class
+# 移除 @ModelRegistry.register_model_class
 class MiniMaxM1ForCausalLM(ModelForCasualLM):
     def __init__(self, fd_config: FDConfig):
         super().__init__(fd_config)
         config = self.fd_config.model_config
         
-        if config.pad_token_id is None:
-            config.pad_token_id = -1
-            logger.warning("config.pad_token_id is None, setting it to -1 as a default.")
+        # --- 把所有适配逻辑都集中到这里！---
+        # 1. 设置统一前缀，保持规范
+        config.pretrained_config.prefix_name = "model"
+
+        # 2. 适配专家数量的名称
+        if hasattr(config, "num_local_experts") and not hasattr(config, "moe_num_experts"):
+            config.moe_num_experts = config.num_local_experts
+            # 其他参考模型也这样做了
+            config.n_routed_experts = config.num_local_experts
         
+        # 3. GLM4.5-Air 也适配了这些，我们跟进
+        if not hasattr(config, "n_shared_experts"):
+             config.n_shared_experts = 0
+        if not hasattr(config, "first_k_dense_replace"):
+             config.first_k_dense_replace = 0
+
+        # 4. 适配 Partial RoPE
         if hasattr(config, "rotary_dim") and hasattr(config, "head_dim") and config.rotary_dim < config.head_dim:
             config.partial_rotary_factor = config.rotary_dim / config.head_dim
+        
+        # --- 结束适配 ---
         
         self.model = MiniMaxM1Model(fd_config)
         self.lm_head = ParallelLMHead(fd_config, prefix="lm_head")
@@ -303,6 +320,7 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
     def name(cls):
         return "MiniMaxM1ForCausalLM"
 
+    # ... forward, compute_logits, load_weights, set_state_dict 方法保持不变 ...
     def forward(self, ids_remove_padding: paddle.Tensor, forward_meta: ForwardMeta):
         return self.model(ids_remove_padding, forward_meta)
 
@@ -311,6 +329,7 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator):
+        # 这里的 load_weights 逻辑非常复杂，我們先假设它是对的，如果启动后报权重加载错误，再来调试这里
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"), ("qkv_proj", "k_proj", "k"), ("qkv_proj", "v_proj", "v"),
             ("up_gate_proj", "w1", "gate"), ("up_gate_proj", "w3", "up"),
@@ -331,18 +350,13 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
         params_dict = dict(self.named_parameters())
         
         for loaded_weight_name, loaded_weight in weights_iterator:
-            # 权重名适配: 移除 'model.' 前缀
             param_key = loaded_weight_name[len("model."):] if loaded_weight_name.startswith("model.") else loaded_weight_name
             found = False
             
-            # 1. 匹配专家权重
             if ".block_sparse_moe.experts." in loaded_weight_name:
                 for p_name_prefix, ckpt_pattern, expert_id, shard_id in expert_params_mapping:
-                    # 构造HF权重名 e.g., layers.0.block_sparse_moe.experts.0.w1.weight
                     hf_weight_name = f"layers.{expert_id // self.fd_config.model_config.num_local_experts}.{ckpt_pattern.format(expert_id)}"
-                    # 简化匹配，检查尾部
                     if loaded_weight_name.endswith(hf_weight_name):
-                        # 构造FD参数名 e.g., model.layers.0.block_sparse_moe.mlp.experts.up_gate_proj_
                         model_param_name = loaded_weight_name.replace(hf_weight_name, p_name_prefix)
                         if model_param_name in params_dict:
                             param = params_dict[model_param_name]
@@ -351,10 +365,8 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                             break
             if found: continue
 
-            # 2. 匹配标准融合层
             for p_name, ckpt_name, shard_id in stacked_params_mapping:
                 if f".{ckpt_name}." in param_key:
-                    # 构造FD参数名，注意 self_attn 和 mlp 的前缀
                     fd_param_key = param_key.replace(f".{ckpt_name}.", f".{p_name}.")
                     if fd_param_key in params_dict:
                         param = params_dict[fd_param_key]
@@ -363,11 +375,9 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                         break
             if found: continue
 
-            # 3. 匹配单体权重
-            # HF checkpoint name -> FD param name
             name_map = {
                 ".w2.weight": ".down_proj.weight",
-                ".shared_mlp.w2.weight": ".down_proj.weight", # 注意prefix
+                ".shared_mlp.w2.weight": ".down_proj.weight",
             }
             
             model_param_name = param_key
@@ -382,11 +392,10 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
             elif "rotary_emb.inv_freq" not in model_param_name:
                 logger.warning(f"Weight '{loaded_weight_name}' (mapped to '{model_param_name}') was not found in the model.")
 
-
     def set_state_dict(self, state_dict):
         raise NotImplementedError("MiniMax-M1 uses the `load_weights` method with the default_v1 loader.")
 
-@ModelRegistry.register_pretrained_model
+# 移除 @ModelRegistry.register_pretrained_model
 class MiniMaxM1PretrainedModel(PretrainedModel):
     config_class = FDConfig
 
@@ -396,6 +405,5 @@ class MiniMaxM1PretrainedModel(PretrainedModel):
 
     @classmethod
     def _get_tensor_parallel_mappings(cls, config, is_split=True):
-        # TODO: 为 minimax-m1 实现张量并行切分
         logger.warning("Tensor parallel mappings for MiniMax-M1 are placeholders and not yet fully implemented.")
         return {}

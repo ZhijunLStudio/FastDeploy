@@ -119,6 +119,9 @@ class ModelConfig:
         self,
         args,
     ):
+        # ==================== CONFIG 探针 1 ====================
+        print(">>> [WORKER_CONFIG] Entering ModelConfig.__init__")
+        # =======================================================
         self.model = ""
         self.is_quantized = False
         self.max_model_len = 0
@@ -139,13 +142,26 @@ class ModelConfig:
             if hasattr(self, key) and value != "None":
                 setattr(self, key, value)
 
+        # ==================== CONFIG 探针 2 ====================
+        print(f">>> [WORKER_CONFIG] About to load pretrained config from: {self.model}")
+        # =======================================================
+
+
         assert self.model != ""
         pretrained_config, _ = PretrainedConfig.get_config_dict(self.model)
         self.pretrained_config = PretrainedConfig.from_dict(pretrained_config)
+        
+        # ==================== CONFIG 探针 3 ====================
+        print(">>> [WORKER_CONFIG] Pretrained config loaded. About to override attributes.")
+        # =======================================================
 
         # set attribute from pretrained_config
         for key, value in pretrained_config.items():
             setattr(self, key, value)
+            
+        # ==================== CONFIG 探针 4 ====================
+        print(">>> [WORKER_CONFIG] Attributes overridden. About to check MultimodalRegistry.")
+        # =======================================================
 
         # we need set default value when not exist
         for key, value in PRETRAINED_INIT_CONFIGURATION.items():
@@ -165,12 +181,32 @@ class ModelConfig:
             self.enable_mm = True
         else:
             self.enable_mm = False
+            
+        # ==================== CONFIG 探针 5 ====================
+        print(">>> [WORKER_CONFIG] ModelConfig.__init__ finished successfully.")
+        # =======================================================
+
 
         self.is_unified_ckpt = check_unified_ckpt(self.model)
 
         self.override_name_from_config()
         self.read_from_env()
         self.read_model_config()
+        
+        # if self.model_type == "minimax_m1" and hasattr(self, "num_local_experts"):
+        #     if not hasattr(self, "moe_num_experts"):
+        #         print(">>> [WORKER_CONFIG_ADAPT] Adapting 'num_local_experts' to 'moe_num_experts'")
+        #         self.moe_num_experts = self.num_local_experts
+        # # ==========================================================
+
+        # # 我们之前对 pad_token_id 的修复依然需要保留
+        # if self.pad_token_id is None:
+        #     self.pad_token_id = -1
+        #     logger.warning(f"Model config has pad_token_id=None. Overriding it to -1 to avoid worker launch error.")
+            
+        # if self.model_type == "minimax_m1":
+        #     print(">>> [WORKER_CONFIG_ADAPT] Forcing enable_mm = False for minimax_m1 model.")
+        #     self.enable_mm = False
         
 
     def override_name_from_config(self):
