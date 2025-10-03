@@ -30,7 +30,7 @@ else:
 from fastdeploy.config import FDConfig
 
 from .utils import get_tensor
-
+from ..utils import set_weight_attrs
 
 class RMSNorm(nn.Layer):
     """
@@ -337,3 +337,76 @@ class LayerNorm(nn.Layer):
             return norm_out[0], norm_out[1]
         else:
             return norm_out[0]
+
+
+class ParallelRMSNorm(nn.Layer):
+    """
+    RMS Normalization layer that handles sharded input for Tensor Parallelism.
+    """
+    def __init__(
+        self,
+        fd_config: FDConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        prefix: str = "",
+        dtype: str = None,
+    ):
+        super().__init__()
+        self.fd_config = fd_config
+        self.eps = eps
+        self.tp_size = fd_config.parallel_config.tensor_parallel_size
+        self.tp_group = fd_config.parallel_config.tp_group
+        
+        shard_size = hidden_size // self.tp_size
+        self.weight_key = f"{prefix}.weight"
+
+        self._norm_weight_dtype = dtype or self._helper.get_default_dtype()
+
+        self.weight = self.create_parameter(
+            shape=[shard_size],
+            default_initializer=nn.initializer.Constant(1.0),
+            dtype=self._norm_weight_dtype
+        )
+        if self.tp_size > 1:
+            set_weight_attrs(self.weight, {"output_dim": True, "weight_loader": self.weight_loader})
+
+    def weight_loader(self, param, loaded_weight, shard_id: Optional[str] = None):
+        """Custom loader that handles sharding for the weight."""
+        tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
+        tp_size = self.fd_config.parallel_config.tensor_parallel_size
+        
+        loaded_weight_tensor = get_tensor(loaded_weight)
+        
+        shard_size = loaded_weight_tensor.shape[0] // tp_size
+        start = tp_rank * shard_size
+        end = (tp_rank + 1) * shard_size
+        weight_shard = loaded_weight_tensor[start:end]
+        
+        assert param.shape == weight_shard.shape, f"Shape mismatch for ParallelRMSNorm weight: {param.shape} vs {weight_shard.shape}"
+        param.set_value(weight_shard)
+
+    def load_state_dict(self, state_dict: Dict[str, paddle.Tensor | np.ndarray]):
+        if self.weight_key in state_dict:
+            # Use the custom loader
+            self.weight_loader(self.weight, state_dict.pop(self.weight_key))
+
+    def forward(self, x: paddle.Tensor):
+        # Input x is sharded on the last dimension: [..., hidden_size / tp_size]
+        orig_dtype = x.dtype
+        x_float = x.astype('float32')
+
+        # Calculate variance on the full tensor dimension
+        # 1. Square the input shard
+        variance = x_float.pow(2)
+        # 2. All-reduce to get the sum of squares across all shards
+        if self.tp_size > 1:
+            paddle.distributed.all_reduce(variance, group=self.tp_group)
+        
+        # 3. Take the mean over the last dimension
+        variance = variance.mean(-1, keepdim=True)
+
+        # Compute RMSNorm
+        inv = paddle.rsqrt(variance + self.eps)
+        norm_out = (x_float * inv).astype(orig_dtype) * self.weight
+        
+        return norm_out
