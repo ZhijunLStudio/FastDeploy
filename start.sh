@@ -2,9 +2,9 @@
 
 # --- 配置参数 ---
 MODEL_PATH="/home/aistudio/config_folder"
-PORT=9020
-METRICS_PORT=9021
-WORKER_QUEUE_PORT=9022
+PORT=7890
+METRICS_PORT=8021
+WORKER_QUEUE_PORT=8022
 MAX_MODEL_LEN=32768
 MAX_NUM_SEQS=4
 LOAD_CHOICES="default_v1"
@@ -24,6 +24,6 @@ python -m fastdeploy.entrypoints.openai.api_server \
     --max-model-len $MAX_MODEL_LEN \
     --max-num-seqs $MAX_NUM_SEQS \
     --load_choices "$LOAD_CHOICES" \
-    --tensor-parallel-size $TP_SIZE
+    --tensor-parallel-size $TP_SIZE 
 
 echo "Server stopped."

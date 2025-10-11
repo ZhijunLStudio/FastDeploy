@@ -5,9 +5,9 @@ import re
 # 包含您提供的完整80层权重映射的JSON文件
 original_index_path = "/home/aistudio/data/models/36280/MiniMax-M1-80k/model.safetensors.index.json"
 # 将要生成的新5层权重映射文件的路径
-new_index_path = "model.safetensors.index.json"
+new_index_path = "/home/aistudio/config_folder/model.safetensors.index.json" 
 # 您想要保留的层数
-num_layers_to_keep = 2
+num_layers_to_keep = 8
 
 # --- 脚本 ---
 print(f"正在从 '{original_index_path}' 加载原始权重索引...")

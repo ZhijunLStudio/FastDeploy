@@ -119,14 +119,14 @@ class LLMEngine:
 
         self.data_processor = self.input_processor.create_processor()
         
-        if self.data_processor.pad_token_id is None:
-            # We also need to update the config object itself, because worker processes
-            # will create their own config based on the command-line arguments we pass.
-            # -1 is a safe default for a non-existent pad token.
-            self.data_processor.pad_token_id = -1
-            self.cfg.model_config.pad_token_id = -1
-            console_logger.warning("Tokenizer's pad_token_id is None. Setting it to -1 globally.")
-            # ==========================================================
+        # if self.data_processor.pad_token_id is None:
+        #     # We also need to update the config object itself, because worker processes
+        #     # will create their own config based on the command-line arguments we pass.
+        #     # -1 is a safe default for a non-existent pad token.
+        #     self.data_processor.pad_token_id = -1
+        #     self.cfg.model_config.pad_token_id = -1
+        #     console_logger.warning("Tokenizer's pad_token_id is None. Setting it to -1 globally.")
+        #     # ==========================================================
 
         self.engine.data_processor = self.data_processor
 
