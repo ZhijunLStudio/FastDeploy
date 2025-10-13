@@ -784,6 +784,13 @@ class GPUModelRunner(ModelRunnerBase):
         """
         Initialize all share buffers for model inputs.
         """
+        fill_id = self.model_config.pad_token_id
+        if fill_id is None:
+            fill_id = 0  # 使用 0 (<unk>) 或 self.model_config.eos_token_id
+            logger.warning(
+                f"model_config.pad_token_id is None. Using {fill_id} to initialize input buffers."
+            )
+            
         self.MAX_INFER_SEED = 9223372036854775806
         self.share_inputs = {}
 

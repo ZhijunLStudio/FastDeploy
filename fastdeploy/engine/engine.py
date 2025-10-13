@@ -119,14 +119,25 @@ class LLMEngine:
 
         self.data_processor = self.input_processor.create_processor()
         
-        # if self.data_processor.pad_token_id is None:
-        #     # We also need to update the config object itself, because worker processes
-        #     # will create their own config based on the command-line arguments we pass.
-        #     # -1 is a safe default for a non-existent pad token.
-        #     self.data_processor.pad_token_id = -1
-        #     self.cfg.model_config.pad_token_id = -1
-        #     console_logger.warning("Tokenizer's pad_token_id is None. Setting it to -1 globally.")
-        #     # ==========================================================
+        # [核心修复逻辑] 检查并设置 pad_token_id
+        if self.data_processor.pad_token_id is None:
+            eos_token_id = self.data_processor.tokenizer.eos_token_id
+            if eos_token_id is not None:
+                console_logger.warning(
+                    f"Tokenizer's pad_token_id is None. Setting it to the value of eos_token_id ({eos_token_id}) for padding."
+                )
+                # 1. 直接修改 tokenizer 实例，这是解决 `padding=True` 问题的根本
+                self.data_processor.tokenizer.pad_token_id = eos_token_id
+                
+                # 2. 同步更新 data_processor 自身的属性，这是解决 worker 启动参数问题的根本
+                self.data_processor.pad_token_id = eos_token_id
+                
+                # 3. （可选但推荐）同步到全局配置，确保一致性
+                if self.cfg.model_config.pad_token_id is None:
+                    self.cfg.model_config.pad_token_id = eos_token_id
+            else:
+                # 这是一个兜底的异常情况，如果一个模型连 EOS token 都没有，那它本身就很有问题
+                raise ValueError("Tokenizer does not have a pad_token_id or an eos_token_id. Cannot proceed with padding.")
 
         self.engine.data_processor = self.data_processor
 

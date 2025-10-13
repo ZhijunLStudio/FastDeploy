@@ -26,6 +26,34 @@ from fastdeploy.model_executor.layers.utils import get_tensor
 from fastdeploy.model_executor.ops.triton_ops.minimax_mamba_ops import lightning_attention, linear_decode_forward_triton
 from fastdeploy.distributed.communication import tensor_model_parallel_all_reduce
 
+import paddle
+import numpy as np
+
+def print_tensor_stats(tensor, name):
+    """一个辅助函数，用于打印Paddle张量的统计信息"""
+    if tensor is None:
+        print(f"DEBUG_STATS_FD: {name} is None")
+        return
+    with paddle.no_grad():
+        if tensor.numel() == 0:
+            print(f"DEBUG_STATS_FD: {name} | shape={list(tensor.shape)} | dtype={tensor.dtype} | is empty")
+            return
+        
+        # 转换到CPU上并转为numpy来获取值，避免在GPU上同步
+        tensor_np = tensor.cpu().numpy()
+
+        has_nan = np.isnan(tensor_np).any()
+        has_inf = np.isinf(tensor_np).any()
+        max_val = np.max(tensor_np)
+        min_val = np.min(tensor_np)
+        mean_val = np.mean(tensor_np)
+        
+        print(f"DEBUG_STATS_FD: {name} | shape={list(tensor.shape)} | dtype={tensor.dtype} | "
+              f"has_nan={has_nan} | has_inf={has_inf} | "
+              f"max={max_val:.6f} | min={min_val:.6f} | mean={mean_val:.6f}")
+        
+        
+
 class RMSNormTP(nn.Layer):
     def __init__(self, fd_config: FDConfig, hidden_size: int, prefix: str, eps: float = 1e-5):
         super().__init__()
@@ -226,33 +254,59 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         if self.shared_moe:
             self.shared_mlp = MiniMaxM1MLP(fd_config, config.shared_intermediate_size, prefix=f"{prefix}.shared_mlp", reduce_results=False)
             self.coefficient = ReplicatedLinear(fd_config, prefix=f"{prefix}.coefficient", input_size=config.hidden_size, output_size=1, with_bias=False, weight_dtype="float32")
+            
+        # --- 新增: 获取 alpha 和 beta 缩放因子 ---
+        self.postnorm = config.postnorm
+        if self.attn_type == 0:
+             self.layernorm_attention_alpha = config.layernorm_linear_attention_alpha
+             self.layernorm_attention_beta = config.layernorm_linear_attention_beta
+        else:
+             self.layernorm_attention_alpha = config.layernorm_full_attention_alpha
+             self.layernorm_attention_beta = config.layernorm_full_attention_beta
+        self.layernorm_mlp_alpha = config.layernorm_mlp_alpha
+        self.layernorm_mlp_beta = config.layernorm_mlp_beta
 
     # forward 方法保持不变...
     def forward(self, forward_meta: ForwardMeta, hidden_states: paddle.Tensor, residual: Optional[paddle.Tensor]):
-        if residual is None:
-            residual = hidden_states
-            normed_hidden_states = self.input_layernorm(hidden_states)
-        else:
-            normed_hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        if self.attn_type == 1: # GQA forward path
-            qkv_out = self.qkv_proj(normed_hidden_states)
+        # print(f"\n--- Entering DecoderLayer {self.original_layer_id} (type: {'GQA' if self.attn_type==1 else 'Linear'}) [FD] ---")
+        # print_tensor_stats(hidden_states, "0. hidden_states (input)")
+        
+        layernorm_output = self.input_layernorm(hidden_states)
+        residual_attn = layernorm_output if self.postnorm else hidden_states
+        if self.attn_type == 1: # GQA
+            qkv_out = self.qkv_proj(layernorm_output)
             attn_output = self.self_attn(qkv=qkv_out, forward_meta=forward_meta)
             attn_output = self.o_proj(attn_output)
-        else: # 线性注意力 forward path
-            attn_output = self.self_attn(normed_hidden_states, forward_meta)
+        else: # 线性注意力
+            attn_output = self.self_attn(layernorm_output, forward_meta)
         
-        normed_attn_output, residual = self.post_attention_layernorm(attn_output, residual)
+        hidden_states = (residual_attn * self.layernorm_attention_alpha) + (attn_output * self.layernorm_attention_beta)
+
+        # --- MLP Block (与 vLLM 对齐) ---
+        layernorm_output_mlp = self.post_attention_layernorm(hidden_states)
+        residual_mlp = layernorm_output_mlp if self.postnorm else hidden_states
         
-        mlp_output = self.mlp(normed_attn_output)
+        mlp_output = self.mlp(layernorm_output_mlp)
         
         if self.shared_moe:
-            shared_output = self.shared_mlp(normed_attn_output)
-            coef_logits = self.coefficient(normed_attn_output.cast("float32")) 
+            shared_output = self.shared_mlp(layernorm_output_mlp)
+            
+            # 注意：vLLM 中 coefficient 输入的是 float32
+            coef_logits = self.coefficient(layernorm_output_mlp.cast("float32")) 
+            
+            # vLLM/PyTorch 中的 F.sigmoid 对应 paddle.nn.functional.sigmoid
             coef = F.sigmoid(coef_logits)
+            
+            # vLLM 中的 shared_moe_mode 默认为 'sigmoid'，这里直接实现 sigmoid 逻辑
+            # 注意数据类型匹配
             mlp_output = mlp_output.cast(coef.dtype) * (1 - coef) + shared_output.cast(coef.dtype) * coef
+            
+        # 最后的 alpha/beta 缩放和残差连接
+        final_output = (residual_mlp * self.layernorm_mlp_alpha) + (mlp_output * self.layernorm_mlp_beta)
+        
+        # 返回更新后的 hidden_states，以及 None 作为新的 residual
+        return final_output, None
 
-        return mlp_output, residual
 
 # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
@@ -261,6 +315,9 @@ class MiniMaxM1Model(nn.Layer):
     def __init__(self, fd_config: FDConfig):
         super().__init__()
         self.config = fd_config.model_config
+        print("self.config:", self.config)
+        import pprint
+        pprint.pprint(vars(self.config))
         prefix = "model"
         self.embed_tokens = VocabParallelEmbedding(
             fd_config,
@@ -286,16 +343,16 @@ class MiniMaxM1Model(nn.Layer):
             eps=self.config.rms_norm_eps,
             prefix=f"{prefix}.norm"
         )
-
+        
     def forward(self, ids_remove_padding: paddle.Tensor, forward_meta: ForwardMeta):
+        print_tensor_stats(ids_remove_padding, "0. input_ids")
         hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
-        residual = None
-        # 遍历 LayerDict 时，需要按 key 的数字顺序
+        print_tensor_stats(hidden_states, "1. after_embedding")
+        # 简化循环，不再处理 residual
         for i in range(len(self.layers)):
             layer = self.layers[str(i)]
-            hidden_states, residual = layer(forward_meta=forward_meta, hidden_states=hidden_states, residual=residual)
-        if residual is not None:
-             hidden_states = hidden_states + residual
+            hidden_states, _ = layer(forward_meta=forward_meta, hidden_states=hidden_states, residual=None)
+        print_tensor_stats(hidden_states, "final. before_norm")
         out = self.norm(hidden_states)
         return out
 
@@ -303,16 +360,25 @@ class MiniMaxM1Model(nn.Layer):
 class MiniMaxM1ForCausalLM(ModelForCasualLM):
     def __init__(self, fd_config: FDConfig):
         super().__init__(fd_config)
-        config = self.fd_config.model_config
-        config.pretrained_config.prefix_name = "model"
-        if hasattr(config, "num_local_experts") and not hasattr(config, "moe_num_experts"):
-            config.moe_num_experts = config.num_local_experts
-        if hasattr(config, "rotary_dim") and hasattr(config, "head_dim") and config.rotary_dim < config.head_dim:
-            config.partial_rotary_factor = config.rotary_dim / config.head_dim
-        if not hasattr(config, "first_k_dense_replace"):
-            config.first_k_dense_replace = 0
+        
+        # +++++++++++++++ 核心修改 +++++++++++++++
+        # 将模型配置保存为 self.config 属性
+        self.config = self.fd_config.model_config
+        # 使用 self.config 进行后续操作
+        self.config.pretrained_config.prefix_name = "model"
+        if hasattr(self.config, "num_local_experts") and not hasattr(self.config, "moe_num_experts"):
+            self.config.moe_num_experts = self.config.num_local_experts
+        if hasattr(self.config, "rotary_dim") and hasattr(self.config, "head_dim") and self.config.rotary_dim < self.config.head_dim:
+            self.config.partial_rotary_factor = self.config.rotary_dim / self.config.head_dim
+        if not hasattr(self.config, "first_k_dense_replace"):
+            self.config.first_k_dense_replace = 0
+        # +++++++++++++++++++++++++++++++++++++++
+        
+
         self.model = MiniMaxM1Model(fd_config)
-        self.lm_head = ParallelLMHead(fd_config, embedding_dim=config.hidden_size, num_embeddings=config.vocab_size, prefix="lm_head")
+        # self.lm_head = ParallelLMHead(fd_config, embedding_dim=config.hidden_size, num_embeddings=config.vocab_size, prefix="lm_head")
+        self.lm_head = ParallelLMHead(fd_config, embedding_dim=self.config.hidden_size, num_embeddings=self.config.vocab_size, prefix="lm_head")
+
     
     @classmethod
     def name(cls): return "MiniMaxM1ForCausalLM"
@@ -321,7 +387,9 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
         return self.model(ids_remove_padding=ids_remove_padding, forward_meta=forward_meta)
     
     def compute_logits(self, hidden_states: paddle.Tensor, **kwargs):
+        # # print_tensor_stats(hidden_states, "final. before_lm_head")
         logits = self.lm_head(hidden_states)
+        # print_tensor_stats(logits, "final. after_lm_head (logits)") 
         # 将 logits 转换为 float32，以确保与采样算子的兼容性
         return logits.cast("float32")
 
@@ -368,6 +436,24 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
         loaded_checkpoint_keys = set()
         
         for loaded_weight_name, loaded_weight in weights_iterator:
+            # +++++++++++++++ 新增调试打印 +++++++++++++++
+            if "embed_tokens.weight" in loaded_weight_name:
+                from fastdeploy.model_executor.utils import get_tensor
+                logger.info(f"DEBUG_EMBEDDING: Found embedding weight '{loaded_weight_name}'")
+                
+                # 看看原始加载进来的是什么
+                raw_tensor = get_tensor(loaded_weight)
+                logger.info(f"DEBUG_EMBEDDING: Raw tensor stats before processing:")
+                print_tensor_stats(raw_tensor, "embed_tokens_raw_checkpoint_tensor")
+
+                # 找到对应的参数
+                param_name = "model.embed_tokens.embeddings.weight"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    logger.info(f"DEBUG_EMBEDDING: Target parameter '{param_name}' shape: {param.shape}, dtype: {param.dtype}")
+                
+            # +++++++++++++++++++++++++++++++++++++++++++
+
             
             # 检查层号是否在模型范围内，如果不在则跳过
             layer_match = re.search(r'\.layers\.(\d+)\.', loaded_weight_name)
@@ -389,7 +475,7 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                 shard_id = {"w1": "gate", "w3": "up", "w2": "down"}[weight_type]
                 if param_name in params_dict:
                     log_prefix = "[MoE Loader]"
-                    logger.info(f"{log_prefix} Routing '{loaded_weight_name}' to '{param_name}' for expert {expert_id}, shard '{shard_id}'.")
+                    # logger.info(f"{log_prefix} Routing '{loaded_weight_name}' to '{param_name}' for expert {expert_id}, shard '{shard_id}'.")
                     manual_moe_loader(params_dict[param_name], loaded_weight, int(expert_id), shard_id)
                     loaded_checkpoint_keys.add(loaded_weight_name)
                 continue
@@ -414,7 +500,7 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                     
                     if param_name in params_dict:
                         log_prefix = "[GQA Loader]"
-                        logger.info(f"{log_prefix} Routing '{loaded_weight_name}' to '{param_name}' with shard_id '{shard_id}'.")
+                        # logger.info(f"{log_prefix} Routing '{loaded_weight_name}' to '{param_name}' with shard_id '{shard_id}'.")
                         param = params_dict[param_name]
                         loader = getattr(param, 'weight_loader', default_weight_loader(self.fd_config))
                         if shard_id:
@@ -445,11 +531,11 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
             if param_name in params_dict:
                 param = params_dict[param_name]
                 loader = getattr(param, 'weight_loader', default_weight_loader(self.fd_config))
-                logger.info(f"{log_prefix} Loading '{loaded_weight_name}' into '{param_name}'.")
+                # logger.info(f"{log_prefix} Loading '{loaded_weight_name}' into '{param_name}'.")
                 loader(param, loaded_weight)
                 loaded_checkpoint_keys.add(loaded_weight_name)
-            elif loaded_weight_name not in loaded_checkpoint_keys:
-                logger.warning(f"Weight '{loaded_weight_name}' was not used (tried name '{param_name}').")
+            # elif loaded_weight_name not in loaded_checkpoint_keys:
+                # logger.warning(f"Weight '{loaded_weight_name}' was not used (tried name '{param_name}').")
 
         # 检查是否有模型参数未被加载
         all_loaded_param_names = {name for name, _ in weights_iterator if name in loaded_checkpoint_keys}
@@ -469,6 +555,40 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
             
             # if not is_param_loaded_heuristic(param):
             #     logger.warning(f"Model parameter '{param_name}' might not have been loaded from checkpoint.")
+            
+        logger.info("Weight loading loop finished. Checking final embedding parameter stats...")
+        if "model.embed_tokens.embeddings.weight" in params_dict:
+            final_embedding_param = params_dict["model.embed_tokens.embeddings.weight"]
+            print_tensor_stats(final_embedding_param, "embed_tokens_final_param_after_load")
+            
+        # +++++++++++++++ 添加打印 +++++++++++++++
+        if "model.embed_tokens.embeddings.weight" in params_dict:
+            weight_tensor = params_dict["model.embed_tokens.embeddings.weight"]
+            
+            # 由于是 TP，我们需要从所有 rank 收集权重才能看全局
+            # 为了简单，我们只看当前 rank 的
+            
+            hcg = paddle.distributed.fleet.get_hybrid_communicate_group()
+            tp_rank = hcg.get_model_parallel_rank()
+            tp_size = hcg.get_model_parallel_world_size()
+
+            print("================ FD Embedding Weight (TP Rank {}) ================".format(tp_rank))
+            # 打印 ID=390 对应的 embedding
+            # `fleet.meta_parallel.VocabParallelEmbedding` 的权重是按 vocab 维度切分的
+            vocab_size = self.config.vocab_size
+            partition_size = vocab_size // tp_size
+            start_idx = tp_rank * partition_size
+            end_idx = (tp_rank + 1) * partition_size
+            
+            if 390 >= start_idx and 390 < end_idx:
+                local_idx = 390 - start_idx
+                print("Token ID 390 embedding (first 5 values):")
+                print(weight_tensor[local_idx, :5].numpy())
+            
+            print("Weight stats:")
+            print_tensor_stats(weight_tensor, "embed_weight")
+            print("================================================================")
+        # +++++++++++++++++++++++++++++++++++++++
 
         # 4. process_weights_after_loading
         process_weights_after_loading_fn = process_weights_after_loading(sublayers_dict)

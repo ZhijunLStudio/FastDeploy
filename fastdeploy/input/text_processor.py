@@ -186,24 +186,6 @@ class DataProcessor(BaseDataProcessor):
 
         self.eos_token_ids = get_eos_token_id(self.tokenizer, self.generation_config)
         self.eos_token_id_len = len(self.eos_token_ids)
-        
-        if self.tokenizer.pad_token is None:
-            if self.tokenizer.eos_token is not None:
-                data_processor_logger.warning(
-                    "Tokenizer does not have a pad_token. "
-                    f"Setting tokenizer.pad_token to tokenizer.eos_token ('{self.tokenizer.eos_token}')."
-                )
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            else:
-                # 这是一个后备方案，对于 minimax-m1 不会走到这里
-                new_pad_token = "[PAD]"
-                data_processor_logger.warning(
-                    "Tokenizer does not have a pad_token or an eos_token. "
-                    f"Adding a new pad token '{new_pad_token}'."
-                )
-                self.tokenizer.add_special_tokens({"pad_token": new_pad_token})
-        
-        
         self.pad_token_id = self.get_pad_id()
         self.reasoning_parser = None
         self.tool_parser_obj = tool_parser_obj
