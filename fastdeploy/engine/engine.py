@@ -127,8 +127,8 @@ class LLMEngine:
                     f"Tokenizer's pad_token_id is None. Setting it to the value of eos_token_id ({eos_token_id}) for padding."
                 )
                 # 1. 直接修改 tokenizer 实例，这是解决 `padding=True` 问题的根本
-                self.data_processor.tokenizer.pad_token_id = eos_token_id
-                
+                self.data_processor.tokenizer.pad_token_id = 200000
+                # self.data_processor.tokenizer.pad_token_id = eos_token_id
                 # 2. 同步更新 data_processor 自身的属性，这是解决 worker 启动参数问题的根本
                 self.data_processor.pad_token_id = eos_token_id
                 

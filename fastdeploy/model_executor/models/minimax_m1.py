@@ -397,94 +397,61 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
         logger.info("Initializing robust multi-GPU weight loader for MiniMax-M1...")
-        from fastdeploy.model_executor.utils import (default_weight_loader,
-                                                     process_weights_after_loading, get_tensor)
+        from fastdeploy.model_executor.utils import (
+            default_weight_loader,
+            process_weights_after_loading,
+        )
 
         params_dict = dict(self.named_parameters())
         sublayers_dict = dict(self.named_sublayers())
-        
-        # manual_moe_loader 保持不变
-        def manual_moe_loader(param, loaded_weight, expert_id, shard_id):
-            # ... (这部分代码是正确的，保持不变) ...
-            config = self.fd_config.model_config
-            tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
-            tp_size = self.fd_config.parallel_config.tensor_parallel_size
-            is_torch_format = config.model_format == "torch"
-            if not param._is_initialized(): param.set_value(paddle.zeros(param.shape, dtype=param.dtype))
-            loaded_weight_tensor = get_tensor(loaded_weight)
-            if is_torch_format and len(loaded_weight_tensor.shape) == 2:
-                loaded_weight_tensor = loaded_weight_tensor.transpose([1, 0])
-            if shard_id in ["gate", "up"]:
-                output_size_per_shard = loaded_weight_tensor.shape[1] // tp_size
-                start, end = tp_rank * output_size_per_shard, (tp_rank + 1) * output_size_per_shard
-                loaded_weight_shard = loaded_weight_tensor[:, start:end]
-                target_expert_slice = param[expert_id]
-                intermediate_size_sharded = target_expert_slice.shape[1] // 2
-                if shard_id == "gate": target_sub_slice = target_expert_slice[:, :intermediate_size_sharded]
-                else: target_sub_slice = target_expert_slice[:, intermediate_size_sharded:]
-                if target_sub_slice.shape != loaded_weight_shard.shape: raise ValueError(f"[MoE Shape Mismatch] gate/up exp {expert_id}: Param={target_sub_slice.shape}, Loaded={loaded_weight_shard.shape}")
-                target_sub_slice.set_value(loaded_weight_shard)
-            else: # down
-                input_size_per_shard = loaded_weight_tensor.shape[0] // tp_size
-                start, end = tp_rank * input_size_per_shard, (tp_rank + 1) * input_size_per_shard
-                loaded_weight_shard = loaded_weight_tensor[start:end, :]
-                target_expert_slice = param[expert_id]
-                if target_expert_slice.shape != loaded_weight_shard.shape: raise ValueError(f"[MoE Shape Mismatch] down exp {expert_id}: Param={target_expert_slice.shape}, Loaded={loaded_weight_shard.shape}")
-                target_expert_slice.set_value(loaded_weight_shard)
+        process_weights_after_loading_fn = process_weights_after_loading(sublayers_dict)
 
-        # 记录已处理的权重，避免重复警告
         loaded_checkpoint_keys = set()
-        
+
         for loaded_weight_name, loaded_weight in weights_iterator:
-            # +++++++++++++++ 新增调试打印 +++++++++++++++
-            if "embed_tokens.weight" in loaded_weight_name:
-                from fastdeploy.model_executor.utils import get_tensor
-                logger.info(f"DEBUG_EMBEDDING: Found embedding weight '{loaded_weight_name}'")
-                
-                # 看看原始加载进来的是什么
-                raw_tensor = get_tensor(loaded_weight)
-                logger.info(f"DEBUG_EMBEDDING: Raw tensor stats before processing:")
-                print_tensor_stats(raw_tensor, "embed_tokens_raw_checkpoint_tensor")
-
-                # 找到对应的参数
-                param_name = "model.embed_tokens.embeddings.weight"
-                if param_name in params_dict:
-                    param = params_dict[param_name]
-                    logger.info(f"DEBUG_EMBEDDING: Target parameter '{param_name}' shape: {param.shape}, dtype: {param.dtype}")
-                
-            # +++++++++++++++++++++++++++++++++++++++++++
-
             
-            # 检查层号是否在模型范围内，如果不在则跳过
+            # --- 统一的预处理和调试打印 ---
+            if "embed_tokens.weight" in loaded_weight_name:
+                logger.info(f"Found embedding weight: '{loaded_weight_name}'")
+
             layer_match = re.search(r'\.layers\.(\d+)\.', loaded_weight_name)
-            if layer_match:
-                layer_idx = int(layer_match.group(1))
-                if layer_idx >= self.fd_config.model_config.num_hidden_layers:
-                    continue 
-
-            param_name = loaded_weight_name
-            loader_used = None
-            log_prefix = ""
-
-            # 规则 1: MoE 专家权重 (最高优先级)
-            moe_match = re.search(r"(\.layers\.\d+\.)block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight", loaded_weight_name)
-            if moe_match:
-                prefix, expert_id, weight_type = moe_match.groups()
-                suffix = "mlp.experts.up_gate_proj_weight" if weight_type in ["w1", "w3"] else "mlp.experts.down_proj_weight"
-                param_name = f"model{prefix}{suffix}"
-                shard_id = {"w1": "gate", "w3": "up", "w2": "down"}[weight_type]
-                if param_name in params_dict:
-                    log_prefix = "[MoE Loader]"
-                    # logger.info(f"{log_prefix} Routing '{loaded_weight_name}' to '{param_name}' for expert {expert_id}, shard '{shard_id}'.")
-                    manual_moe_loader(params_dict[param_name], loaded_weight, int(expert_id), shard_id)
-                    loaded_checkpoint_keys.add(loaded_weight_name)
+            if layer_match and int(layer_match.group(1)) >= self.config.num_hidden_layers:
                 continue
 
-            # 规则 2: GQA 层权重 (qkv/o_proj)
-            if 'self_attn' in loaded_weight_name and any(p in loaded_weight_name for p in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
+            param_to_load = None
+            
+
+            # 规则 1: MoE Expert Weights (e.g., model.layers.0.block_sparse_moe.experts.0.w1.weight)
+            moe_match = re.search(r"(\.layers\.\d+\.)block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight", loaded_weight_name)
+            if moe_match:
+                prefix_path, expert_id_str, weight_type = moe_match.groups()
+                expert_id = int(expert_id_str)
+                
+                # 构建目标参数名
+                mlp_prefix = f"model{prefix_path.replace('block_sparse_moe', 'mlp')}"
+                if weight_type in ["w1", "w3"]:
+                    param_name = f"{mlp_prefix}mlp.experts.up_gate_proj_weight"
+                    shard_id = "gate" if weight_type == "w1" else "up"
+                else: # w2
+                    param_name = f"{mlp_prefix}mlp.experts.down_proj_weight"
+                    shard_id = "down"
+
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    # FusedMoE层自带的weight_loader知道如何处理expert_id和shard_id
+                    param.weight_loader(param, loaded_weight, expert_id=expert_id, shard_id=shard_id)
+                    param_to_load = param # 标记为已处理
+                
+                loaded_checkpoint_keys.add(loaded_weight_name)
+                continue
+
+            # 规则 2: GQA Attention Weights (e.g., model.layers.7.self_attn.q_proj.weight)
+            # 仅对GQA层生效
+            if 'self_attn' in loaded_weight_name:
                 layer_idx = int(re.search(r'\.layers\.(\d+)\.', loaded_weight_name).group(1))
-                # 仅当该层是GQA类型时应用此规则
-                if self.fd_config.model_config.attn_type_list[layer_idx] == 1:
+                if self.config.attn_type_list[layer_idx] == 1: # Is GQA
+                    param_name = loaded_weight_name
+                    shard_id = None
                     if 'q_proj.weight' in loaded_weight_name:
                         param_name = loaded_weight_name.replace('self_attn.q_proj.weight', 'qkv_proj.weight')
                         shard_id = 'q'
@@ -496,108 +463,51 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                         shard_id = 'v'
                     elif 'o_proj.weight' in loaded_weight_name:
                         param_name = loaded_weight_name.replace('self_attn.o_proj.weight', 'o_proj.weight')
-                        shard_id = None
                     
                     if param_name in params_dict:
-                        log_prefix = "[GQA Loader]"
-                        # logger.info(f"{log_prefix} Routing '{loaded_weight_name}' to '{param_name}' with shard_id '{shard_id}'.")
                         param = params_dict[param_name]
                         loader = getattr(param, 'weight_loader', default_weight_loader(self.fd_config))
-                        if shard_id:
-                            loader(param, loaded_weight, shard_id)
-                        else:
-                            loader(param, loaded_weight)
-                        loaded_checkpoint_keys.add(loaded_weight_name)
+                        loader(param, loaded_weight, shard_id)
+                        param_to_load = param
+                    
+                    loaded_checkpoint_keys.add(loaded_weight_name)
                     continue
-
-            # 规则 3: 简单重命名
+            
+            # 规则 3: 通用名称映射和默认加载
+            param_name = loaded_weight_name
+            # 简单重命名
             simple_rename_map = {
                 "block_sparse_moe.gate.weight": "mlp.gate.weight",
                 "model.embed_tokens.weight": "model.embed_tokens.embeddings.weight",
                 "lm_head.weight": "lm_head.linear.weight",
             }
-            renamed = False
             for old, new in simple_rename_map.items():
                 if old in param_name:
                     param_name = param_name.replace(old, new)
-                    log_prefix = "[Simple Rename]"
-                    renamed = True
                     break
             
-            # 规则 4: 直接匹配 (包括线性注意力层)
-            if not renamed:
-                log_prefix = "[Direct Match]"
-            
+            # 使用映射后或原始的名称进行加载
             if param_name in params_dict:
                 param = params_dict[param_name]
                 loader = getattr(param, 'weight_loader', default_weight_loader(self.fd_config))
-                # logger.info(f"{log_prefix} Loading '{loaded_weight_name}' into '{param_name}'.")
                 loader(param, loaded_weight)
+                param_to_load = param
                 loaded_checkpoint_keys.add(loaded_weight_name)
-            # elif loaded_weight_name not in loaded_checkpoint_keys:
-                # logger.warning(f"Weight '{loaded_weight_name}' was not used (tried name '{param_name}').")
+            elif loaded_weight_name not in loaded_checkpoint_keys:
+                 logger.warning(f"Weight '{loaded_weight_name}' was not used (tried name '{param_name}').")
 
-        # 检查是否有模型参数未被加载
-        all_loaded_param_names = {name for name, _ in weights_iterator if name in loaded_checkpoint_keys}
-        for param_name, param in params_dict.items():
-            # 构造可能的源权重名称进行反向检查
-            # 这是一个近似检查，但对于调试很有用
-            is_loaded = False
-            if any(key in param_name for key in loaded_checkpoint_keys): # 简化检查
-                 is_loaded = True
-            
-            # 更精确的检查需要反向映射，这里暂时省略
-            # 如果需要，可以添加一个 `param_name` 到 `loaded_weight_name` 的映射来检查
-            
-            # 简单的判断：如果参数的均值仍然接近于其初始化值，则可能未加载
-            # 注意：这只是一个启发式方法
-            if 'embeddings' in param_name: continue # embedding权重巨大，计算sum很慢
-            
-            # if not is_param_loaded_heuristic(param):
-            #     logger.warning(f"Model parameter '{param_name}' might not have been loaded from checkpoint.")
-            
-        logger.info("Weight loading loop finished. Checking final embedding parameter stats...")
+            # 对加载后的参数进行后处理
+            if param_to_load is not None:
+                sublayer_name = param.name.rsplit('.', 1)[0]
+                process_weights_after_loading_fn(sublayer_name, param_to_load)
+
+        # --- 循环结束后，打印最终的 embedding 权重状态 ---
+        logger.info("Weight loading process finished.")
         if "model.embed_tokens.embeddings.weight" in params_dict:
             final_embedding_param = params_dict["model.embed_tokens.embeddings.weight"]
+            logger.info("Final stats for the loaded embedding parameter:")
+            # 此时参数已加载到GPU，打印它的状态
             print_tensor_stats(final_embedding_param, "embed_tokens_final_param_after_load")
-            
-        # +++++++++++++++ 添加打印 +++++++++++++++
-        if "model.embed_tokens.embeddings.weight" in params_dict:
-            weight_tensor = params_dict["model.embed_tokens.embeddings.weight"]
-            
-            # 由于是 TP，我们需要从所有 rank 收集权重才能看全局
-            # 为了简单，我们只看当前 rank 的
-            
-            hcg = paddle.distributed.fleet.get_hybrid_communicate_group()
-            tp_rank = hcg.get_model_parallel_rank()
-            tp_size = hcg.get_model_parallel_world_size()
-
-            print("================ FD Embedding Weight (TP Rank {}) ================".format(tp_rank))
-            # 打印 ID=390 对应的 embedding
-            # `fleet.meta_parallel.VocabParallelEmbedding` 的权重是按 vocab 维度切分的
-            vocab_size = self.config.vocab_size
-            partition_size = vocab_size // tp_size
-            start_idx = tp_rank * partition_size
-            end_idx = (tp_rank + 1) * partition_size
-            
-            if 390 >= start_idx and 390 < end_idx:
-                local_idx = 390 - start_idx
-                print("Token ID 390 embedding (first 5 values):")
-                print(weight_tensor[local_idx, :5].numpy())
-            
-            print("Weight stats:")
-            print_tensor_stats(weight_tensor, "embed_weight")
-            print("================================================================")
-        # +++++++++++++++++++++++++++++++++++++++
-
-        # 4. process_weights_after_loading
-        process_weights_after_loading_fn = process_weights_after_loading(sublayers_dict)
-        for name, param in params_dict.items():
-             sublayer_name = name.rsplit('.', 1)[0]
-             process_weights_after_loading_fn(sublayer_name, param)
-
-        logger.info("Finished processing weights.")
-
 
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
