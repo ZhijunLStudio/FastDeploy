@@ -29,18 +29,18 @@ from .utils import get_tensor
 import paddle
 import numpy as np
 
-def print_tensor_stats_fd(tensor, name):
-    if tensor is None:
-        print(f"DEBUG_STATS_FD: {name} is None")
-        return
-    with paddle.no_grad():
-        if tensor.numel() == 0:
-            print(f"DEBUG_STATS_FD: {name} | shape={list(tensor.shape)} | dtype={tensor.dtype} | is empty")
-            return
-        tensor_np = tensor.cpu().numpy()
-        max_val, min_val, mean_val = np.max(tensor_np), np.min(tensor_np), np.mean(tensor_np)
-        print(f"DEBUG_STATS_FD: {name} | shape={list(tensor.shape)} | dtype={tensor.dtype} | "
-              f"max={max_val:.6f} | min={min_val:.6f} | mean={mean_val:.6f}")
+# def print_tensor_stats_fd(tensor, name):
+#     if tensor is None:
+#         print(f"DEBUG_STATS_FD: {name} is None")
+#         return
+#     with paddle.no_grad():
+#         if tensor.numel() == 0:
+#             print(f"DEBUG_STATS_FD: {name} | shape={list(tensor.shape)} | dtype={tensor.dtype} | is empty")
+#             return
+#         tensor_np = tensor.cpu().numpy()
+#         max_val, min_val, mean_val = np.max(tensor_np), np.min(tensor_np), np.mean(tensor_np)
+#         print(f"DEBUG_STATS_FD: {name} | shape={list(tensor.shape)} | dtype={tensor.dtype} | "
+#               f"max={max_val:.6f} | min={min_val:.6f} | mean={mean_val:.6f}")
 
 
 class VocabParallelEmbedding(nn.Layer):
@@ -134,9 +134,9 @@ class VocabParallelEmbedding(nn.Layer):
             Tensor: Embedded tensor representation of the input IDs.
         """
         # +++++++++++++++ DEBUG 打印 +++++++++++++++
-        print("--- [FD] VocabParallelEmbedding.forward ---")
-        print_tensor_stats_fd(ids_remove_padding, "input_ids (inside embedding layer)")
-        print_tensor_stats_fd(self.embeddings.weight, "self.embeddings.weight")
+        # print("--- [FD] VocabParallelEmbedding.forward ---")
+        # print_tensor_stats_fd(ids_remove_padding, "input_ids (inside embedding layer)")
+        # print_tensor_stats_fd(self.embeddings.weight, "self.embeddings.weight")
         # +++++++++++++++++++++++++++++++++++++++++
         
         
@@ -154,8 +154,8 @@ class VocabParallelEmbedding(nn.Layer):
             input_embedings = self.embeddings(ids_remove_padding)
             
                 # +++++++++++++++ DEBUG 打印 +++++++++++++++
-        print_tensor_stats_fd(input_embedings, "output_embeddings (inside embedding layer)")
-        print("--- [FD] Exiting VocabParallelEmbedding.forward ---")
+        # print_tensor_stats_fd(input_embedings, "output_embeddings (inside embedding layer)")
+        # print("--- [FD] Exiting VocabParallelEmbedding.forward ---")
         # +++++++++++++++++++++++++++++++++++++++++
 
         return input_embedings

@@ -119,25 +119,31 @@ class LLMEngine:
 
         self.data_processor = self.input_processor.create_processor()
         
-        # [核心修复逻辑] 检查并设置 pad_token_id
+        # [CORE FIX] Check and set pad_token_id if it's missing.
+        # Some tokenizers do not have a pad_token_id, which causes issues with padding.
+        # We use the eos_token_id as a robust fallback in such cases.
         if self.data_processor.pad_token_id is None:
             eos_token_id = self.data_processor.tokenizer.eos_token_id
             if eos_token_id is not None:
                 console_logger.warning(
-                    f"Tokenizer's pad_token_id is None. Setting it to the value of eos_token_id ({eos_token_id}) for padding."
+                    f"Tokenizer's pad_token_id is None. Setting it to the eos_token_id ({eos_token_id}) for padding."
                 )
-                # 1. 直接修改 tokenizer 实例，这是解决 `padding=True` 问题的根本
-                self.data_processor.tokenizer.pad_token_id = 200000
-                # self.data_processor.tokenizer.pad_token_id = eos_token_id
-                # 2. 同步更新 data_processor 自身的属性，这是解决 worker 启动参数问题的根本
+                # 1. Update the tokenizer instance directly. This is crucial for padding operations.
+                self.data_processor.tokenizer.pad_token_id = eos_token_id
+
+                # 2. Update the data_processor's attribute to ensure workers are initialized with the correct value.
                 self.data_processor.pad_token_id = eos_token_id
-                
-                # 3. （可选但推荐）同步到全局配置，确保一致性
+
+                # 3. Update the main model configuration to maintain a single source of truth.
                 if self.cfg.model_config.pad_token_id is None:
                     self.cfg.model_config.pad_token_id = eos_token_id
             else:
-                # 这是一个兜底的异常情况，如果一个模型连 EOS token 都没有，那它本身就很有问题
-                raise ValueError("Tokenizer does not have a pad_token_id or an eos_token_id. Cannot proceed with padding.")
+                # This is a critical failure case. A model must have a token for padding.
+                raise ValueError(
+                    "Tokenizer has neither a pad_token_id nor an eos_token_id. "
+                    "Cannot proceed without a token for padding."
+                )
+
 
         self.engine.data_processor = self.data_processor
 
