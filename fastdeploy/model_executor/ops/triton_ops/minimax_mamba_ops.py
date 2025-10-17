@@ -1,23 +1,13 @@
-# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# work/FastDeploy/fastdeploy/model_executor/ops/triton_ops/minimax_mamba_ops.py
 
 from typing import Optional
-
 import paddle
+import paddle.nn.functional as F
+from paddleformers.utils.log import logger
 import triton
-from einops import rearrange
+import pprint
 
+# 导入你已经准备好的底层 Triton JIT Kernels
 from .minimax_mamba_kernels import (
     _fwd_diag_kernel,
     _fwd_kv_parallel,
@@ -26,6 +16,110 @@ from .minimax_mamba_kernels import (
     _linear_attn_decode_kernel,
 )
 
+# 保留打印函数，用于调试
+def print_tensor_stats(tensor, name):
+    """打印Paddle张量的统计信息 (强制 float32)"""
+    if tensor is None:
+        logger.info(f"[FD DEBUG_KERNEL] {name} is None")
+        return
+    with paddle.no_grad():
+        stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        if tensor.numel() > 0:
+            tensor_float = tensor.astype('float32')
+            tensor_cpu = tensor_float.cpu()
+            stats["max"] = f"{tensor_cpu.max().item():.6f}"
+            stats["min"] = f"{tensor_cpu.min().item():.6f}"
+            stats["mean"] = f"{tensor_cpu.mean().item():.6f}"
+            stats["std"] = f"{tensor_cpu.std().item():.6f}"
+            flat_data = tensor_cpu.flatten().numpy()[:5]
+            stats["first_5_values"] = flat_data
+        stats_str = f"\n--- [FD DEBUG_KERNEL] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n"
+        logger.info(stats_str)
+
+# 这是一个基于 paddle.autograd.Function 的包装类，用于调用 Triton kernels
+# 它的作用类似于 PyTorch 中的 torch.autograd.Function
+class _Attention(paddle.autograd.PyLayer):
+    @staticmethod
+    def forward(ctx, q, k, v, s, kv_history_in):
+        # 确保输入张量在内存中是连续的
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        s = s.contiguous()
+
+        # ==================== 核心修复：在 PyLayer 内部创建副本 ====================
+        # 创建一个与输入 kv_history 形状和类型相同的、用于计算的张量。
+        # 这是为了避免原地修改传入的叶子节点张量。
+        kv_history_compute = paddle.clone(kv_history_in)
+        # =====================================================================
+
+        # 获取输入维度
+        b, h, n, d = q.shape
+        e = v.shape[-1]
+
+        # 初始化输出张量
+        o = paddle.empty(shape=[b, h, n, e], dtype=q.dtype)
+        
+        # --- [后续所有 Triton Kernel 调用逻辑保持不变] ---
+        # ... (设置 BLOCK, CBLOCK, 计算 k_decay 等) ...
+
+        BLOCK = 256
+        NUM_BLOCK = triton.cdiv(n, BLOCK)
+        CBLOCK_DIAG = 32
+        NUM_CBLOCK_DIAG = BLOCK // CBLOCK_DIAG
+        assert BLOCK % CBLOCK_DIAG == 0
+        array = paddle.arange(0, BLOCK) + 1
+        array_float = array.astype("float32")
+        k_decay = paddle.exp(-s * (BLOCK - array_float.reshape([1, -1])))
+
+        # Step 1
+        grid_diag = (b * h * NUM_BLOCK, NUM_CBLOCK_DIAG)
+        _fwd_diag_kernel[grid_diag](
+            q, k, v, o, s,
+            b=b, h=h, n=n, d=d, e=e,
+            BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK, CBLOCK=CBLOCK_DIAG,
+        )
+
+        # Step 2
+        NUM_FBLOCK = 1
+        D_FBLOCK = d // NUM_FBLOCK
+        E_FBLOCK = e // NUM_FBLOCK
+        CBLOCK_KV_AND_NON_DIAG = 64
+        NUM_CBLOCK_KV_AND_NON_DIAG = BLOCK // CBLOCK_KV_AND_NON_DIAG
+        kv = paddle.empty(shape=[b, h, NUM_BLOCK, d, e], dtype="float32")
+        grid_kv_parallel = (b * h, NUM_BLOCK)
+        _fwd_kv_parallel[grid_kv_parallel](
+            k, v, k_decay, kv,
+            b=b, h=h, n=n, d=d, e=e,
+            BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK,
+            D_FBLOCK=D_FBLOCK, E_FBLOCK=E_FBLOCK, NUM_FBLOCK=NUM_FBLOCK,
+            CBLOCK=CBLOCK_KV_AND_NON_DIAG, NUM_CBLOCK=NUM_CBLOCK_KV_AND_NON_DIAG,
+        )
+
+        # Step 3: 将新创建的 kv_history_compute 传入，让它被原地修改
+        grid_kv_reduce = (b * h, NUM_FBLOCK)
+        _fwd_kv_reduce[grid_kv_reduce](
+            s, kv, kv_history_compute,  # <--- 使用副本
+            b=b, h=h, n=n, d=d, e=e,
+            BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK,
+            D_FBLOCK=D_FBLOCK, E_FBLOCK=E_FBLOCK,
+        )
+
+        # Step 4
+        grid_none_diag = (b * h, NUM_BLOCK * NUM_CBLOCK_KV_AND_NON_DIAG)
+        _fwd_none_diag_kernel[grid_none_diag](
+            q, o, s, kv,
+            b=b, h=h, n=n, d=d, e=e,
+            BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK, E_FBLOCK=E_FBLOCK,
+            CBLOCK=CBLOCK_KV_AND_NON_DIAG, NUM_CBLOCK=NUM_CBLOCK_KV_AND_NON_DIAG,
+        )
+        
+        # 返回计算结果和被更新后的 kv_history 副本
+        return o, kv_history_compute
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_kv_history):
+        raise NotImplementedError("Backward pass for lightning_attention is not implemented")
 
 def lightning_attention(
     q: paddle.Tensor,
@@ -33,119 +127,41 @@ def lightning_attention(
     v: paddle.Tensor,
     slope_rate: paddle.Tensor,
     kv_history: Optional[paddle.Tensor] = None,
+    is_profiling: bool = False,
+    block_size: int = 256,
 ) -> tuple[paddle.Tensor, paddle.Tensor]:
-    """
-    Implements the Lightning Attention mechanism for the prefill stage using Triton kernels.
+    
+    if is_profiling:
+        logger.warning("<<<<< RUNNING in PROFILING MODE for LIGHTNING ATTENTION! >>>>>")
+        logger.warning("<<<<< Bypassing actual computation and returning dummy tensors. >>>>>")
+        dummy_output = paddle.zeros_like(v)
+        dummy_kv_state = paddle.zeros_like(kv_history) if kv_history is not None else paddle.zeros(shape=[q.shape[0], q.shape[1], q.shape[3], v.shape[3]], dtype=v.dtype)
+        return dummy_output, dummy_kv_state
 
-    Args:
-        q (paddle.Tensor): Query tensor of shape (B, H, N, D).
-        k (paddle.Tensor): Key tensor of shape (B, H, N, D).
-        v (paddle.Tensor): Value tensor of shape (B, H, N, E).
-        slope_rate (paddle.Tensor): Slope tensor for attention decay.
-        kv_history (Optional[paddle.Tensor]): KV history from previous steps.
-
-    Returns:
-        tuple[paddle.Tensor, paddle.Tensor]: A tuple containing the output tensor and the updated KV history.
-    """
-    # Ensure tensors are contiguous for Triton kernels.
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-
-    if slope_rate.dim() > 1:
-        slope_rate = slope_rate.squeeze()
-    slope_rate = slope_rate.contiguous()
-
-    B, H, N, D = q.shape
-    E = v.shape[-1]
-    compute_dtype = q.dtype
-    o = paddle.empty_like(v)
+    logger.info("<<<<< RUNNING TRITON KERNEL FOR LIGHTNING ATTENTION! >>>>>")
+    
+    original_dtype = q.dtype
+    
+    if slope_rate.dim() == 1:
+        slope_rate = slope_rate.reshape([1, -1, 1, 1])
 
     if kv_history is None:
-        kv_history_in = paddle.zeros((B, H, D, E), dtype=paddle.float32).to(q.place)
-    else:
-        kv_history_in = kv_history.clone().contiguous()
+        kv_history = paddle.zeros(shape=[q.shape[0], q.shape[1], q.shape[3], v.shape[3]], dtype="float32")
+    
+    # ==================== 核心修改：移除这里的 clone ====================
+    # kv_history = kv_history.clone().contiguous() # <--- 移除这一行
+    # 直接将原始的 kv_history 传给 apply
+    # =================================================================
 
-    # --- Kernel Grid and Block Size Configuration ---
-    BLOCK = 256
-    NUM_BLOCK = triton.cdiv(N, BLOCK)
-    CBLOCK_diag = 32
-    NUM_CBLOCK_diag = BLOCK // CBLOCK_diag
+    output, updated_kv_history = _Attention.apply(q, k, v, slope_rate, kv_history)
 
-    # --- Launch Triton Kernels ---
-    grid_diag = (B * H * NUM_BLOCK, NUM_CBLOCK_diag)
-    _fwd_diag_kernel[grid_diag](
-        q, k, v, o, slope_rate, b=B, h=H, n=N, d=D, e=E, BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK, CBLOCK=CBLOCK_diag
-    )
-
-    array = (paddle.arange(0, BLOCK, dtype="float32") + 1).to(q.place)
-    k_decay = paddle.exp(-slope_rate.reshape((H, 1)) * (BLOCK - array.reshape((1, -1))))
-    k_decay = k_decay.astype(compute_dtype)
-
-    NUM_FBLOCK = 1
-    D_FBLOCK = D // NUM_FBLOCK
-    E_FBLOCK = E // NUM_FBLOCK
-    CBLOCK_kv = 64
-    NUM_CBLOCK_kv = BLOCK // CBLOCK_kv
-    kv_intermediate = paddle.empty((B, H, NUM_BLOCK, D, E), dtype=paddle.float32).to(q.place)
-
-    grid_kv_parallel = (B * H, NUM_BLOCK)
-    _fwd_kv_parallel[grid_kv_parallel](
-        k,
-        v,
-        k_decay,
-        kv_intermediate,
-        b=B,
-        h=H,
-        n=N,
-        d=D,
-        e=E,
-        BLOCK=BLOCK,
-        NUM_BLOCK=NUM_BLOCK,
-        D_FBLOCK=D_FBLOCK,
-        E_FBLOCK=E_FBLOCK,
-        NUM_FBLOCK=NUM_FBLOCK,
-        CBLOCK=CBLOCK_kv,
-        NUM_CBLOCK=NUM_CBLOCK_kv,
-    )
-
-    grid_kv_reduce = (B * H, NUM_FBLOCK)
-    _fwd_kv_reduce[grid_kv_reduce](
-        slope_rate,
-        kv_intermediate,
-        kv_history_in,
-        b=B,
-        h=H,
-        n=N,
-        d=D,
-        e=E,
-        BLOCK=BLOCK,
-        NUM_BLOCK=NUM_BLOCK,
-        D_FBLOCK=D_FBLOCK,
-        E_FBLOCK=E_FBLOCK,
-    )
-
-    grid_none_diag = (B * H, NUM_BLOCK * NUM_CBLOCK_diag, NUM_FBLOCK)
-    _fwd_none_diag_kernel[grid_none_diag](
-        q,
-        o,
-        slope_rate,
-        kv_intermediate,
-        b=B,
-        h=H,
-        n=N,
-        d=D,
-        e=E,
-        BLOCK=BLOCK,
-        NUM_BLOCK=NUM_BLOCK,
-        E_FBLOCK=E_FBLOCK,
-        CBLOCK=CBLOCK_diag,
-        NUM_CBLOCK=NUM_CBLOCK_diag,
-    )
-
-    return o, kv_history_in
+    return output.astype(original_dtype), updated_kv_history.astype(original_dtype)
 
 
+
+# ----------------------------------------------------------------------------------
+#  decode 函数保持不变，因为它已经使用了 Triton Kernel
+# ----------------------------------------------------------------------------------
 def linear_decode_forward_triton(
     q: paddle.Tensor,
     k: paddle.Tensor,
@@ -155,53 +171,18 @@ def linear_decode_forward_triton(
     slot_idx: paddle.Tensor,
     BLOCK_SIZE: int = 32,
 ) -> paddle.Tensor:
-    """
-    Performs the forward pass for linear attention decoding using a Triton kernel.
-
-    Args:
-        q (paddle.Tensor): Query tensor of shape (B, H, 1, D).
-        k (paddle.Tensor): Key tensor of shape (B, H, 1, D).
-        v (paddle.Tensor): Value tensor of shape (B, H, 1, D).
-        kv_caches (paddle.Tensor): KV cache tensor.
-        slope_rate (paddle.Tensor): Slope tensor for attention decay.
-        slot_idx (paddle.Tensor): Slot indices for accessing the KV cache.
-        BLOCK_SIZE (int): The block size for the Triton kernel.
-
-    Returns:
-        paddle.Tensor: The output tensor of the attention operation.
-    """
     B, H, _, D = q.shape
     assert tuple(k.shape) == (B, H, 1, D), f"Shape of k is {k.shape}, expected {(B, H, 1, D)}"
     assert tuple(v.shape) == (B, H, 1, D), f"Shape of v is {v.shape}, expected {(B, H, 1, D)}"
-
+    from einops import rearrange
     output = paddle.empty_like(q)
     grid = (B, H, triton.cdiv(D, BLOCK_SIZE))
 
+    # ==================== 核心修复 ====================
     qkv_b_stride, qkv_h_stride = q.strides[0], q.strides[1]
-    cache_b_stride, cache_h_stride, cache_d0_stride, cache_d1_stride = (
-        kv_caches.strides[0],
-        kv_caches.strides[1],
-        kv_caches.strides[2],
-        kv_caches.strides[3],
-    )
+    cache_b_stride, cache_h_stride, cache_d0_stride, cache_d1_stride = (kv_caches.strides[0], kv_caches.strides[1], kv_caches.strides[2], kv_caches.strides[3])
+    # ================================================
 
-    _linear_attn_decode_kernel[grid](
-        q,
-        k,
-        v,
-        kv_caches,
-        slope_rate,
-        slot_idx,
-        output,
-        D=D,
-        qkv_b_stride=qkv_b_stride,
-        qkv_h_stride=qkv_h_stride,
-        cache_b_stride=cache_b_stride,
-        cache_h_stride=cache_h_stride,
-        cache_d0_stride=cache_d0_stride,
-        cache_d1_stride=cache_d1_stride,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
+    _linear_attn_decode_kernel[grid](q, k, v, kv_caches, slope_rate, slot_idx, output, D=D, qkv_b_stride=qkv_b_stride, qkv_h_stride=qkv_h_stride, cache_b_stride=cache_b_stride, cache_h_stride=cache_h_stride, cache_d0_stride=cache_d0_stride, cache_d1_stride=cache_d1_stride, BLOCK_SIZE=BLOCK_SIZE)
     output = rearrange(output, "b h n d -> b n (h d)")
     return output.squeeze(1).contiguous()

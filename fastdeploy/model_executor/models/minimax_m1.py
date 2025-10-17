@@ -53,7 +53,32 @@ from fastdeploy.model_executor.utils import (
     default_weight_loader,
     process_weights_after_loading,
 )
-print("<<<<<<<<< HEY I AM HERE >>>>>>>>>")
+import pprint
+import numpy as np
+
+def print_tensor_stats(tensor, name):
+    """打印Paddle张量的统计信息 (强制 float32)"""
+    if tensor is None:
+        logger.info(f"DEBUG_FD: {name} is None")
+        return
+    with paddle.no_grad():
+        stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        if tensor.numel() > 0:
+            tensor_float = tensor.astype('float32')
+            tensor_cpu = tensor_float.cpu()
+            stats["max"] = f"{tensor_cpu.max().item():.6f}"
+            stats["min"] = f"{tensor_cpu.min().item():.6f}"
+            stats["mean"] = f"{tensor_cpu.mean().item():.6f}"
+            stats["std"] = f"{tensor_cpu.std().item():.6f}"
+            
+            # 如果是 2D 张量 (batch, hidden_size)，打印第一个 token 的前5个值
+            if tensor_float.ndim == 2:
+                flat_data = tensor_cpu.numpy()[0, :5]
+            else:
+                flat_data = tensor_cpu.flatten().numpy()[:5]
+            stats["first_5_values"] = flat_data
+        logger.info(f"\n--- [FD DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n")
+# ============================================================================
 
 class RMSNormTP(nn.Layer):
     """
@@ -98,120 +123,160 @@ class RMSNormTP(nn.Layer):
 
 
 class MiniMaxM1LinearAttention(nn.Layer):
-    """
-    Linear Attention module for MiniMax-M1.
-    """
-
     def __init__(self, fd_config: FDConfig, layer_id: int, prefix: str = ""):
         super().__init__()
         config = fd_config.model_config
         self.layer_id = layer_id
-
         tp_size = fd_config.parallel_config.tensor_parallel_size
         tp_rank = fd_config.parallel_config.tensor_parallel_rank
-
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.tp_heads = self.num_heads // tp_size
-
         hidden_inner_size = self.head_dim * self.num_heads
-
-        self.qkv_proj = ColumnParallelLinear(
-            fd_config,
-            prefix=f"{prefix}.qkv_proj",
-            input_size=config.hidden_size,
-            output_size=hidden_inner_size * 3,
-            with_bias=False,
-        )
-        self.output_gate = ColumnParallelLinear(
-            fd_config,
-            prefix=f"{prefix}.output_gate",
-            input_size=config.hidden_size,
-            output_size=hidden_inner_size,
-            with_bias=False,
-        )
-        self.out_proj = RowParallelLinear(
-            fd_config,
-            prefix=f"{prefix}.out_proj",
-            input_size=hidden_inner_size,
-            output_size=config.hidden_size,
-            with_bias=False,
-        )
-
-        # Use our newly defined RMSNormTP
-        self.norm = RMSNormTP(
-            fd_config, hidden_size=hidden_inner_size, prefix=f"{prefix}.norm", eps=1e-5
-        )
-
+        self.qkv_proj = ColumnParallelLinear(fd_config, prefix=f"{prefix}.qkv_proj", input_size=config.hidden_size, output_size=hidden_inner_size * 3, with_bias=False)
+        self.output_gate = ColumnParallelLinear(fd_config, prefix=f"{prefix}.output_gate", input_size=config.hidden_size, output_size=hidden_inner_size, with_bias=False)
+        self.out_proj = RowParallelLinear(fd_config, prefix=f"{prefix}.out_proj", input_size=hidden_inner_size, output_size=config.hidden_size, with_bias=False)
+        self.norm = RMSNormTP(fd_config, hidden_size=hidden_inner_size, prefix=f"{prefix}.norm", eps=1e-5)
         slope_rate = self._build_slope_tensor(self.num_heads)
         if config.num_hidden_layers > 1:
             self.slope_rate = slope_rate * (1 - layer_id / (config.num_hidden_layers - 1) + 1e-5)
         else:
             self.slope_rate = slope_rate * (1 + 1e-5)
-
         self.tp_slope = self.slope_rate[tp_rank * self.tp_heads : (tp_rank + 1) * self.tp_heads].contiguous()
 
     @staticmethod
     def _build_slope_tensor(n_attention_heads: int):
-        """Builds the slope tensor for linear attention."""
-
         def get_slopes_power_of_2(n):
-            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            start = 2**(-(2**-(math.log2(n) - 3)))
             ratio = start
             return [start * ratio**i for i in range(n)]
-
         if math.log2(n_attention_heads).is_integer():
             slopes = get_slopes_power_of_2(n_attention_heads)
         else:
-            closest_power_of_2 = 2 ** math.floor(math.log2(n_attention_heads))
-            slopes = get_slopes_power_of_2(closest_power_of_2) + get_slopes_power_of_2(2 * closest_power_of_2)[0::2][
-                : n_attention_heads - closest_power_of_2
-            ]
-
-        return paddle.to_tensor(slopes, dtype="float32").reshape([n_attention_heads, 1, 1])
+            closest_power_of_2 = 2**math.floor(math.log2(n_attention_heads))
+            slopes = (get_slopes_power_of_2(closest_power_of_2) + get_slopes_power_of_2(2 * closest_power_of_2)[0::2][:n_attention_heads - closest_power_of_2])
+        return paddle.to_tensor(slopes, dtype='float32').reshape([n_attention_heads, 1, 1])
+    
 
     def forward(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta):
-        """Forward pass for Linear Attention."""
+        from paddleformers.utils.log import logger
+
+        layer_id = self.layer_id
+        logger.info(f"\n{'='*20} [FD DEBUG] Entering LinearAttention Layer {layer_id} {'='*20}")
+        print_tensor_stats(hidden_states, f"L{layer_id}:0_InputHiddenStates")
+
         model_dtype = self.out_proj.weight.dtype
         total_tokens = hidden_states.shape[0]
 
         qkv = self.qkv_proj(hidden_states)
-        qkv_act = F.silu(qkv)
+        print_tensor_stats(qkv, f"L{layer_id}:1_AfterQKVProj")
+        
+        qkv_float32 = qkv.astype("float32")
+        qkv_act = F.silu(qkv_float32)
+        print_tensor_stats(qkv_act, f"L{layer_id}:2_AfterSILU")
 
-        q, k, v = qkv_act.split(3, axis=-1)
+        q_act, k_act, v_act = qkv_act.split(3, axis=-1)
+        q = q_act.reshape((total_tokens, self.tp_heads, self.head_dim))
+        k = k_act.reshape((total_tokens, self.tp_heads, self.head_dim))
+        v = v_act.reshape((total_tokens, self.tp_heads, self.head_dim))
+        
+        print_tensor_stats(q, f"L{layer_id}:2a_Split_Q")
+        print_tensor_stats(k, f"L{layer_id}:2b_Split_K")
+        print_tensor_stats(v, f"L{layer_id}:2c_Split_V")
 
-        # Reshape for attention computation
-        q = q.reshape((total_tokens, self.tp_heads, self.head_dim))
-        k = k.reshape((total_tokens, self.tp_heads, self.head_dim))
-        v = v.reshape((total_tokens, self.tp_heads, self.head_dim))
+        # ==================== 健壮性修改：处理 profile_run 阶段 ====================
+        # 检查 forward_meta 是否包含调度信息，如果没有，说明是 profile/warmup 阶段
+        is_profiling_or_warmup = forward_meta.step_use_cudagraph
 
-        if forward_meta.forward_mode.is_prefill():
-            q = q.transpose((1, 0, 2)).unsqueeze(0)
-            k = k.transpose((1, 0, 2)).unsqueeze(0)
-            v = v.transpose((1, 0, 2)).unsqueeze(0)
+        if is_profiling_or_warmup:
+            logger.warning(f"--- [FD DEBUG] L{layer_id} | Running in PROFILING/WARMUP mode detected by step_use_cudagraph. Using simplified prefill path. ---")
+            has_prefill = True
+            has_decode = False
+            prefill_token_num = total_tokens
+        else:
+            prefill_token_num = int(paddle.sum(forward_meta.seq_lens_encoder).item())
+            decode_token_num = total_tokens - prefill_token_num
+            has_prefill = prefill_token_num > 0
+            has_decode = decode_token_num > 0
+            logger.info(f"--- [FD DEBUG] L{layer_id} | Total Tokens: {total_tokens}, Prefill: {prefill_token_num}, Decode: {decode_token_num} ---")
+        # =======================================================================
 
-            state_cache = forward_meta.linear_attn_caches[:, self.layer_id, :, :, :]
-            output, updated_state_cache = lightning_attention(q, k, v, self.tp_slope, kv_history=state_cache)
-            forward_meta.linear_attn_caches[:, self.layer_id, :, :, :] = updated_state_cache
-            output = output.squeeze(0).transpose((1, 0, 2)).reshape((total_tokens, -1))
+        output_prefill = None
+        output_decode = None
 
-        else:  # decode
-            q = q.unsqueeze(2)
-            k = k.unsqueeze(2)
-            v = v.unsqueeze(2)
+        if has_prefill:
+            logger.info(f"--- [FD DEBUG] L{layer_id} | Running PREFILL path ---")
+            q_prefill, k_prefill, v_prefill = q[:prefill_token_num], k[:prefill_token_num], v[:prefill_token_num]
+            
+            q_attn = q_prefill.transpose((1, 0, 2)).unsqueeze(0)
+            k_attn = k_prefill.transpose((1, 0, 2)).unsqueeze(0)
+            v_attn = v_prefill.transpose((1, 0, 2)).unsqueeze(0)
+            
+            # 在 profile 阶段，linear_attn_caches 可能为 None
+            if forward_meta.linear_attn_caches is None:
+                logger.warning(f"--- [FD DEBUG] L{layer_id} | linear_attn_caches is None. Creating a dummy cache. ---")
+                # 创建一个临时的、形状正确的 dummy cache
+                cache_shape = (
+                    1, # batch size for profile run is usually 1
+                    self.fd_config.model_config.num_hidden_layers,
+                    self.tp_heads,
+                    self.head_dim,
+                    self.head_dim
+                )
+                state_cache = paddle.zeros(cache_shape, dtype="float32")
+                # 只取当前层需要的部分
+                state_cache = state_cache[:, layer_id, :, :, :]
+            else:
+                state_cache = forward_meta.linear_attn_caches[:, layer_id, :, :, :]
+            
+            from fastdeploy.model_executor.ops.triton_ops.minimax_mamba_ops import lightning_attention
+            output_prefill, updated_state_cache = lightning_attention(q_attn, k_attn, v_attn, self.tp_slope, kv_history=state_cache, is_profiling=is_profiling_or_warmup)
+            
+            if forward_meta.linear_attn_caches is not None:
+                forward_meta.linear_attn_caches[:, layer_id, :, :, :] = updated_state_cache
+            output_prefill = output_prefill.squeeze(0).transpose((1, 0, 2)).reshape((prefill_token_num, -1))
 
-            state_cache = forward_meta.linear_attn_caches[:, self.layer_id, :, :, :]
-            slot_mapping = forward_meta.slot_mapping
-            output = linear_decode_forward_triton(q, k, v, state_cache, self.tp_slope, slot_mapping)
+        if has_decode:
+            logger.info(f"--- [FD DEBUG] L{layer_id} | Running DECODE path ---")
+            q_decode, k_decode, v_decode = q[prefill_token_num:], k[prefill_token_num:], v[prefill_token_num:]
+            
+            q_decode = q_decode.unsqueeze(2)
+            k_decode = k_decode.unsqueeze(2)
+            v_decode = v_decode.unsqueeze(2)
 
+            state_cache = forward_meta.linear_attn_caches[:, layer_id, :, :, :]
+            slot_mapping_decode = forward_meta.slot_mapping[prefill_token_num:]
+            
+            output_decode = linear_decode_forward_triton(q_decode, k_decode, v_decode, state_cache, self.tp_slope, slot_mapping_decode)
+
+        # ... 后续合并和处理逻辑不变 ...
+        if output_prefill is not None and output_decode is not None:
+            output = paddle.concat([output_prefill, output_decode], axis=0)
+        elif output_prefill is not None:
+            output = output_prefill
+        elif output_decode is not None:
+            output = output_decode
+        else:
+            logger.warning(f"--- [FD DEBUG] L{layer_id} | Both prefill and decode paths were skipped! Returning zeros. ---")
+            return paddle.zeros_like(hidden_states)
+
+        print_tensor_stats(output, f"L{layer_id}:3_AfterAttentionKernel")
+        
         output = self.norm(output)
-
+        print_tensor_stats(output, f"L{layer_id}:4_AfterRMSNormTP")
+        
         gate = self.output_gate(hidden_states)
+        print_tensor_stats(gate, f"L{layer_id}:5_GateValue")
+        
         output = F.sigmoid(gate) * output.cast(model_dtype)
-
+        print_tensor_stats(output, f"L{layer_id}:6_AfterGating")
+        
         final_output = self.out_proj(output)
-
+        print_tensor_stats(final_output, f"L{layer_id}:7_FinalOutput")
+        
+        logger.info(f"{'='*20} [FD DEBUG] Exiting LinearAttention Layer {layer_id} {'='*20}\n")
         return final_output
+
 
 
 class MiniMaxM1MLP(nn.Layer):
@@ -407,14 +472,19 @@ class MiniMaxM1Model(nn.Layer):
             prefix=f"{prefix}.norm",
         )
 
+    
     def forward(self, ids_remove_padding: paddle.Tensor, forward_meta: ForwardMeta):
-        """Forward pass for the model."""
+        print_tensor_stats(ids_remove_padding, "TOP:0_InputIDs")
         hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
-        # Simplified loop, no residual handling
+        print_tensor_stats(hidden_states, "TOP:1_AfterEmbedding")
+        
         for i in range(len(self.layers)):
             layer = self.layers[str(i)]
             hidden_states, _ = layer(forward_meta=forward_meta, hidden_states=hidden_states, residual=None)
+            print_tensor_stats(hidden_states, f"TOP:2_AfterLayer_{i}")
+            
         out = self.norm(hidden_states)
+        print_tensor_stats(out, "TOP:3_FinalOutput")
         return out
 
 
@@ -462,73 +532,118 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
-        """Loads model weights with custom mapping logic for MiniMax-M1."""
         logger.info("Initializing robust multi-GPU weight loader for MiniMax-M1...")
+        import numpy as np
+        from fastdeploy.model_executor.utils import (
+            default_weight_loader,
+            process_weights_after_loading,
+        )
+
         params_dict = dict(self.named_parameters())
         sublayers_dict = dict(self.named_sublayers())
         process_weights_after_loading_fn = process_weights_after_loading(sublayers_dict)
 
-        loaded_checkpoint_keys = set()
+        # ============================================================================
+        #  临时修复函数：专门用于正确加载 bfloat16 的 PySafeSlice
+        #  这是解决问题的核心，我们只在需要时调用它。
+        # ============================================================================
+        def _get_bfloat16_tensor_from_slice(weight_slice):
+            data_bytes = weight_slice[:]
+            uint16_array = np.frombuffer(data_bytes, dtype=np.uint16)
+            bfloat16_dtype_obj = paddle.to_tensor([0], dtype='bfloat16').numpy().dtype
+            bf16_array = uint16_array.view(bfloat16_dtype_obj).reshape(weight_slice.shape)
+            return paddle.to_tensor(bf16_array)
 
-        for loaded_weight_name, loaded_weight in weights_iterator:
-            layer_match = re.search(r"\.layers\.(\d+)\.", loaded_weight_name)
+        for loaded_weight_name, loaded_weight_slice in weights_iterator:
+            
+            # --- 核心干预逻辑 ---
+            # 默认情况下，我们直接使用原始的 slice 对象
+            current_weight = loaded_weight_slice
+
+            # 仅当检测到是 bfloat16 时，才进行手动干预
+            if "PySafeSlice" in str(type(loaded_weight_slice)):
+                dtype_str = str(getattr(loaded_weight_slice, 'dtype', '')).lower()
+                if 'bfloat16' in dtype_str or 'bf16' in dtype_str:
+                    logger.info(f"Applying bfloat16 workaround for weight: {loaded_weight_name}")
+                    # 将 slice 手动、正确地转换为 paddle.Tensor
+                    current_weight = _get_bfloat16_tensor_from_slice(loaded_weight_slice)
+            
+            # --- 详细的调试信息打印 ---
+            # 为了满足调试需求，我们在这里对处理后的 `current_weight` 进行打印
+            # 注意：如果 `current_weight` 仍然是 slice，我们需要先转换它
+            tensor_to_print = None
+            if isinstance(current_weight, paddle.Tensor):
+                tensor_to_print = current_weight
+            else: # 假设是 slice
+                try:
+                    tensor_to_print = paddle.to_tensor(current_weight.get())
+                except Exception:
+                    # 如果转换失败，至少打印名称
+                    logger.warning(f"Could not convert {loaded_weight_name} to tensor for printing.")
+                    tensor_to_print = paddle.to_tensor([])
+            
+            # with paddle.no_grad():
+            #     stats = {"shape": list(tensor_to_print.shape), "dtype": str(tensor_to_print.dtype)}
+            #     if tensor_to_print.numel() > 0:
+            #         tensor_float = tensor_to_print.astype('float32')
+            #         stats["max"] = f"{tensor_float.max().item():.6f}"
+            #         stats["min"] = f"{tensor_float.min().item():.6f}"
+            #         stats["mean"] = f"{tensor_float.mean().item():.6f}"
+            #     import pprint
+            #     logger.info(f"\n--- Weight Status Before Loading ---\nName: {loaded_weight_name}\nStats:\n{pprint.pformat(stats, indent=2)}\n----------------------------------\n")
+
+
+            # --- 后续加载逻辑完全遵循 deepseek_v3 的范式 ---
+            # --- 并且所有地方都使用 `current_weight` ---
+
+            # <--- 从这里开始，是你之前能跑通的、规范化的 `load_weights` 逻辑 --->
+            # <--- 确保所有 `loader(param, loaded_weight, ...)` 都改成了 `loader(param, current_weight, ...)` --->
+            
+            layer_match = re.search(r'\.layers\.(\d+)\.', loaded_weight_name)
             if layer_match and int(layer_match.group(1)) >= self.config.num_hidden_layers:
                 continue
 
             param_to_load = None
 
-            # Rule 1: MoE Expert Weights
-            moe_match = re.search(
-                r"(\.layers\.\d+\.)block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight", loaded_weight_name
-            )
+            # 规则 1: MoE Expert Weights
+            moe_match = re.search(r"(\.layers\.\d+\.)block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight", loaded_weight_name)
             if moe_match:
                 prefix_path, expert_id_str, weight_type = moe_match.groups()
                 expert_id = int(expert_id_str)
-
                 mlp_prefix = f"model{prefix_path.replace('block_sparse_moe', 'mlp')}"
                 if weight_type in ["w1", "w3"]:
                     param_name = f"{mlp_prefix}mlp.experts.up_gate_proj_weight"
                     shard_id = "gate" if weight_type == "w1" else "up"
-                else:  # w2
+                else:
                     param_name = f"{mlp_prefix}mlp.experts.down_proj_weight"
                     shard_id = "down"
 
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    param.weight_loader(param, loaded_weight, expert_id=expert_id, shard_id=shard_id)
-                    param_to_load = param
-
-                loaded_checkpoint_keys.add(loaded_weight_name)
+                    if hasattr(param, 'weight_loader'):
+                        param.weight_loader(param, current_weight, expert_id=expert_id, shard_id=shard_id)
+                        param_to_load = param
                 continue
 
-            # Rule 2: GQA Attention Weights
-            if "self_attn" in loaded_weight_name:
-                layer_idx = int(re.search(r"\.layers\.(\d+)\.", loaded_weight_name).group(1))
-                if self.config.attn_type_list[layer_idx] == 1:  # Is GQA
+            # 规则 2: GQA Attention Weights
+            if 'self_attn' in loaded_weight_name:
+                layer_idx = int(re.search(r'\.layers\.(\d+)\.', loaded_weight_name).group(1))
+                if self.config.attn_type_list[layer_idx] == 1:
                     param_name = loaded_weight_name
                     shard_id = None
-                    if "q_proj.weight" in loaded_weight_name:
-                        param_name = loaded_weight_name.replace("self_attn.q_proj.weight", "qkv_proj.weight")
-                        shard_id = "q"
-                    elif "k_proj.weight" in loaded_weight_name:
-                        param_name = loaded_weight_name.replace("self_attn.k_proj.weight", "qkv_proj.weight")
-                        shard_id = "k"
-                    elif "v_proj.weight" in loaded_weight_name:
-                        param_name = loaded_weight_name.replace("self_attn.v_proj.weight", "qkv_proj.weight")
-                        shard_id = "v"
-                    elif "o_proj.weight" in loaded_weight_name:
-                        param_name = loaded_weight_name.replace("self_attn.o_proj.weight", "o_proj.weight")
+                    if 'q_proj.weight' in loaded_weight_name: param_name = loaded_weight_name.replace('self_attn.q_proj.weight', 'qkv_proj.weight'); shard_id = 'q'
+                    elif 'k_proj.weight' in loaded_weight_name: param_name = loaded_weight_name.replace('self_attn.k_proj.weight', 'qkv_proj.weight'); shard_id = 'k'
+                    elif 'v_proj.weight' in loaded_weight_name: param_name = loaded_weight_name.replace('self_attn.v_proj.weight', 'qkv_proj.weight'); shard_id = 'v'
+                    elif 'o_proj.weight' in loaded_weight_name: param_name = loaded_weight_name.replace('self_attn.o_proj.weight', 'o_proj.weight')
 
                     if param_name in params_dict:
                         param = params_dict[param_name]
-                        loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
-                        loader(param, loaded_weight, shard_id)
+                        loader = getattr(param, 'weight_loader', default_weight_loader(self.fd_config))
+                        loader(param, current_weight, shard_id)
                         param_to_load = param
-
-                    loaded_checkpoint_keys.add(loaded_weight_name)
                     continue
-
-            # Rule 3: General name mapping and default loading
+            
+            # 规则 3: 通用名称映射和默认加载
             param_name = loaded_weight_name
             simple_rename_map = {
                 "block_sparse_moe.gate.weight": "mlp.gate.weight",
@@ -536,21 +651,18 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                 "lm_head.weight": "lm_head.linear.weight",
             }
             for old, new in simple_rename_map.items():
-                if old in param_name:
-                    param_name = param_name.replace(old, new)
-                    break
+                if old in param_name: param_name = param_name.replace(old, new)
 
             if param_name in params_dict:
                 param = params_dict[param_name]
-                loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
-                loader(param, loaded_weight)
+                loader = getattr(param, 'weight_loader', default_weight_loader(self.fd_config))
+                loader(param, current_weight)
                 param_to_load = param
-                loaded_checkpoint_keys.add(loaded_weight_name)
-            elif loaded_weight_name not in loaded_checkpoint_keys:
+            else:
                 logger.warning(f"Weight '{loaded_weight_name}' was not used (tried name '{param_name}').")
 
             if param_to_load is not None:
-                sublayer_name = param.name.rsplit(".", 1)[0]
+                sublayer_name = param_to_load.name.rsplit(".", 1)[0]
                 process_weights_after_loading_fn(sublayer_name, param_to_load)
 
         logger.info("Weight loading process finished.")
