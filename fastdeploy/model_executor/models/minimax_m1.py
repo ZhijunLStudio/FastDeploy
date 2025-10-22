@@ -72,10 +72,10 @@ def print_tensor_stats(tensor, name):
             stats["std"] = f"{tensor_cpu.std().item():.6f}"
             
             # 如果是 2D 张量 (batch, hidden_size)，打印第一个 token 的前5个值
-            if tensor_float.ndim == 2:
-                flat_data = tensor_cpu.numpy()[0, :5]
-            else:
-                flat_data = tensor_cpu.flatten().numpy()[:5]
+            # if tensor_float.ndim == 2:
+            #     flat_data = tensor_cpu.numpy()[0, :5]
+            # else:
+            flat_data = tensor_cpu.flatten().numpy()[:5]
             stats["first_5_values"] = flat_data
         logger.info(f"\n--- [FD DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n")
 # ============================================================================
@@ -102,17 +102,45 @@ class RMSNormTP(nn.Layer):
         # Attach the instance method shard_weight_loader to the weight parameter.
         self.weight.weight_loader = self.shard_weight_loader
 
+    # def forward(self, x):
+    #     """Forward pass for RMSNormTP."""
+    #     orig_dtype = x.dtype
+    #     x_float = x.cast("float32")
+    #     variance = x_float.pow(2).mean(axis=-1, keepdim=True)
+    #     if self.tp_size > 1:
+    #         tensor_model_parallel_all_reduce(variance)
+    #         variance = variance / self.tp_size
+    #     inv_std = paddle.rsqrt(variance + self.eps)
+    #     norm_out = (x_float * inv_std).cast(orig_dtype) * self.weight
+    #     return norm_out
+    
     def forward(self, x):
-        """Forward pass for RMSNormTP."""
+        # --- 详细调试日志 (与 vLLM 对称) ---
+        logger.info(f"--- [FD DEBUG] Entering RMSNormTP for '{self.prefix}' ---")
+        print_tensor_stats(x, f"RMSNorm_Input_{self.prefix}")
+
         orig_dtype = x.dtype
         x_float = x.cast("float32")
+        
         variance = x_float.pow(2).mean(axis=-1, keepdim=True)
+        print_tensor_stats(variance, f"RMSNorm_Variance_Before_AllReduce_{self.prefix}")
+
         if self.tp_size > 1:
             tensor_model_parallel_all_reduce(variance)
             variance = variance / self.tp_size
+            print_tensor_stats(variance, f"RMSNorm_Variance_After_AllReduce_{self.prefix}")
+        
+        # 打印最终用于计算的 variance
+        print_tensor_stats(variance, f"RMSNorm_Variance_{self.prefix}")
+
         inv_std = paddle.rsqrt(variance + self.eps)
+        print_tensor_stats(inv_std, f"RMSNorm_InvStd_{self.prefix}")
+        
         norm_out = (x_float * inv_std).cast(orig_dtype) * self.weight
+        
+        logger.info(f"--- [FD DEBUG] Exiting RMSNormTP for '{self.prefix}' ---")
         return norm_out
+    
 
     def shard_weight_loader(self, param, loaded_weight):
         """Custom loader to shard the full weight."""
@@ -175,10 +203,11 @@ class MiniMaxM1LinearAttention(nn.Layer):
         qkv_act = F.silu(qkv_float32)
         print_tensor_stats(qkv_act, f"L{layer_id}:2_AfterSILU")
 
-        q_act, k_act, v_act = qkv_act.split(3, axis=-1)
-        q = q_act.reshape((total_tokens, self.tp_heads, self.head_dim))
-        k = k_act.reshape((total_tokens, self.tp_heads, self.head_dim))
-        v = v_act.reshape((total_tokens, self.tp_heads, self.head_dim))
+        qkv_reshaped = qkv_act.reshape((total_tokens, self.tp_heads, 3 * self.head_dim))
+
+        # 2. 再 split
+        # 沿着最后一个维度 (3 * head_dim) 切分
+        q, k, v = qkv_reshaped.split([self.head_dim, self.head_dim, self.head_dim], axis=-1)
         
         print_tensor_stats(q, f"L{layer_id}:2a_Split_Q")
         print_tensor_stats(k, f"L{layer_id}:2b_Split_K")
@@ -212,29 +241,42 @@ class MiniMaxM1LinearAttention(nn.Layer):
             k_attn = k_prefill.transpose((1, 0, 2)).unsqueeze(0)
             v_attn = v_prefill.transpose((1, 0, 2)).unsqueeze(0)
             
-            # 在 profile 阶段，linear_attn_caches 可能为 None
-            if forward_meta.linear_attn_caches is None:
-                logger.warning(f"--- [FD DEBUG] L{layer_id} | linear_attn_caches is None. Creating a dummy cache. ---")
-                # 创建一个临时的、形状正确的 dummy cache
-                cache_shape = (
-                    1, # batch size for profile run is usually 1
-                    self.fd_config.model_config.num_hidden_layers,
-                    self.tp_heads,
-                    self.head_dim,
-                    self.head_dim
+            if has_prefill:
+                logger.info(f"--- [FD DEBUG] L{layer_id} | Running PREFILL path ---")
+                q_prefill, k_prefill, v_prefill = q[:prefill_token_num], k[:prefill_token_num], v[:prefill_token_num]
+                
+                q_attn = q_prefill.transpose((1, 0, 2)).unsqueeze(0)
+                k_attn = k_prefill.transpose((1, 0, 2)).unsqueeze(0)
+                v_attn = v_prefill.transpose((1, 0, 2)).unsqueeze(0)
+                
+                # ==================== 关键修正 ====================
+                # Prefill 阶段不应该使用旧的 cache state。我们传入 None。
+                # lightning_attention 函数内部会处理 None 的情况，创建一个全零的 tensor。
+                state_cache_for_prefill = None
+                # ====================================================
+
+                output_prefill, updated_state_cache = lightning_attention(
+                    q_attn, k_attn, v_attn, self.tp_slope, 
+                    kv_history=state_cache_for_prefill, # <--- 传入 None
+                    is_profiling=is_profiling_or_warmup
                 )
-                state_cache = paddle.zeros(cache_shape, dtype="float32")
-                # 只取当前层需要的部分
-                state_cache = state_cache[:, layer_id, :, :, :]
-            else:
-                state_cache = forward_meta.linear_attn_caches[:, layer_id, :, :, :]
-            
-            from fastdeploy.model_executor.ops.triton_ops.minimax_mamba_ops import lightning_attention
-            output_prefill, updated_state_cache = lightning_attention(q_attn, k_attn, v_attn, self.tp_slope, kv_history=state_cache, is_profiling=is_profiling_or_warmup)
-            
-            if forward_meta.linear_attn_caches is not None:
-                forward_meta.linear_attn_caches[:, layer_id, :, :, :] = updated_state_cache
-            output_prefill = output_prefill.squeeze(0).transpose((1, 0, 2)).reshape((prefill_token_num, -1))
+                
+                # 只有在计算完成后，才把新的状态写回全局 cache，为 Decode 做准备
+                if forward_meta.linear_attn_caches is not None:
+                    # 注意：这里需要根据 slot_mapping 将 updated_state_cache 写回到正确的位置
+                    # 假设 prefill 只有一个 request，slot_id 是 0
+                    # 这是一个简化的假设，你需要根据你的调度逻辑来获取正确的 slot_id
+                    slot_indices = forward_meta.slot_mapping[:prefill_token_num].unique()
+                    if len(slot_indices) > 0:
+                        # updated_state_cache 的 shape 是 [B, H, D, E]，B 对应 prefill 的 batch size
+                        # forward_meta.linear_attn_caches 的 shape 是 [max_slots, L, H, D, E]
+                        # 我们需要将 updated_state_cache 写回到 slot_indices 对应的位置
+                        # 这里的索引逻辑可能需要你根据 FD 的实现微调
+                        # 假设 B=1, slot_indices[0] 就是当前 request 的 slot
+                        current_slot = slot_indices[0].item()
+                        forward_meta.linear_attn_caches[current_slot, layer_id, :, :, :] = updated_state_cache.squeeze(0)
+
+                output_prefill = output_prefill.squeeze(0).transpose((1, 0, 2)).reshape((prefill_token_num, -1))
 
         if has_decode:
             logger.info(f"--- [FD DEBUG] L{layer_id} | Running DECODE path ---")
@@ -413,35 +455,55 @@ class MiniMaxM1DecoderLayer(nn.Layer):
         self.layernorm_mlp_alpha = config.layernorm_mlp_alpha
         self.layernorm_mlp_beta = config.layernorm_mlp_beta
 
-    def forward(self, forward_meta: ForwardMeta, hidden_states: paddle.Tensor, residual: Optional[paddle.Tensor]):
+    
+    def forward(self, forward_meta: ForwardMeta, hidden_states: paddle.Tensor, residual: Optional[paddle.Tensor], run_mode: str = "[UNKNOWN]"):
         """Forward pass for the decoder layer."""
+        layer_id = self.original_layer_id
+        logger.info(f"\n{'='*20} {run_mode} [FD DEBUG] Entering DecoderLayer {layer_id} {'='*20}")
+        print_tensor_stats(hidden_states, f"{run_mode} L{layer_id}:0a_Input_HiddenStates")
+        print_tensor_stats(residual, f"{run_mode} L{layer_id}:0b_Input_Residual")
+
+        # --- Attention Block ---
         layernorm_output = self.input_layernorm(hidden_states)
+        print_tensor_stats(layernorm_output, f"{run_mode} L{layer_id}:1_After_InputLayernorm")
+        
         residual_attn = layernorm_output if self.postnorm else hidden_states
+        
+        attn_output = None
         if self.attn_type == 1:  # GQA
             qkv_out = self.qkv_proj(layernorm_output)
             attn_output = self.self_attn(qkv=qkv_out, forward_meta=forward_meta)
             attn_output = self.o_proj(attn_output)
         else:  # Linear Attention
             attn_output = self.self_attn(layernorm_output, forward_meta)
+        print_tensor_stats(attn_output, f"{run_mode} L{layer_id}:2_After_Attention")
 
-        hidden_states = (residual_attn * self.layernorm_attention_alpha) + (attn_output * self.layernorm_attention_beta)
+        # --- Residual Connection 1 ---
+        hidden_states_after_attn = (residual_attn * self.layernorm_attention_alpha) + (attn_output * self.layernorm_attention_beta)
+        print_tensor_stats(hidden_states_after_attn, f"{run_mode} L{layer_id}:3_After_Attn_Residual(alpha={self.layernorm_attention_alpha}, beta={self.layernorm_attention_beta})")
 
-        # MLP Block
-        layernorm_output_mlp = self.post_attention_layernorm(hidden_states)
-        residual_mlp = layernorm_output_mlp if self.postnorm else hidden_states
+        # --- MLP Block ---
+        layernorm_output_mlp = self.post_attention_layernorm(hidden_states_after_attn)
+        print_tensor_stats(layernorm_output_mlp, f"{run_mode} L{layer_id}:4_After_PostAttnLayernorm")
+        
+        residual_mlp = layernorm_output_mlp if self.postnorm else hidden_states_after_attn
 
         mlp_output = self.mlp(layernorm_output_mlp)
+        print_tensor_stats(mlp_output, f"{run_mode} L{layer_id}:5a_After_MoE_MLP")
 
         if self.shared_moe:
             shared_output = self.shared_mlp(layernorm_output_mlp)
             coef_logits = self.coefficient(layernorm_output_mlp.cast("float32"))
             coef = F.sigmoid(coef_logits)
             mlp_output = mlp_output.cast(coef.dtype) * (1 - coef) + shared_output.cast(coef.dtype) * coef
+            print_tensor_stats(mlp_output, f"{run_mode} L{layer_id}:5b_After_Shared_MLP_Merge")
 
-        # Final alpha/beta scaling and residual connection
+        # --- Residual Connection 2 ---
         final_output = (residual_mlp * self.layernorm_mlp_alpha) + (mlp_output * self.layernorm_mlp_beta)
-
-        return final_output, None
+        print_tensor_stats(final_output, f"{run_mode} L{layer_id}:6_FinalOutput(alpha={self.layernorm_mlp_alpha}, beta={self.layernorm_mlp_beta})")
+        
+        logger.info(f"{'='*20} [FD DEBUG] Exiting DecoderLayer {layer_id} {'='*20}\n")
+        return final_output, None # residual is managed internally now
 
 
 @support_graph_optimization
@@ -452,6 +514,7 @@ class MiniMaxM1Model(nn.Layer):
 
     def __init__(self, fd_config: FDConfig):
         super().__init__()
+        self.fd_config = fd_config 
         self.config = fd_config.model_config
         prefix = "model"
         self.embed_tokens = VocabParallelEmbedding(
@@ -473,18 +536,98 @@ class MiniMaxM1Model(nn.Layer):
         )
 
     
+    # def forward(self, ids_remove_padding: paddle.Tensor, forward_meta: ForwardMeta):
+    #     print_tensor_stats(ids_remove_padding, "TOP:0_InputIDs")
+    #     hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
+    #     print_tensor_stats(hidden_states, "TOP:1_AfterEmbedding")
+        
+    #     for i in range(len(self.layers)):
+    #         layer = self.layers[str(i)]
+    #         hidden_states, _ = layer(forward_meta=forward_meta, hidden_states=hidden_states, residual=None)
+    #         # print_tensor_stats(hidden_states, f"TOP:2_AfterLayer_{i}")
+            
+    #     out = self.norm(hidden_states)
+    #     print_tensor_stats(out, "TOP:3_FinalOutput")
+    #     return out
     def forward(self, ids_remove_padding: paddle.Tensor, forward_meta: ForwardMeta):
-        print_tensor_stats(ids_remove_padding, "TOP:0_InputIDs")
+        
+        # debug_ids_list = [23246, 457, 390, 1219] # 使用和 vLLM 完全相同的 ID 列表
+        # current_len = ids_remove_padding.shape[0]
+
+        # if len(debug_ids_list) >= current_len:
+        #     ids_remove_padding = paddle.to_tensor(debug_ids_list[:current_len], dtype=ids_remove_padding.dtype)
+        # else:
+        #     final_ids = debug_ids_list + [0] * (current_len - len(debug_ids_list))
+        #     ids_remove_padding = paddle.to_tensor(final_ids, dtype=ids_remove_padding.dtype)
+            
+        # --- Start of Detailed Embedding Debug Prints ---
+        # ==================== 第2步：使用 self.fd_config ====================
+        # 现在可以安全地访问 self.fd_config 了
+        if self.fd_config.parallel_config.tensor_parallel_rank == 0:
+            print("\n--- [FD DEBUG] Inside MiniMaxM1Model.forward (Embedding Details) ---")
+
+            # 打印前10个输入 token ID
+            print(f"Input IDs (first 10): {ids_remove_padding[:10].tolist()}")
+
+            # 检查特定的 token ID (例如 5)
+            test_token_id = 5
+            weight_matrix = self.embed_tokens.embeddings.weight
+            
+            # 假设 FD 单卡运行，local_idx 就是 token_id
+            local_idx = test_token_id
+            if local_idx < weight_matrix.shape[0]:
+                weight_vector = weight_matrix[local_idx, :5].astype('float32').cpu().numpy()
+                print(f"Weight for token ID {test_token_id}, first 5 values: {weight_vector}")
+
+            print_tensor_stats(ids_remove_padding, "Input IDs")
+            print_tensor_stats(weight_matrix, "Embedding Weight")
+        # ===================================================================
+        # --- End of Detailed Prints ---
+
+        # print_tensor_stats(ids_remove_padding, "TOP:0_InputIDs")
+        # hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
+
+        # # --- More Detailed Prints ---
+        # if self.fd_config.parallel_config.tensor_parallel_rank == 0:
+        #     first_token_output = hidden_states[0, :5].astype('float32').cpu().numpy()
+        #     print(f"Output embedding for first token (ID: {ids_remove_padding[0].item()}), first 5 values: {first_token_output}")
+        #     print("--- [FD DEBUG] Exiting Embedding Section ---\n")
+        # # --- End of Detailed Prints ---
+
+        # print_tensor_stats(hidden_states, "TOP:1_AfterEmbedding")
+        
+        # for i in range(len(self.layers)):
+        #     layer = self.layers[str(i)]
+        #     hidden_states, _ = layer(forward_meta=forward_meta, hidden_states=hidden_states, residual=None)
+            
+        # out = self.norm(hidden_states)
+        # print_tensor_stats(out, "TOP:3_FinalOutput")
+        # return out
+        
+        
+        # 在所有打印前都加上 run_mode 前缀
+                
+        # ==================== 区分 Profile 和 正式推理 ====================
+        # 在 profile_run 期间，forward_meta.seq_lens_encoder 通常会被设置为一个非零长度的 dummy tensor
+        # 在真实推理时，它会反映真实的 prefill token 数量。
+        # 一个更可靠的标志是 `step_use_cudagraph`，它在 profile 时为 True，推理时通常为 False。
+        is_profile_run = forward_meta.step_use_cudagraph
+        run_mode = "[PROFILE]" if is_profile_run else "[INFERENCE]"
+
+        if self.fd_config.parallel_config.tensor_parallel_rank == 0:
+            print(f"\n{'#'*20} FastDeploy RUN MODE: {run_mode} {'#'*20}\n")
+        # =================================================================
+        print_tensor_stats(ids_remove_padding, f"{run_mode} TOP:0_InputIDs")
         hidden_states = self.embed_tokens(ids_remove_padding=ids_remove_padding)
-        print_tensor_stats(hidden_states, "TOP:1_AfterEmbedding")
+        print_tensor_stats(hidden_states, f"{run_mode} TOP:1_AfterEmbedding")
         
         for i in range(len(self.layers)):
             layer = self.layers[str(i)]
-            hidden_states, _ = layer(forward_meta=forward_meta, hidden_states=hidden_states, residual=None)
-            print_tensor_stats(hidden_states, f"TOP:2_AfterLayer_{i}")
+            # 将 run_mode 传递下去
+            hidden_states, _ = layer(forward_meta=forward_meta, hidden_states=hidden_states, residual=None, run_mode=run_mode)
             
         out = self.norm(hidden_states)
-        print_tensor_stats(out, "TOP:3_FinalOutput")
+        print_tensor_stats(out, f"{run_mode} TOP:3_FinalOutput")
         return out
 
 
@@ -604,6 +747,29 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                 continue
 
             param_to_load = None
+            
+            # ==================== 核心修复：在这里添加 Linear Attention 的规则 ====================
+            # is_linear_attn_weight = False
+            # if 'self_attn' in loaded_weight_name and layer_match:
+            #     layer_idx = int(layer_match.group(1))
+            #     if self.config.attn_type_list[layer_idx] == 0: # 确认是 Linear Attention 层
+            #         is_linear_attn_weight = True
+            
+            # if is_linear_attn_weight:
+            #     # Linear Attention 的权重名是 '...self_attn.qkv_proj.weight'
+            #     # 模型中的参数名也是 '...self_attn.qkv_proj.weight'
+            #     # 所以我们不需要替换名字，直接用 loaded_weight_name
+            #     param_name = loaded_weight_name
+            #     if param_name in params_dict:
+            #         param = params_dict[param_name]
+            #         # 获取 ColumnParallelLinear / RowParallelLinear 自带的 loader
+            #         loader = getattr(param, 'weight_loader', default_weight_loader(self.fd_config))
+            #         loader(param, current_weight) # 调用它自己的 loader
+            #         param_to_load = param
+            #     else:
+            #          logger.error(f"[Linear Attn] Could not find target param: {param_name}")
+            #     continue # 处理完后直接进入下一次循环
+            # ===================================================================================
 
             # 规则 1: MoE Expert Weights
             moe_match = re.search(r"(\.layers\.\d+\.)block_sparse_moe\.experts\.(\d+)\.(w[123])\.weight", loaded_weight_name)
@@ -660,6 +826,28 @@ class MiniMaxM1ForCausalLM(ModelForCasualLM):
                 param_to_load = param
             else:
                 logger.warning(f"Weight '{loaded_weight_name}' was not used (tried name '{param_name}').")
+                
+                
+            # # ==================== 新增的权重加载 DEBUG ====================
+            # if "qkv_proj.weight" in loaded_weight_name and "self_attn" in loaded_weight_name:
+            #     layer_idx_match = re.search(r'\.layers\.(\d+)\.', loaded_weight_name)
+            #     if layer_idx_match:
+            #         layer_idx = int(layer_idx_match.group(1))
+            #         # 只打印前几个 linear attention 层的
+            #         if self.config.attn_type_list[layer_idx] == 0 and layer_idx < 2: 
+            #             logger.warning(f"\n--- [FD WEIGHT DEBUG] ---")
+            #             logger.warning(f"Found weight: {loaded_weight_name}")
+            #             logger.warning(f"Loaded weight shape: {current_weight.shape}")
+                        
+            #             target_param_name = loaded_weight_name.replace("self_attn.", "")
+            #             if target_param_name in params_dict:
+            #                 target_param = params_dict[target_param_name]
+            #                 logger.warning(f"Target param name: {target_param_name}")
+            #                 logger.warning(f"Target param shape in model: {target_param.shape}")
+            #             else:
+            #                 logger.error(f"Could not find target param: {target_param_name}")
+            #             logger.warning(f"-------------------------\n")
+            # # ==========================================================
 
             if param_to_load is not None:
                 sublayer_name = param_to_load.name.rsplit(".", 1)[0]

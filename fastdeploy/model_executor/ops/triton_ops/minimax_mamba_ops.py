@@ -20,21 +20,39 @@ from .minimax_mamba_kernels import (
 def print_tensor_stats(tensor, name):
     """打印Paddle张量的统计信息 (强制 float32)"""
     if tensor is None:
-        logger.info(f"[FD DEBUG_KERNEL] {name} is None")
+        logger.info(f"DEBUG_OPS_FD: {name} is None")
         return
     with paddle.no_grad():
         stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
         if tensor.numel() > 0:
             tensor_float = tensor.astype('float32')
             tensor_cpu = tensor_float.cpu()
-            stats["max"] = f"{tensor_cpu.max().item():.6f}"
-            stats["min"] = f"{tensor_cpu.min().item():.6f}"
-            stats["mean"] = f"{tensor_cpu.mean().item():.6f}"
-            stats["std"] = f"{tensor_cpu.std().item():.6f}"
+
+            # ==================== 新增检查 ====================
+            has_nan = paddle.any(paddle.isnan(tensor_cpu)).item()
+            has_inf = paddle.any(paddle.isinf(tensor_cpu)).item()
+            stats["has_nan"] = has_nan
+            stats["has_inf"] = has_inf
+            # ================================================
+
+            # 只有在没有 nan/inf 的情况下才计算统计值
+            if not has_nan and not has_inf:
+                stats["max"] = f"{tensor_cpu.max().item():.6f}"
+                stats["min"] = f"{tensor_cpu.min().item():.6f}"
+                stats["mean"] = f"{tensor_cpu.mean().item():.6f}"
+                stats["std"] = f"{tensor_cpu.std().item():.6f}"
+            else:
+                stats["max"] = "NaN/Inf Present"
+                stats["min"] = "NaN/Inf Present"
+                stats["mean"] = "NaN/Inf Present"
+                stats["std"] = "NaN/Inf Present"
+            
+            # if tensor_float.ndim == 2:
+            #     flat_data = tensor_cpu.numpy()[0, :5]
+            # else:
             flat_data = tensor_cpu.flatten().numpy()[:5]
             stats["first_5_values"] = flat_data
-        stats_str = f"\n--- [FD DEBUG_KERNEL] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n"
-        logger.info(stats_str)
+        logger.info(f"\n--- [FD OPS DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n")
 
 # 这是一个基于 paddle.autograd.Function 的包装类，用于调用 Triton kernels
 # 它的作用类似于 PyTorch 中的 torch.autograd.Function
@@ -79,6 +97,7 @@ class _Attention(paddle.autograd.PyLayer):
             b=b, h=h, n=n, d=d, e=e,
             BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK, CBLOCK=CBLOCK_DIAG,
         )
+        print_tensor_stats(o, "PyLayer_After_DiagKernel")
 
         # Step 2
         NUM_FBLOCK = 1
@@ -95,15 +114,20 @@ class _Attention(paddle.autograd.PyLayer):
             D_FBLOCK=D_FBLOCK, E_FBLOCK=E_FBLOCK, NUM_FBLOCK=NUM_FBLOCK,
             CBLOCK=CBLOCK_KV_AND_NON_DIAG, NUM_CBLOCK=NUM_CBLOCK_KV_AND_NON_DIAG,
         )
+        print_tensor_stats(kv, "PyLayer_After_KVParallelKernel")
 
         # Step 3: 将新创建的 kv_history_compute 传入，让它被原地修改
         grid_kv_reduce = (b * h, NUM_FBLOCK)
+        print_tensor_stats(kv_history_compute, "PyLayer_Before_KVReduceKernel_History")
         _fwd_kv_reduce[grid_kv_reduce](
             s, kv, kv_history_compute,  # <--- 使用副本
             b=b, h=h, n=n, d=d, e=e,
             BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK,
             D_FBLOCK=D_FBLOCK, E_FBLOCK=E_FBLOCK,
         )
+        print_tensor_stats(kv, "PyLayer_After_KVReduceKernel_KV") # 这个张量被原地修改了
+        print_tensor_stats(kv_history_compute, "PyLayer_After_KVReduceKernel_History")
+
 
         # Step 4
         grid_none_diag = (b * h, NUM_BLOCK * NUM_CBLOCK_KV_AND_NON_DIAG)
@@ -113,6 +137,7 @@ class _Attention(paddle.autograd.PyLayer):
             BLOCK=BLOCK, NUM_BLOCK=NUM_BLOCK, E_FBLOCK=E_FBLOCK,
             CBLOCK=CBLOCK_KV_AND_NON_DIAG, NUM_CBLOCK=NUM_CBLOCK_KV_AND_NON_DIAG,
         )
+        print_tensor_stats(o, "PyLayer_After_NoneDiagKernel")
         
         # 返回计算结果和被更新后的 kv_history 副本
         return o, kv_history_compute
@@ -125,12 +150,12 @@ def lightning_attention(
     q: paddle.Tensor,
     k: paddle.Tensor,
     v: paddle.Tensor,
-    slope_rate: paddle.Tensor,
+    slope_rate: paddle.Tensor, # 在 vLLM 中叫 ed
     kv_history: Optional[paddle.Tensor] = None,
-    is_profiling: bool = False,
-    block_size: int = 256,
+    is_profiling: bool = False, # vLLM 中没有这个参数，但我们可以保留
+    block_size: int = 256,      # vLLM 中作为默认值
 ) -> tuple[paddle.Tensor, paddle.Tensor]:
-    
+
     if is_profiling:
         logger.warning("<<<<< RUNNING in PROFILING MODE for LIGHTNING ATTENTION! >>>>>")
         logger.warning("<<<<< Bypassing actual computation and returning dummy tensors. >>>>>")
@@ -139,25 +164,66 @@ def lightning_attention(
         return dummy_output, dummy_kv_state
 
     logger.info("<<<<< RUNNING TRITON KERNEL FOR LIGHTNING ATTENTION! >>>>>")
-    
-    original_dtype = q.dtype
-    
+    print_tensor_stats(q, "Kernel_Wrapper_Input_Q")
+    print_tensor_stats(k, "Kernel_Wrapper_Input_K")
+    print_tensor_stats(v, "Kernel_Wrapper_Input_V")
+
+    d = q.shape[-1]
+    e = v.shape[-1]
+
     if slope_rate.dim() == 1:
         slope_rate = slope_rate.reshape([1, -1, 1, 1])
 
-    if kv_history is None:
-        kv_history = paddle.zeros(shape=[q.shape[0], q.shape[1], q.shape[3], v.shape[3]], dtype="float32")
+    m = 128 if d >= 128 else 64
+    if d % m != 0:
+        raise ValueError(f"Head dimension d ({d}) must be divisible by chunk size m ({m})")
     
-    # ==================== 核心修改：移除这里的 clone ====================
-    # kv_history = kv_history.clone().contiguous() # <--- 移除这一行
-    # 直接将原始的 kv_history 传给 apply
-    # =================================================================
+    arr = [m * i for i in range(d // m + 1)]
+    if arr[-1] != d:
+        arr.append(d)
+    
+    num_chunks = len(arr) - 1
+    output = 0
 
-    output, updated_kv_history = _Attention.apply(q, k, v, slope_rate, kv_history)
+    if kv_history is None:
+        kv_history_for_loop = paddle.zeros(
+            shape=[q.shape[0], q.shape[1], d, e], dtype="float32"
+        )
+    else:
+        kv_history_for_loop = paddle.clone(kv_history).contiguous()
 
-    return output.astype(original_dtype), updated_kv_history.astype(original_dtype)
+    logger.info(f">>> [DEBUG] Starting chunked attention computation. Total chunks: {num_chunks}")
 
+    final_kv_state = None
+    for i in range(num_chunks):
+        s = arr[i]
+        e_chunk = arr[i + 1]
+        
+        q_chunk = q[..., s:e_chunk]
+        k_chunk = k[..., s:e_chunk]
+        
+        # 你的 _Attention.apply 需要能够处理切片后的 Q, K
+        # 假设它返回的是一个完整的、更新后的 kv_history
+        
+        logger.info(f">>> [DEBUG] Processing chunk {i}: head_dim slice [{s}:{e_chunk}]")
+        print_tensor_stats(q_chunk, f"Kernel_Chunk_{i}_Input_Q")
+        print_tensor_stats(k_chunk, f"Kernel_Chunk_{i}_Input_K")
+        print_tensor_stats(kv_history_for_loop, f"Kernel_Chunk_{i}_Input_KV_History")
 
+        o_chunk, updated_full_kv_history = _Attention.apply(q_chunk, k_chunk, v, slope_rate, kv_history_for_loop)
+        
+        print_tensor_stats(o_chunk, f"Kernel_Chunk_{i}_Output_O")
+
+        output = output + o_chunk
+        
+        # 更新 kv_history 以便下一次循环使用
+        kv_history_for_loop = updated_full_kv_history
+        final_kv_state = updated_full_kv_history
+    
+    print_tensor_stats(output, "Kernel_Final_Aggregated_Output_O")
+    
+    # 返回最终的累加输出和最后一次更新后的完整 kv 状态
+    return output.astype(k.dtype), final_kv_state
 
 # ----------------------------------------------------------------------------------
 #  decode 函数保持不变，因为它已经使用了 Triton Kernel

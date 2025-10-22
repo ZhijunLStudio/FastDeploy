@@ -12,16 +12,17 @@ class TestMiniMaxMambaOps(unittest.TestCase):
     
     def setUp(self):
         self.device = paddle.CUDAPlace(0)
-        self.golden_data_path = "/home/aistudio/golden_data"
+        self.golden_data_path = "./golden_data" # 建议使用相对路径
 
     def load_npy(self, filename: str):
         full_path = os.path.join(self.golden_data_path, filename)
         if not os.path.exists(full_path):
             raise FileNotFoundError(
                 f"Golden data file not found at: {full_path}. "
-                "Please ensure you have run the `generate_golden_data.py` script."
+                "Please run `generate_golden_data.py` first."
             )
-        return paddle.to_tensor(np.load(full_path), place=self.device)
+        # 显式转换为 float32，确保与生成数据时的精度一致
+        return paddle.to_tensor(np.load(full_path), place=self.device, dtype='float32')
 
     def test_prefill_lightning_attention(self):
         print("\n--- Testing Prefill (lightning_attention) ---")
@@ -34,9 +35,18 @@ class TestMiniMaxMambaOps(unittest.TestCase):
         output_golden = self.load_npy("prefill_output_golden.npy")
         kv_history_out_golden = self.load_npy("prefill_kv_history_out_golden.npy")
 
+        # 确认输入形状
+        print(f"DEBUG (Prefill): Input q shape: {q.shape}")
+        print(f"DEBUG (Prefill): Input kv_history_in shape: {kv_history_in.shape}")
+
         output_fd, kv_history_out_fd = lightning_attention(
             q, k, v, slope_rate, kv_history=kv_history_in
         )
+        
+        # 确认输出形状
+        print(f"DEBUG (Prefill): FD output shape: {output_fd.shape}, Golden output shape: {output_golden.shape}")
+        print(f"DEBUG (Prefill): FD kv_history_out shape: {kv_history_out_fd.shape}, Golden kv_history_out shape: {kv_history_out_golden.shape}")
+
 
         rtol, atol = 1e-4, 1e-4
         
@@ -66,16 +76,14 @@ class TestMiniMaxMambaOps(unittest.TestCase):
         output_golden = self.load_npy("decode_output_golden.npy")
         kv_caches_out_golden = self.load_npy("decode_kv_caches_out_golden.npy")
         
-        # +++++++++++++++++++ 关键修正 2: 加入调试打印 +++++++++++++++++++
-        print(f"DEBUG (Decode): Shape of q loaded from npy: {q.shape}")
-        print(f"DEBUG (Decode): Shape of k loaded from npy: {k.shape}")
-        print(f"DEBUG (Decode): Shape of v loaded from npy: {v.shape}")
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        print(f"DEBUG (Decode): Input q shape: {q.shape}")
 
         kv_caches_fd = kv_caches_in.clone()
         output_fd = linear_decode_forward_triton(
             q, k, v, kv_caches_fd, slope_rate, slot_idx, BLOCK_SIZE=32
         )
+
+        print(f"DEBUG (Decode): FD output shape: {output_fd.shape}, Golden output shape: {output_golden.shape}")
 
         rtol, atol = 1e-4, 1e-4
 

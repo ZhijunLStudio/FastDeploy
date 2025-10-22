@@ -130,10 +130,35 @@ class CustomAllreduce:
         lib = cuda_wrapper.CudaRTLibrary()
         lib.cudaFree(ctypes.c_void_p(pointers[rank]))
 
+    # def should_custom_ar(self, inp: paddle.Tensor):
+    #     if self.capturing:
+    #         return True
+    #     inp_size = inp.shape[0] * inp.shape[1] * inp.element_size()
+    #     # custom allreduce requires input byte size to be multiples of 16
+    #     if inp_size % 16 != 0:
+    #         return False
+    #     # for 4 or more non NVLink-capable GPUs, custom allreduce provides
+    #     # little performance improvement over NCCL.
+    #     if self.world_size == 2 or self.full_nvlink:
+    #         return inp_size < self.max_size
+    #     return False
     def should_custom_ar(self, inp: paddle.Tensor):
         if self.capturing:
             return True
-        inp_size = inp.shape[0] * inp.shape[1] * inp.element_size()
+        
+        # --- [修复] ---
+        # 1. 使用 paddle.numel() 计算总元素数，保证对任意维度张量都正确
+        num_elements = paddle.numel(inp)
+        inp_size = num_elements * inp.element_size()
+
+        # 2. 增加一个最小尺寸阈值。对于非常小的张量，直接使用原生all_reduce更稳定且性能差异不大。
+        #    这里的 256 字节是一个经验值，可以调整。
+        #    我们的 variance (16字节) 会在这里返回 False。
+        MIN_SIZE_THRESHOLD = 256 
+        if inp_size < MIN_SIZE_THRESHOLD:
+            return False
+        # --- [结束修复] ---
+        
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False

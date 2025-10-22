@@ -123,14 +123,14 @@ class LLMEngine:
         # Some tokenizers do not have a pad_token_id, which causes issues with padding.
         # We use the eos_token_id as a robust fallback in such cases.
         if self.data_processor.pad_token_id is None:
-            eos_token_id = self.data_processor.tokenizer.eos_token_id
+            eos_token_id = 200000
             if eos_token_id is not None:
                 console_logger.warning(
                     f"Tokenizer's pad_token_id is None. Setting it to the eos_token_id ({eos_token_id}) for padding."
                 )
                 # 1. Update the tokenizer instance directly. This is crucial for padding operations.
                 self.data_processor.tokenizer.pad_token_id = eos_token_id
-
+                # self.data_processor.tokenizer.pad_token_id = 200000
                 # 2. Update the data_processor's attribute to ensure workers are initialized with the correct value.
                 self.data_processor.pad_token_id = eos_token_id
 
