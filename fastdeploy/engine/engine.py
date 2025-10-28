@@ -476,11 +476,23 @@ class LLMEngine:
         worker_path = "../worker/worker_process.py"
         py_script = os.path.join(current_dir_path, worker_path)
 
-        ori_vocab_size = (
-            len(self.engine.data_processor.tokenizer.sp_model)
-            if hasattr(self.engine.data_processor.tokenizer, "sp_model")
-            else len(self.engine.data_processor.tokenizer.vocab)
-        )
+        # ori_vocab_size = (
+        #     len(self.engine.data_processor.tokenizer.sp_model)
+        #     if hasattr(self.engine.data_processor.tokenizer, "sp_model")
+        #     else len(self.engine.data_processor.tokenizer.vocab)
+        # )
+        # 优先使用标准的 vocab_size 属性，这是所有 tokenizer 都应该具备的
+        if hasattr(self.engine.data_processor.tokenizer, "vocab_size"):
+            ori_vocab_size = self.engine.data_processor.tokenizer.vocab_size
+        # 兼容旧的 sp_model 逻辑
+        elif hasattr(self.engine.data_processor.tokenizer, "sp_model"):
+            ori_vocab_size = len(self.engine.data_processor.tokenizer.sp_model)
+        # 最后的 fallback
+        elif hasattr(self.engine.data_processor.tokenizer, "vocab"):
+            ori_vocab_size = len(self.engine.data_processor.tokenizer.vocab)
+        else:
+            # 如果以上方法都失败，抛出一个明确的错误
+            raise AttributeError(f"Tokenizer of type {type(self.engine.data_processor.tokenizer).__name__} does not have a standard way to determine vocab size (e.g., 'vocab_size' property or 'vocab' attribute).")
 
         think_end_id = self.data_processor.tokenizer.get_vocab().get("</think>", -1)
         if think_end_id > 0:

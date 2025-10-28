@@ -66,6 +66,19 @@ class InputPreprocessor:
             tool_parser_obj = ToolParserManager.get_tool_parser(self.tool_parser)
 
         architecture = self.model_config.architectures[0]
+        
+        # --- START OF MINIMAL INTRUSION MODIFICATION ---
+        # 1. 优先检查 model_type 是否为 'kimi_k2'
+        model_type = getattr(self.model_config, 'model_type', None)
+        if model_type == "kimi_k2":
+            from fastdeploy.input.kimi_k2_processor import KimiK2Processor
+            self.processor = KimiK2Processor(
+                model_name_or_path=self.model_name_or_path,
+                reasoning_parser_obj=reasoning_parser_obj,
+                tool_parser_obj=tool_parser_obj,
+            )
+            return self.processor
+        # --- END OF MINIMAL INTRUSION MODIFICATION ---
 
         try:
             from fastdeploy.plugins.input_processor import load_input_processor_plugins

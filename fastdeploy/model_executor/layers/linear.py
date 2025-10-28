@@ -262,6 +262,7 @@ class ReplicatedLinear(LinearBase):
         skip_quant: bool = False,
         weight_dtype: str = "",
         weight_key: str = "",
+        output_dim: bool = False,
     ):
         """
         Initializes a replicated linear layer.
@@ -291,13 +292,22 @@ class ReplicatedLinear(LinearBase):
         self.hidden_size = fd_config.model_config.hidden_size
 
         assert self.quant_method is not None
+        extra_attrs = {
+            "output_dim": output_dim,
+            "weight_loader": self.weight_loader if hasattr(self, "weight_loader") else default_weight_loader(self.fd_config),
+            "model_format": fd_config.model_config.model_format,
+        }
         self.quant_method.create_weights(
             self,
-            weight_loader=(
-                self.weight_loader if hasattr(self, "weight_loader") else default_weight_loader(self.fd_config)
-            ),
-            model_format=fd_config.model_config.model_format,
+            **extra_attrs,
         )
+        # self.quant_method.create_weights(
+        #     self,
+        #     weight_loader=(
+        #         self.weight_loader if hasattr(self, "weight_loader") else default_weight_loader(self.fd_config)
+        #     ),
+        #     model_format=fd_config.model_config.model_format,
+        # )
 
 
 class MergedReplicatedLinear(ReplicatedLinear):
@@ -339,6 +349,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
             skip_quant=skip_quant,
             weight_dtype=weight_dtype,
             weight_key=weight_key,
+            output_dim=True, 
         )
         self.output_sizes = output_sizes
 
@@ -408,6 +419,15 @@ class ColumnParallelLinear(LinearBase):
             add_bias (bool): Whether to add bias in the current layer or in the pre/post layer. Defaults to False.
             skip_quant (bool): Whether to skip quantization. Defaults to False.
         """
+        tp_size = fd_config.parallel_config.tensor_parallel_size
+        output_size_per_rank = output_size // tp_size if tp_size > 0 else output_size
+        print(f"--- [DEBUG] Initializing ColumnParallelLinear ---")
+        print(f"  - prefix: {prefix}")
+        print(f"  - input_size: {input_size}")
+        print(f"  - original output_size: {output_size}")
+        print(f"  - tp_size: {tp_size}")
+        print(f"  - calculated output_size_per_rank: {output_size_per_rank}")
+        
         self.fd_config = fd_config
         self.nranks = fd_config.parallel_config.tensor_parallel_size
         self.input_size = input_size
@@ -813,6 +833,16 @@ class RowParallelLinear(LinearBase):
             add_bias (bool): Whether to add bias in the current layer or in the pre/post layer. Defaults to False.
             skip_quant (bool): Whether to skip quantization. Defaults to False.
         """
+        # --- 在 __init__ 方法的开头添加 debug 日志 ---
+        tp_size = fd_config.parallel_config.tensor_parallel_size
+        input_size_per_rank = input_size // tp_size if tp_size > 0 else input_size
+        print(f"--- [DEBUG] Initializing RowParallelLinear ---")
+        print(f"  - prefix: {prefix}")
+        print(f"  - original input_size: {input_size}")
+        print(f"  - output_size: {output_size}")
+        print(f"  - tp_size: {tp_size}")
+        print(f"  - calculated input_size_per_rank: {input_size_per_rank}")
+        
         self.fd_config = fd_config
         self.skip_quant = False
         self.nranks = fd_config.parallel_config.tensor_parallel_size

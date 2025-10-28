@@ -98,6 +98,12 @@ class DeepSeekV3MLP(nn.Layer):
             bias=None,
             act_method=fd_config.model_config.hidden_act,
         )
+        # --- 添加 debug 日志 ---
+        print(f"--- [DEBUG] Initializing DeepSeekV3MLP ---")
+        print(f"  - prefix: {prefix}")
+        print(f"  - intermediate_size: {intermediate_size}")
+        print(f"  - up_gate_proj weight shape: {getattr(self.up_gate_proj, 'weight', 'N/A').shape}")
+        print(f"  - down_proj weight shape: {getattr(self.down_proj, 'weight', 'N/A').shape}")
 
     def load_state_dict(self, state_dict):
         """ """
@@ -173,6 +179,19 @@ class DeepSeekV3MoE(nn.Layer):
             prefix=f"{prefix}.shared_experts",
             reduce_results=False,
         )
+        # --- 添加 debug 日志 ---
+        print(f"--- [DEBUG] Initializing DeepSeekV3MoE (Layer {layer_id}) ---")
+        print(f"  - prefix: {prefix}")
+        print(f"  - n_routed_experts: {fd_config.model_config.n_routed_experts}")
+        print(f"  - n_shared_experts: {fd_config.model_config.n_shared_experts}")
+        print(f"  - moe_intermediate_size: {fd_config.model_config.moe_intermediate_size}")
+        # 我们可以检查第一个 expert 的形状作为代表
+        # first_expert = next((expert for expert in self.experts if expert is not None), None)
+        # if first_expert:
+        #     print(f"  - (First) expert up_gate_proj shape: {getattr(first_expert.up_gate_proj, 'weight', 'N/A').shape}")
+        #     print(f"  - (First) expert down_proj shape: {getattr(first_expert.down_proj, 'weight', 'N/A').shape}")
+        print(f"  - shared_experts up_gate_proj shape: {getattr(self.shared_experts.up_gate_proj, 'weight', 'N/A').shape}")
+        print(f"  - shared_experts down_proj shape: {getattr(self.shared_experts.down_proj, 'weight', 'N/A').shape}")
 
     def load_state_dict(self, state_dict):
         """ """
@@ -318,6 +337,24 @@ class DeepseekV3MLAAttention(nn.Layer):
         )
 
         self.prefix = prefix
+        # --- 在 __init__ 方法的最后添加以下 debug 日志 ---
+        print(f"--- [DEBUG] Initializing DeepseekV3MLAAttention (Layer {layer_id}) ---")
+        print(f"  - prefix: {prefix}")
+        print(f"  - hidden_size: {self.hidden_size}")
+        print(f"  - num_attention_heads: {self.num_attention_heads}")
+        print(f"  - tp_size: {self.tp_size}")
+        print(f"  - num_attention_heads_tp: {self.num_attention_heads_tp}")
+        print(f"  - q_lora_rank: {self.q_lora_rank}")
+        print(f"  - kv_lora_rank: {self.kv_lora_rank}")
+        print(f"  - qk_rope_head_dim: {self.qk_rope_head_dim}")
+        print(f"  - qk_nope_head_dim: {self.qk_nope_head_dim}")
+        print(f"  - v_head_dim: {self.v_head_dim}")
+        print(f"  - qk_head_dim: {self.qk_head_dim}")
+        print(f"  - qkv_a_proj_with_mqa weight shape: {getattr(self.qkv_a_proj_with_mqa, 'weight', 'N/A').shape}")
+        print(f"  - q_b_proj weight shape: {getattr(self.q_b_proj, 'weight', 'N/A').shape}")
+        print(f"  - kv_b_proj weight shape: {getattr(self.kv_b_proj, 'weight', 'N/A').shape}")
+        print(f"  - o_proj weight shape: {getattr(self.o_proj, 'weight', 'N/A').shape}")
+        print(f"--- [DEBUG] End of DeepseekV3MLAAttention Init ---")
 
     @staticmethod
     def yarn_get_mscale(scale=1, mscale=1):
@@ -625,6 +662,7 @@ class DeepseekV3ForCausalLM(ModelForCasualLM):
         self.mask_encoder_batch_buffer = paddle.empty(
             [fd_config.scheduler_config.max_num_batched_tokens, 1], dtype=paddle.int32
         )
+        
 
     @classmethod
     def name(cls):
