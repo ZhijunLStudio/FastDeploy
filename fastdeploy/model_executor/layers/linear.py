@@ -262,7 +262,6 @@ class ReplicatedLinear(LinearBase):
         skip_quant: bool = False,
         weight_dtype: str = "",
         weight_key: str = "",
-        output_dim: bool = False,
     ):
         """
         Initializes a replicated linear layer.
@@ -292,22 +291,13 @@ class ReplicatedLinear(LinearBase):
         self.hidden_size = fd_config.model_config.hidden_size
 
         assert self.quant_method is not None
-        extra_attrs = {
-            "output_dim": output_dim,
-            "weight_loader": self.weight_loader if hasattr(self, "weight_loader") else default_weight_loader(self.fd_config),
-            "model_format": fd_config.model_config.model_format,
-        }
         self.quant_method.create_weights(
             self,
-            **extra_attrs,
+            weight_loader=(
+                self.weight_loader if hasattr(self, "weight_loader") else default_weight_loader(self.fd_config)
+            ),
+            model_format=fd_config.model_config.model_format,
         )
-        # self.quant_method.create_weights(
-        #     self,
-        #     weight_loader=(
-        #         self.weight_loader if hasattr(self, "weight_loader") else default_weight_loader(self.fd_config)
-        #     ),
-        #     model_format=fd_config.model_config.model_format,
-        # )
 
 
 class MergedReplicatedLinear(ReplicatedLinear):
@@ -349,7 +339,6 @@ class MergedReplicatedLinear(ReplicatedLinear):
             skip_quant=skip_quant,
             weight_dtype=weight_dtype,
             weight_key=weight_key,
-            output_dim=True, 
         )
         self.output_sizes = output_sizes
 
@@ -537,6 +526,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.weight_loader(param, loaded_weight_shard, shard_id)
         else:
             # split gate up
+            print(f"\n--- [DEBUG] MergedColumnParallelLinear.weight_loader (shard_id='{loaded_shard_id}') ---")
+            print(f"  - Original param shape: {param.shape}")
+            
             assert loaded_shard_id in ["gate", "up"]
             if weight_need_transpose:
                 loaded_weight = get_tensor(loaded_weight)
@@ -561,9 +553,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             else:
                 # loaded_shard_id == "up"
                 param_shard_offset = param_shard_size
+                
+            print(f"  - output_dim: {output_dim}, shard_dim: {shard_dim}, output_size: {output_size}")
+            print(f"  - param_shard_size: {param_shard_size}, param_shard_offset: {param_shard_offset}")
             if hasattr(param, "tensor_track"):
                 param.tensor_track.mark(start=param_shard_offset, end=param_shard_offset + param_shard_size)
             param = slice_fn(param, output_dim, start=param_shard_offset, end=param_shard_offset + param_shard_size)
+            # This is the line that creates the view (slice) of the parameter
+            param_slice = slice_fn(param, output_dim, start=param_shard_offset, end=param_shard_offset + param_shard_size)
+
+            print(f"  - Sliced param shape: {param_slice.shape}")
+            print(f"  - Loaded weight shape: {loaded_weight.shape}")
+            
             assert param.shape == loaded_weight.shape, (
                 f" Attempted to load weight ({loaded_weight.shape}) " f"into parameter ({param.shape})"
             )
