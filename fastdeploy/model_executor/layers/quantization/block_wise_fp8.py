@@ -130,7 +130,19 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                 dtype="float32",
                 is_bias=False,
             )
-            extra_weight_attrs["output_dim"] = not extra_weight_attrs["output_dim"]
+            # extra_weight_attrs["output_dim"] = not extra_weight_attrs["output_dim"]
+            # 1. 安全地获取 output_dim，为 weight 参数准备属性
+            weight_attrs = extra_weight_attrs.copy()
+            weight_attrs['output_dim'] = weight_attrs.get('output_dim', False)
+            weight_attrs["weight_need_transpose"] = not weight_attrs.get("model_format") == "torch"
+            set_weight_attrs(layer.weight, weight_attrs)
+
+            # 2. 为 weight_scale_inv 参数准备属性（output_dim取反）
+            scale_attrs = extra_weight_attrs.copy()
+            scale_attrs['output_dim'] = not scale_attrs.get('output_dim', False)
+            scale_attrs["is_scale"] = True
+            set_weight_attrs(layer.weight_scale_inv, scale_attrs)
+            # --- 修复结束 ---
 
             extra_weight_attrs["weight_need_transpose"] = not extra_weight_attrs.get("model_format") == "torch"
             set_weight_attrs(
