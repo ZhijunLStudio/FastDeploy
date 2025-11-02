@@ -17,7 +17,7 @@
 from fastdeploy.engine.sampling_params import SamplingParams
 from fastdeploy.entrypoints.llm import LLM
 
-model_name_or_path = "/home/aistudio/data/models/localdisk/264907/models/Kimi-K2-Instruct-0905"
+model_name_or_path = "/home/aistudio/data/models/localdisk/264907/models/models/Kimi-K2-Instruct-0905"
 
 # 超参设置
 sampling_params = SamplingParams(temperature=0.1, max_tokens=30)

@@ -131,31 +131,35 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                 is_bias=False,
             )
             # extra_weight_attrs["output_dim"] = not extra_weight_attrs["output_dim"]
-            # 1. 安全地获取 output_dim，为 weight 参数准备属性
+            # --- 这是唯一的修改点 ---
+            # 使用 .get() 方法安全地访问 'output_dim'，并提供默认值 False
+            current_output_dim = extra_weight_attrs.get("output_dim", False)
+
+            # 为 weight 参数准备属性
             weight_attrs = extra_weight_attrs.copy()
-            weight_attrs['output_dim'] = weight_attrs.get('output_dim', False)
+            weight_attrs['output_dim'] = current_output_dim
             weight_attrs["weight_need_transpose"] = not weight_attrs.get("model_format") == "torch"
             set_weight_attrs(layer.weight, weight_attrs)
 
-            # 2. 为 weight_scale_inv 参数准备属性（output_dim取反）
+            # 为 weight_scale_inv 参数准备属性（output_dim取反）
             scale_attrs = extra_weight_attrs.copy()
-            scale_attrs['output_dim'] = not scale_attrs.get('output_dim', False)
+            scale_attrs['output_dim'] = not current_output_dim
             scale_attrs["is_scale"] = True
             set_weight_attrs(layer.weight_scale_inv, scale_attrs)
             # --- 修复结束 ---
 
-            extra_weight_attrs["weight_need_transpose"] = not extra_weight_attrs.get("model_format") == "torch"
-            set_weight_attrs(
-                layer.weight,
-                extra_weight_attrs,
-            )
-            set_weight_attrs(
-                layer.weight_scale_inv,
-                {
-                    **extra_weight_attrs,
-                    "is_scale": True,
-                },
-            )
+            # extra_weight_attrs["weight_need_transpose"] = not extra_weight_attrs.get("model_format") == "torch"
+            # set_weight_attrs(
+            #     layer.weight,
+            #     extra_weight_attrs,
+            # )
+            # set_weight_attrs(
+            #     layer.weight_scale_inv,
+            #     {
+            #         **extra_weight_attrs,
+            #         "is_scale": True,
+            #     },
+            # )
 
     def process_weights_after_loading(self, layer) -> None:
         if not self.quant_config.is_checkpoint_bf16:
