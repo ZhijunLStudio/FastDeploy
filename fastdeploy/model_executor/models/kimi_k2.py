@@ -2,12 +2,41 @@
 from __future__ import annotations
 import re
 import paddle
+import numpy as np
 
-# --- Imports ---
 from .deepseek_v3 import DeepseekV3ForCausalLM, DeepSeekV3PretrainedModel
 from fastdeploy.model_executor.layers.moe.moe import FusedMoE
 from fastdeploy.model_executor.models.model_base import ModelCategory, ModelRegistry
-from fastdeploy.model_executor.utils import default_weight_loader, process_weights_after_loading
+from fastdeploy.model_executor.utils import get_tensor
+
+
+from paddleformers.utils.log import logger
+import pprint
+
+def print_tensor_stats(tensor, name):
+    """打印Paddle张量的统计信息 (强制 float32)"""
+    if tensor is None:
+        logger.info(f"DEBUG_FD: {name} is None")
+        return
+    with paddle.no_grad():
+        stats = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        num_elements = tensor.numel()
+        if num_elements.item() > 0:
+            tensor_float = tensor.astype('float32')
+            tensor_cpu = tensor_float.cpu()
+            stats["max"] = f"{tensor_cpu.max().item():.6f}"
+            stats["min"] = f"{tensor_cpu.min().item():.6f}"
+            stats["mean"] = f"{tensor_cpu.mean().item():.6f}"
+            
+            if num_elements.item() > 1:
+                stats["std"] = f"{tensor_cpu.std().item():.6f}"
+            else:
+                stats["std"] = "0.000000"
+
+            flat_data = tensor_cpu.flatten().numpy()[:5]
+            stats["first_5_values"] = flat_data
+        logger.info(f"\n--- [FD DEBUG] {name} ---\n{pprint.pformat(stats, indent=2)}\n--------------------------\n")
+
 
 @ModelRegistry.register_model_class(
     architecture="KimiK2ForCausalLM",
@@ -17,107 +46,263 @@ from fastdeploy.model_executor.utils import default_weight_loader, process_weigh
 )
 class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
     """
-    KimiK2 model, which is architecturally identical to DeepseekV3.
-    This class inherits directly from DeepseekV3ForCausalLM and only overrides
-    the weight loading method to handle the difference in weight naming prefixes.
+    KimiK2 model, architecturally identical to DeepseekV3.
+    This class implements a self-contained, robust weight loading method
+    based on the exact checkpoint structure.
     """
 
     @classmethod
     def name(cls):
         return "KimiK2ForCausalLM"
 
+    def _load_moe_experts(self, model_param_name, weights_map):
+        """
+        Helper function to find, merge, and stack all expert weights from the checkpoint.
+        """
+        match = re.search(r"layers\.(\d+)\.mlp\.experts\.(.+)", model_param_name)
+        if not match:
+            return None, set()
+
+        layer_idx = match.group(1)
+        param_full_suffix = match.group(2) # e.g., "up_gate_proj_weight", "down_proj_weight_scale_inv"
+        
+        num_experts = self.fd_config.model_config.n_routed_experts
+        expert_tensors = []
+        processed_names = set()
+
+        print(f"  > Strategy: MoE Expert Stacking for '{param_full_suffix}' in layer {layer_idx}")
+
+        is_up_gate = param_full_suffix.startswith("up_gate_proj")
+        is_down = param_full_suffix.startswith("down_proj")
+        
+        # Correctly determine the suffix part ('weight' or 'weight_scale_inv')
+        suffix = "weight" if "weight_scale_inv" not in param_full_suffix else "weight_scale_inv"
+        
+        for i in range(num_experts):
+            if is_up_gate:
+                gate_name = f"model.layers.{layer_idx}.mlp.experts.{i}.gate_proj.{suffix}"
+                up_name = f"model.layers.{layer_idx}.mlp.experts.{i}.up_proj.{suffix}"
+                
+                if gate_name not in weights_map or up_name not in weights_map:
+                    print(f"    - WARNING: Missing gate/up proj for expert {i}. Skipping MoE layer {layer_idx}.")
+                    return None, set()
+                
+                gate_tensor = weights_map[gate_name]
+                up_tensor = weights_map[up_name]
+                expert_tensor = paddle.concat([gate_tensor, up_tensor], axis=0)
+                processed_names.add(gate_name)
+                processed_names.add(up_name)
+            elif is_down:
+                weight_name = f"model.layers.{layer_idx}.mlp.experts.{i}.down_proj.{suffix}"
+                if weight_name not in weights_map:
+                    print(f"    - WARNING: Missing down_proj for expert {i}. Skipping MoE layer {layer_idx}.")
+                    return None, set()
+                expert_tensor = weights_map[weight_name]
+                processed_names.add(weight_name)
+            else:
+                return None, set()
+
+            expert_tensors.append(expert_tensor)
+        
+        if not expert_tensors:
+            return None, set()
+
+        # Stack all expert tensors along a new first dimension
+        stacked_tensor = paddle.stack(expert_tensors, axis=0)
+        return stacked_tensor, processed_names
+
+
     @paddle.no_grad()
     def load_weights(self, weights_iterator):
         """
-        Loads weights for the KimiK2 model.
-        
-        The internal model structure uses the 'deepseek_v3.' prefix due to inheritance.
-        However, Kimi's weight files use the 'model.' prefix.
-        This method adapts the loading process by replacing the prefix before matching weights.
+        Final, definitive, and fully-logged weight loading logic for KimiK2.
+        This version reverse-maps model parameters to checkpoint weights with
+        explicit transformation rules based on confirmed naming patterns.
         """
         
-        # This mapping is copied directly from `deepseek_v3.py` and is essential for
-        # correctly routing split weights (like gate/up_proj) to merged parameters.
-        stacked_params_mapping = [
-            ("up_gate_proj", "gate_proj", "gate"),
-            ("up_gate_proj", "up_proj", "up"),
-            ("embed_tokens.embeddings", "embed_tokens", None),
-            ("lm_head.linear", "lm_head", None),
-            ("experts.gate_correction_bias", "gate.e_score_correction_bias", None),
-            ("qkv_a_proj_with_mqa", "q_a_proj", "q_a"),
-            ("qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", "kv_a"),
-        ]
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            num_experts=self.fd_config.model_config.n_routed_experts,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            param_gate_up_proj_name="experts.up_gate_proj_",
-            param_down_proj_name="experts.down_proj_",
-        )
+        print("\n--- [KIMI LOADER] STARTING WEIGHT LOAD (Manual Aggregation Logic) ---")
+
         params_dict = dict(self.named_parameters())
-        process_weights_after_loading_fn = process_weights_after_loading(dict(self.named_sublayers()))
-        
-        for loaded_weight_name, loaded_weight in weights_iterator:
+        tp_size = self.fd_config.parallel_config.tensor_parallel_size
+        tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
+
+        print("[KIMI LOADER] Buffering all weights from iterator into memory...")
+        weights_map = {name: get_tensor(weight) for name, weight in weights_iterator}
+        print(f"[KIMI LOADER] Buffering complete. Total unique weights in map: {len(weights_map)}")
+
+        processed_ckpt_names = set()
+
+        for model_param_name, param in params_dict.items():
+            print(f"\n[KIMI LOADER] Attempting to load parameter: {model_param_name} with shape {param.shape}")
             
-            # --- 这是唯一的、根本性的修复 ---
-            # 将从文件中读到的 'model.' 前缀替换为模型内部使用的 'deepseek_v3.' 前缀
-            # 模仿 Ernie 和 Qwen2 的成功做法
-            if loaded_weight_name.startswith("model."):
-                 loaded_weight_name = loaded_weight_name.replace("model.", "deepseek_v3.", 1)
-            # --- 修复结束 ---
-
-            # The rest of the logic is an exact copy of the battle-tested logic from `DeepseekV3ForCausalLM`.
-            model_param_name = None
-            param = None
-            found = False
+            loaded_tensor = None
             
-            # --- Start of copied block from DeepseekV3ForCausalLM.load_weights ---
-            for p_name, w_name, s_id in stacked_params_mapping:
-                if w_name not in loaded_weight_name:
-                    continue
-                if "mlp.experts." in loaded_weight_name:
-                    continue
-                model_param_name = loaded_weight_name.replace(w_name, p_name)
+            # --- Determine loading strategy based on parameter name ---
+            # Strategy 0: MoE Expert Weights
+            if "mlp.experts." in model_param_name:
+                loaded_tensor, names = self._load_moe_experts(model_param_name, weights_map)
+                processed_ckpt_names.update(names)
 
-                if model_param_name not in params_dict:
-                    continue
+            # Strategy 1: Merged ColumnParallel Weights
+            elif model_param_name.endswith(".up_gate_proj.weight"):
+                gate_name = model_param_name.replace(".up_gate_proj.", ".gate_proj.")
+                up_name = model_param_name.replace(".up_gate_proj.", ".up_proj.")
+                if gate_name in weights_map and up_name in weights_map:
+                    print(f"  > Strategy: Merged ColumnParallel. Shards: '{gate_name}', '{up_name}'")
+                    gate_w = weights_map[gate_name]
+                    up_w = weights_map[up_name]
+                    loaded_tensor = paddle.concat([gate_w, up_w], axis=0)
+                    processed_ckpt_names.update([gate_name, up_name])
 
-                param = params_dict[model_param_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
-                weight_loader(param, loaded_weight, s_id)
-                found = True
-                break
+            # Strategy 1.1: Merged ColumnParallel Weight Scales
+            elif model_param_name.endswith(".up_gate_proj.weight_scale_inv"):
+                gate_scale_name = model_param_name.replace(".up_gate_proj.", ".gate_proj.")
+                up_scale_name = model_param_name.replace(".up_gate_proj.", ".up_proj.")
+                if gate_scale_name in weights_map and up_scale_name in weights_map:
+                    print(f"  > Strategy: Merged ColumnParallel Scales. Shards: '{gate_scale_name}', '{up_scale_name}'")
+                    gate_scale_w = weights_map[gate_scale_name]
+                    up_scale_w = weights_map[up_scale_name]
+                    loaded_tensor = paddle.concat([gate_scale_w, up_scale_w], axis=0)
+                    processed_ckpt_names.update([gate_scale_name, up_scale_name])
+
+            # Strategy 2: Merged Replicated Weights
+            elif model_param_name.endswith(".qkv_a_proj_with_mqa.weight"):
+                q_a_name = model_param_name.replace(".qkv_a_proj_with_mqa.", ".q_a_proj.")
+                kv_a_name = model_param_name.replace(".qkv_a_proj_with_mqa.", ".kv_a_proj_with_mqa.")
+                if q_a_name in weights_map and kv_a_name in weights_map:
+                    print(f"  > Strategy: Merged Replicated. Shards: '{q_a_name}', '{kv_a_name}'")
+                    q_a_w = weights_map[q_a_name]
+                    kv_a_w = weights_map[kv_a_name]
+                    loaded_tensor = paddle.concat([q_a_w, kv_a_w], axis=0)
+                    processed_ckpt_names.update([q_a_name, kv_a_name])
+
+            # Strategy 2.1: Merged Replicated Weight Scales
+            elif model_param_name.endswith(".qkv_a_proj_with_mqa.weight_scale_inv"):
+                q_a_scale_name = model_param_name.replace(".qkv_a_proj_with_mqa.", ".q_a_proj.")
+                kv_a_scale_name = model_param_name.replace(".qkv_a_proj_with_mqa.", ".kv_a_proj_with_mqa.")
+                if q_a_scale_name in weights_map and kv_a_scale_name in weights_map:
+                    print(f"  > Strategy: Merged Replicated Scales. Shards: '{q_a_scale_name}', '{kv_a_scale_name}'")
+                    q_a_scale_w = weights_map[q_a_scale_name]
+                    kv_a_scale_w = weights_map[kv_a_scale_name]
+                    loaded_tensor = paddle.concat([q_a_scale_w, kv_a_scale_w], axis=0)
+                    processed_ckpt_names.update([q_a_scale_name, kv_a_scale_name])
+
+            # Strategy 3: Special Names (LM Head, Embeddings)
+            elif model_param_name == "model.embed_tokens.embeddings.weight":
+                ckpt_name = "model.embed_tokens.weight"
+                if ckpt_name in weights_map:
+                    print(f"  > Strategy: Special Name Mapping. Source: '{ckpt_name}'")
+                    loaded_tensor = weights_map[ckpt_name]
+                    processed_ckpt_names.add(ckpt_name)
             
-            if not found:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in loaded_weight_name:
-                        continue
-                    model_param_name = loaded_weight_name.replace(weight_name, param_name)
-                    if model_param_name not in params_dict:
-                        continue
-                    param = params_dict[model_param_name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id=shard_id, expert_id=expert_id)
-                    found = True
-                    break
+            elif model_param_name == "lm_head.linear.weight":
+                ckpt_name = "lm_head.weight"
+                if ckpt_name in weights_map:
+                    print(f"  > Strategy: Special Name Mapping. Source: '{ckpt_name}'")
+                    loaded_tensor = weights_map[ckpt_name]
+                    processed_ckpt_names.add(ckpt_name)
 
-            if not found:
-                model_param_name = loaded_weight_name
-                if model_param_name not in params_dict:
-                    continue
-                param = params_dict[model_param_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
-                weight_loader(param, loaded_weight)
+            # Strategy 4: Direct Match for all other parameters
+            elif model_param_name in weights_map:
+                print(f"  > Strategy: Direct Match. Source: '{model_param_name}'")
+                loaded_tensor = weights_map[model_param_name]
+                processed_ckpt_names.add(model_param_name)
 
-            if model_param_name and param is not None:
-                model_sublayer_name = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight|embeddings|linear)$", "", model_param_name)
-                if "kv_b_proj" in model_sublayer_name:
-                    kv_model_sublayer_name = model_sublayer_name.replace("kv_b_proj", "kv_b_proj_bmm")
-                    process_weights_after_loading_fn(kv_model_sublayer_name)
-                process_weights_after_loading_fn(model_sublayer_name, param)
-            # --- End of copied block ---
+            if loaded_tensor is None:
+                print(f"  > WARNING: No corresponding weight found for param '{model_param_name}'. Skipping.")
+                continue
+
+            print(f"    - Loaded tensor shape (raw): {loaded_tensor.shape}")
+
+            # --- Apply Transformations based on parameter name patterns ---
+            is_column_parallel = any(s in model_param_name for s in [".q_b_proj.", ".kv_b_proj.", ".up_gate_proj.", "lm_head."])
+            is_row_parallel = any(s in model_param_name for s in [".o_proj.", ".down_proj."])
+            
+            if tp_size > 1:
+                # Special handling for MoE expert weights (which can be 3D or 4D tensors)
+                if "mlp.experts" in model_param_name and loaded_tensor.ndim >= 3:
+                    if "up_gate_proj" in model_param_name:
+                        dim_to_shard = 1
+                        print(f"    - Applying TP shard on MoE dim={dim_to_shard} (ColumnParallel-like)")
+                    elif "down_proj" in model_param_name:
+                         dim_to_shard = 2
+                         print(f"    - Applying TP shard on MoE dim={dim_to_shard} (RowParallel-like)")
+                    else:
+                        dim_to_shard = -1 
+
+                    if dim_to_shard != -1:
+                        total_size = loaded_tensor.shape[dim_to_shard]
+                        block_size = total_size // tp_size
+                        start, end = tp_rank * block_size, (tp_rank + 1) * block_size
+                        if dim_to_shard == 1:
+                            loaded_tensor = loaded_tensor[:, start:end, ...]
+                        else: # dim_to_shard == 2
+                            loaded_tensor = loaded_tensor[:, :, start:end, ...]
+                        print(f"    - Sharded tensor shape: {loaded_tensor.shape}")
+                
+                elif "weight_scale_inv" in model_param_name:
+                    dim_to_shard = -1
+                    if is_column_parallel:
+                        dim_to_shard = 0
+                        print(f"    - Applying TP shard on scale dim={dim_to_shard} (ColumnParallel)")
+                    elif is_row_parallel:
+                        dim_to_shard = 1
+                        print(f"    - Applying TP shard on scale dim={dim_to_shard} (RowParallel)")
+                    
+                    if dim_to_shard != -1:
+                        total_size = loaded_tensor.shape[dim_to_shard]
+                        block_size = total_size // tp_size
+                        start, end = tp_rank * block_size, (tp_rank + 1) * block_size
+                        if dim_to_shard == 0:
+                            loaded_tensor = loaded_tensor[start:end, :]
+                        else:
+                            loaded_tensor = loaded_tensor[:, start:end]
+                        print(f"    - Sharded tensor shape: {loaded_tensor.shape}")
+                
+                elif is_column_parallel or "embed_tokens" in model_param_name:
+                    dim_to_shard = 0
+                    print(f"    - Applying TP shard on dim={dim_to_shard} (ColumnParallel/Vocab)")
+                    total_size = loaded_tensor.shape[dim_to_shard]
+                    block_size = total_size // tp_size
+                    start, end = tp_rank * block_size, (tp_rank + 1) * block_size
+                    loaded_tensor = loaded_tensor[start:end, :]
+                    print(f"    - Sharded tensor shape: {loaded_tensor.shape}")
+
+                elif is_row_parallel:
+                    dim_to_shard = 1
+                    print(f"    - Applying TP shard on dim={dim_to_shard} (RowParallel)")
+                    total_size = loaded_tensor.shape[dim_to_shard]
+                    block_size = total_size // tp_size
+                    start, end = tp_rank * block_size, (tp_rank + 1) * block_size
+                    loaded_tensor = loaded_tensor[:, start:end]
+                    print(f"    - Sharded tensor shape: {loaded_tensor.shape}")
+            
+            if is_row_parallel and "weight" in model_param_name and loaded_tensor.ndim == 2:
+                loaded_tensor = loaded_tensor.transpose([1, 0])
+                print(f"    - Transposed for RowParallel -> {loaded_tensor.shape}")
+
+            if param.shape != loaded_tensor.shape and np.prod(param.shape) == np.prod(loaded_tensor.shape):
+                print(f"    - Reshaping loaded tensor from {loaded_tensor.shape} to {param.shape}")
+                loaded_tensor = loaded_tensor.reshape(param.shape)
+            
+            assert param.shape == loaded_tensor.shape, f"Final shape mismatch for {model_param_name}: param {param.shape} vs loaded {loaded_tensor.shape}"
+            param.copy_(loaded_tensor.cast(param.dtype), False)
+            print(f"  > SUCCESS: Loaded into '{model_param_name}'")
+
+        unprocessed_weights = set(weights_map.keys()) - processed_ckpt_names
+        if unprocessed_weights:
+            unprocessed_weights = {w for w in unprocessed_weights if "inv_freq" not in w}
+            unprocessed_weights = {w for w in unprocessed_weights if not any(x in w for x in [
+                'q_a_proj.weight_scale_inv', 'kv_a_proj_with_mqa.weight_scale_inv', 
+                'gate_proj.weight_scale_inv', 'up_proj.weight_scale_inv',
+            ])}
+            unprocessed_weights = {w for w in unprocessed_weights if 'mlp.experts' not in w}
+
+            if unprocessed_weights:
+                print(f"\n[KIMI LOADER] WARNING: The following weights were not used: {unprocessed_weights}")
+
+        print("\n--- [KIMI LOADER] WEIGHT LOAD COMPLETE ---\n")
+
 
 class KimiK2PretrainedModel(DeepSeekV3PretrainedModel):
     @classmethod

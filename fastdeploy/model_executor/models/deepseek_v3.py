@@ -786,6 +786,7 @@ class DeepseekV3ForCausalLM(ModelForCasualLM):
     ):
         """ """
         position_ids, mask_encoder_batch = self.pre_process(forward_meta)
+        position_ids = position_ids.clone()
         hidden_states = self.model(
             ids_remove_padding=ids_remove_padding,
             forward_meta=forward_meta,

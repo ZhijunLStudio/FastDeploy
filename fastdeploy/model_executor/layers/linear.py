@@ -408,15 +408,6 @@ class ColumnParallelLinear(LinearBase):
             add_bias (bool): Whether to add bias in the current layer or in the pre/post layer. Defaults to False.
             skip_quant (bool): Whether to skip quantization. Defaults to False.
         """
-        tp_size = fd_config.parallel_config.tensor_parallel_size
-        output_size_per_rank = output_size // tp_size if tp_size > 0 else output_size
-        print(f"--- [DEBUG] Initializing ColumnParallelLinear ---")
-        print(f"  - prefix: {prefix}")
-        print(f"  - input_size: {input_size}")
-        print(f"  - original output_size: {output_size}")
-        print(f"  - tp_size: {tp_size}")
-        print(f"  - calculated output_size_per_rank: {output_size_per_rank}")
-        
         self.fd_config = fd_config
         self.nranks = fd_config.parallel_config.tensor_parallel_size
         self.input_size = input_size
@@ -526,9 +517,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.weight_loader(param, loaded_weight_shard, shard_id)
         else:
             # split gate up
-            print(f"\n--- [DEBUG] MergedColumnParallelLinear.weight_loader (shard_id='{loaded_shard_id}') ---")
-            print(f"  - Original param shape: {param.shape}")
-            
             assert loaded_shard_id in ["gate", "up"]
             if weight_need_transpose:
                 loaded_weight = get_tensor(loaded_weight)
@@ -553,18 +541,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             else:
                 # loaded_shard_id == "up"
                 param_shard_offset = param_shard_size
-                
-            print(f"  - output_dim: {output_dim}, shard_dim: {shard_dim}, output_size: {output_size}")
-            print(f"  - param_shard_size: {param_shard_size}, param_shard_offset: {param_shard_offset}")
             if hasattr(param, "tensor_track"):
                 param.tensor_track.mark(start=param_shard_offset, end=param_shard_offset + param_shard_size)
             param = slice_fn(param, output_dim, start=param_shard_offset, end=param_shard_offset + param_shard_size)
-            # This is the line that creates the view (slice) of the parameter
-            param_slice = slice_fn(param, output_dim, start=param_shard_offset, end=param_shard_offset + param_shard_size)
-
-            print(f"  - Sliced param shape: {param_slice.shape}")
-            print(f"  - Loaded weight shape: {loaded_weight.shape}")
-            
             assert param.shape == loaded_weight.shape, (
                 f" Attempted to load weight ({loaded_weight.shape}) " f"into parameter ({param.shape})"
             )
@@ -834,16 +813,6 @@ class RowParallelLinear(LinearBase):
             add_bias (bool): Whether to add bias in the current layer or in the pre/post layer. Defaults to False.
             skip_quant (bool): Whether to skip quantization. Defaults to False.
         """
-        # --- 在 __init__ 方法的开头添加 debug 日志 ---
-        tp_size = fd_config.parallel_config.tensor_parallel_size
-        input_size_per_rank = input_size // tp_size if tp_size > 0 else input_size
-        print(f"--- [DEBUG] Initializing RowParallelLinear ---")
-        print(f"  - prefix: {prefix}")
-        print(f"  - original input_size: {input_size}")
-        print(f"  - output_size: {output_size}")
-        print(f"  - tp_size: {tp_size}")
-        print(f"  - calculated input_size_per_rank: {input_size_per_rank}")
-        
         self.fd_config = fd_config
         self.skip_quant = False
         self.nranks = fd_config.parallel_config.tensor_parallel_size
