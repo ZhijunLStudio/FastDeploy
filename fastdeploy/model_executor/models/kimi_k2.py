@@ -59,12 +59,14 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
         """
         Helper function to find, merge, and stack all expert weights from the checkpoint.
         """
+        print(f"--- [KIMI DEBUG] Entering _load_moe_experts for '{model_param_name}'")
         match = re.search(r"layers\.(\d+)\.mlp\.experts\.(.+)", model_param_name)
         if not match:
+            print(f"--- [KIMI DEBUG]   - Regex failed to match. Exiting.")
             return None, set()
 
         layer_idx = match.group(1)
-        param_full_suffix = match.group(2) # e.g., "up_gate_proj_weight", "down_proj_weight_scale_inv"
+        param_full_suffix = match.group(2)
         
         num_experts = self.fd_config.model_config.n_routed_experts
         expert_tensors = []
@@ -75,8 +77,8 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
         is_up_gate = param_full_suffix.startswith("up_gate_proj")
         is_down = param_full_suffix.startswith("down_proj")
         
-        # Correctly determine the suffix part ('weight' or 'weight_scale_inv')
         suffix = "weight" if "weight_scale_inv" not in param_full_suffix else "weight_scale_inv"
+        print(f"--- [KIMI DEBUG]   - Determined suffix: '{suffix}'")
         
         for i in range(num_experts):
             if is_up_gate:
@@ -84,7 +86,7 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
                 up_name = f"model.layers.{layer_idx}.mlp.experts.{i}.up_proj.{suffix}"
                 
                 if gate_name not in weights_map or up_name not in weights_map:
-                    print(f"    - WARNING: Missing gate/up proj for expert {i}. Skipping MoE layer {layer_idx}.")
+                    print(f"--- [KIMI DEBUG]   - ERROR: Missing weights for expert {i}. Looking for '{gate_name}' and '{up_name}'.")
                     return None, set()
                 
                 gate_tensor = weights_map[gate_name]
@@ -95,7 +97,7 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
             elif is_down:
                 weight_name = f"model.layers.{layer_idx}.mlp.experts.{i}.down_proj.{suffix}"
                 if weight_name not in weights_map:
-                    print(f"    - WARNING: Missing down_proj for expert {i}. Skipping MoE layer {layer_idx}.")
+                    print(f"--- [KIMI DEBUG]   - ERROR: Missing weight for expert {i}. Looking for '{weight_name}'.")
                     return None, set()
                 expert_tensor = weights_map[weight_name]
                 processed_names.add(weight_name)
@@ -105,10 +107,11 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
             expert_tensors.append(expert_tensor)
         
         if not expert_tensors:
+            print(f"--- [KIMI DEBUG]   - No expert tensors collected. Exiting.")
             return None, set()
 
-        # Stack all expert tensors along a new first dimension
         stacked_tensor = paddle.stack(expert_tensors, axis=0)
+        print(f"--- [KIMI DEBUG]   - Successfully stacked {len(expert_tensors)} expert tensors. Final shape: {stacked_tensor.shape}")
         return stacked_tensor, processed_names
 
 
@@ -120,20 +123,20 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
         explicit transformation rules based on confirmed naming patterns.
         """
         
-        print("\n--- [KIMI LOADER] STARTING WEIGHT LOAD (Manual Aggregation Logic) ---")
+        print("\n--- [KIMI LOADER V6 DEBUG] STARTING WEIGHT LOAD (Manual Aggregation with Super Logging) ---")
 
         params_dict = dict(self.named_parameters())
         tp_size = self.fd_config.parallel_config.tensor_parallel_size
         tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
 
-        print("[KIMI LOADER] Buffering all weights from iterator into memory...")
+        print("[KIMI V6 DEBUG] Buffering all weights from iterator into memory...")
         weights_map = {name: get_tensor(weight) for name, weight in weights_iterator}
-        print(f"[KIMI LOADER] Buffering complete. Total unique weights in map: {len(weights_map)}")
+        print(f"[KIMI V6 DEBUG] Buffering complete. Total unique weights in map: {len(weights_map)}")
 
         processed_ckpt_names = set()
 
         for model_param_name, param in params_dict.items():
-            print(f"\n[KIMI LOADER] Attempting to load parameter: {model_param_name} with shape {param.shape}")
+            print(f"\n[KIMI V6 DEBUG] >>> Attempting to load parameter: '{model_param_name}' with shape {param.shape}")
             
             loaded_tensor = None
             
@@ -187,7 +190,7 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
                     loaded_tensor = paddle.concat([q_a_scale_w, kv_a_scale_w], axis=0)
                     processed_ckpt_names.update([q_a_scale_name, kv_a_scale_name])
 
-            # Strategy 3: Special Names (LM Head, Embeddings)
+            # Strategy 3: Special Names
             elif model_param_name == "model.embed_tokens.embeddings.weight":
                 ckpt_name = "model.embed_tokens.weight"
                 if ckpt_name in weights_map:
@@ -202,7 +205,7 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
                     loaded_tensor = weights_map[ckpt_name]
                     processed_ckpt_names.add(ckpt_name)
 
-            # Strategy 4: Direct Match for all other parameters
+            # Strategy 4: Direct Match
             elif model_param_name in weights_map:
                 print(f"  > Strategy: Direct Match. Source: '{model_param_name}'")
                 loaded_tensor = weights_map[model_param_name]
@@ -214,49 +217,39 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
 
             print(f"    - Loaded tensor shape (raw): {loaded_tensor.shape}")
 
-            # --- Apply Transformations based on parameter name patterns ---
+            # --- Apply Transformations ---
             is_column_parallel = any(s in model_param_name for s in [".q_b_proj.", ".kv_b_proj.", ".up_gate_proj.", "lm_head."])
             is_row_parallel = any(s in model_param_name for s in [".o_proj.", ".down_proj."])
             
             if tp_size > 1:
-                # Special handling for MoE expert weights (which can be 3D or 4D tensors)
+                # ... (TP sharding logic from your V2 code, which is correct)
                 if "mlp.experts" in model_param_name and loaded_tensor.ndim >= 3:
                     if "up_gate_proj" in model_param_name:
                         dim_to_shard = 1
-                        print(f"    - Applying TP shard on MoE dim={dim_to_shard} (ColumnParallel-like)")
                     elif "down_proj" in model_param_name:
                          dim_to_shard = 2
-                         print(f"    - Applying TP shard on MoE dim={dim_to_shard} (RowParallel-like)")
                     else:
                         dim_to_shard = -1 
-
                     if dim_to_shard != -1:
+                        print(f"    - Applying TP shard on MoE dim={dim_to_shard}")
                         total_size = loaded_tensor.shape[dim_to_shard]
                         block_size = total_size // tp_size
                         start, end = tp_rank * block_size, (tp_rank + 1) * block_size
-                        if dim_to_shard == 1:
-                            loaded_tensor = loaded_tensor[:, start:end, ...]
-                        else: # dim_to_shard == 2
-                            loaded_tensor = loaded_tensor[:, :, start:end, ...]
+                        if dim_to_shard == 1: loaded_tensor = loaded_tensor[:, start:end, ...]
+                        else: loaded_tensor = loaded_tensor[:, :, start:end, ...]
                         print(f"    - Sharded tensor shape: {loaded_tensor.shape}")
                 
                 elif "weight_scale_inv" in model_param_name:
                     dim_to_shard = -1
-                    if is_column_parallel:
-                        dim_to_shard = 0
-                        print(f"    - Applying TP shard on scale dim={dim_to_shard} (ColumnParallel)")
-                    elif is_row_parallel:
-                        dim_to_shard = 1
-                        print(f"    - Applying TP shard on scale dim={dim_to_shard} (RowParallel)")
-                    
+                    if is_column_parallel: dim_to_shard = 0
+                    elif is_row_parallel: dim_to_shard = 1
                     if dim_to_shard != -1:
+                        print(f"    - Applying TP shard on scale dim={dim_to_shard}")
                         total_size = loaded_tensor.shape[dim_to_shard]
                         block_size = total_size // tp_size
                         start, end = tp_rank * block_size, (tp_rank + 1) * block_size
-                        if dim_to_shard == 0:
-                            loaded_tensor = loaded_tensor[start:end, :]
-                        else:
-                            loaded_tensor = loaded_tensor[:, start:end]
+                        if dim_to_shard == 0: loaded_tensor = loaded_tensor[start:end, :]
+                        else: loaded_tensor = loaded_tensor[:, start:end]
                         print(f"    - Sharded tensor shape: {loaded_tensor.shape}")
                 
                 elif is_column_parallel or "embed_tokens" in model_param_name:
@@ -285,6 +278,7 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
                 print(f"    - Reshaping loaded tensor from {loaded_tensor.shape} to {param.shape}")
                 loaded_tensor = loaded_tensor.reshape(param.shape)
             
+            print(f"    - Final check before copy: param.shape={param.shape}, loaded_tensor.shape={loaded_tensor.shape}")
             assert param.shape == loaded_tensor.shape, f"Final shape mismatch for {model_param_name}: param {param.shape} vs loaded {loaded_tensor.shape}"
             param.copy_(loaded_tensor.cast(param.dtype), False)
             print(f"  > SUCCESS: Loaded into '{model_param_name}'")
@@ -301,7 +295,7 @@ class KimiK2ForCausalLM(DeepseekV3ForCausalLM):
             if unprocessed_weights:
                 print(f"\n[KIMI LOADER] WARNING: The following weights were not used: {unprocessed_weights}")
 
-        print("\n--- [KIMI LOADER] WEIGHT LOAD COMPLETE ---\n")
+        print("\n--- [KIMI LOADER V6 DEBUG] WEIGHT LOAD COMPLETE ---")
 
 
 class KimiK2PretrainedModel(DeepSeekV3PretrainedModel):
