@@ -615,6 +615,11 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 paddle.device.cuda.empty_cache()
 
             sublayer._wint4_quantized = True
+            # Replace quant_method so moe_expert_ffn uses int4 kernel
+            from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import CutlassWeightOnlyMoEMethod
+            from fastdeploy.model_executor.layers.quantization.weight_only import WINT4Config
+            wint4_cfg = WINT4Config(is_checkpoint_bf16=True)
+            sublayer.quant_method = CutlassWeightOnlyMoEMethod(wint4_cfg)
             mem = paddle.device.cuda.memory_allocated() / (1024**3)
             logger.info(f"WINT4: MoE layer '{name}' quantized to int4, GPU: {mem:.1f} GB")
 
