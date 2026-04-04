@@ -250,20 +250,8 @@ class MiniMaxM2_5MoE(nn.Layer):
             "gate_correction_bias_key": f"{prefix}.gate.e_score_correction_bias",
         }
 
-        self.experts = FusedMoE(
-            fd_config,
-            moe_intermediate_size=fd_config.model_config.intermediate_size,
-            num_experts=num_experts,
-            top_k=fd_config.model_config.num_experts_per_tok,
-            topk_method="noaux_tc",   # MiniMax uses sigmoid routing with correction bias
-            n_group=1,                # No grouping in MiniMax (unlike DeepSeek)
-            topk_group=1,
-            routed_scaling_factor=1.0,
-            layer_idx=layer_id,
-            weight_key_map=weight_key_map,
-        )
-
         # Gate projects hidden_size -> num_experts (float32, no quant)
+        # Must create gate BEFORE FusedMoE so e_score_correction_bias is available
         self.gate = ReplicatedLinear(
             fd_config=fd_config,
             prefix=f"{prefix}.gate",
@@ -285,14 +273,14 @@ class MiniMaxM2_5MoE(nn.Layer):
         else:
             self.gate.e_score_correction_bias = None
 
-        # Re-create FusedMoE with the correction bias reference
+        # Create FusedMoE with the correction bias reference (only once)
         self.experts = FusedMoE(
             fd_config,
             moe_intermediate_size=fd_config.model_config.intermediate_size,
             num_experts=num_experts,
             top_k=fd_config.model_config.num_experts_per_tok,
-            topk_method="noaux_tc",
-            n_group=1,
+            topk_method="noaux_tc",   # MiniMax uses sigmoid routing with correction bias
+            n_group=1,                # No grouping in MiniMax (unlike DeepSeek)
             topk_group=1,
             routed_scaling_factor=1.0,
             layer_idx=layer_id,
