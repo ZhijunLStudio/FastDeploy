@@ -1791,7 +1791,51 @@ class BlockWiseFP8MoEMethod(QuantMethodBase):
     ) -> paddle.Tensor:
         """
         Triton compute Fused MoE.
+        On SM < 90 (A100/A800): DeepGEMM/Triton FP8 kernel not available.
+        Dequant FP8 weights to BF16 and use standard BF16 MoE kernel.
         """
+        from fastdeploy.model_executor.layers.moe.fused_moe_backend_base import get_moe_method
+
+        if get_sm_version() < 90 and current_platform.is_cuda():
+            if not hasattr(self, '_bf16_moe_method'):
+                self._bf16_moe_method = get_moe_method(layer)
+            bf16_method = self._bf16_moe_method
+
+            if not getattr(layer, '_bf16_dequanted', False):
+                for wname, sname in [
+                    ("up_gate_proj_weight", "up_gate_proj_weight_scale"),
+                    ("down_proj_weight", "down_proj_weight_scale"),
+                ]:
+                    if not hasattr(layer, wname):
+                        continue
+                    w = getattr(layer, wname)
+                    if w.dtype == paddle.bfloat16:
+                        continue
+                    s = getattr(layer, sname, None)
+                    if s is None:
+                        w_bf16 = w.cast("bfloat16")
+                    else:
+                        BLOCK = self.quant_config.weight_block_size[0]
+                        w_f32 = w.cast("float32")
+                        E, od, id_ = w_f32.shape
+                        nr = (od + BLOCK - 1) // BLOCK
+                        nc = (id_ + BLOCK - 1) // BLOCK
+                        w_blocked = w_f32.reshape([E, nr, BLOCK, nc, BLOCK])
+                        sc_exp = s.unsqueeze(2).unsqueeze(4)
+                        w_dq = (w_blocked * sc_exp).reshape([E, od, id_])
+                        w_bf16 = w_dq.cast("bfloat16")
+                        del w_f32, w_blocked, sc_exp, w_dq
+                    delattr(layer, wname)
+                    setattr(layer, wname, layer.create_parameter(
+                        shape=w_bf16.shape, dtype="bfloat16",
+                        default_initializer=paddle.nn.initializer.Constant(0),
+                    ))
+                    getattr(layer, wname).copy_(w_bf16, False)
+                    del w_bf16
+                layer._bf16_dequanted = True
+                paddle.device.cuda.empty_cache()
+
+            return bf16_method.apply(layer, x, gate, topk_ids_hookfunc=topk_ids_hookfunc, shared_experts=shared_experts)
 
         gate_out = gate(x)
         gate_out = gate_out.cast("float32")

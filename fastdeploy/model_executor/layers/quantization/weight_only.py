@@ -228,6 +228,7 @@ class WINT4Config(WeightOnlyConfig):
         is_checkpoint_bf16: bool = False,
     ) -> None:
         super().__init__("weight_only_int4", is_checkpoint_bf16)
+        self.is_quantized = True
 
     @classmethod
     def from_config(cls, config: dict) -> "WINT4Config":

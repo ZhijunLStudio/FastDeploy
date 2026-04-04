@@ -16,6 +16,7 @@
 
 from functools import partial
 from typing import Callable, Optional
+import os
 
 import paddle
 from paddle import nn

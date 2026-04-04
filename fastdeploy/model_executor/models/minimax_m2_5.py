@@ -493,7 +493,18 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         )
 
     def _wint4_quantize_linear_layers(self):
-        """Quantize Linear layers (q/k/v/o_proj) from BF16 to WINT4 in-place."""
+        """Quantize Linear layers (q/k/v/o_proj) from BF16 to WINT4 in-place.
+
+        NOTE: PaddlePaddle's weight_only_linear does NOT work correctly on SM80 (A100).
+        On SM80, we skip Linear layer quantization and keep them as BF16.
+        MoE layers (97% of parameters) are quantized via moe_expert_ffn which works correctly.
+        """
+        sm = paddle.device.cuda.get_device_properties().major * 10 + paddle.device.cuda.get_device_properties().minor
+        if sm < 90:
+            logger.info(f"WINT4: Skipping Linear layer quantization on SM{sm} "
+                        f"(weight_only_linear not supported). Keeping BF16 for Linear layers.")
+            return
+
         from paddle.nn.quant import weight_quantize as _wq
         from fastdeploy.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
         from fastdeploy.model_executor.layers.quantization.weight_only import GPUWeightOnlyLinearMethod, WINT4Config
@@ -548,81 +559,206 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
         logger.info(f"WINT4: Quantized {count} Linear layers to int4")
 
-    def _wint4_quantize_moe_experts(self):
-        """Quantize MoE expert weights from BF16 to WINT4, one layer at a time.
+    def _wint4_quantize_layer(self, layer_idx: int):
+        """Quantize MoE experts of a single decoder layer to WINT4.
 
-        Key optimization: delete BF16 param + empty_cache BEFORE creating int8 param
-        to avoid double GPU memory allocation.
+        Quantizes each expert individually to limit peak memory.
+        Called per-layer in load_weights to enable streaming quantization.
         """
-        from fastdeploy.model_executor.layers.moe.moe import FusedMoE
         from paddle.nn.quant import weight_quantize as _wq
+        from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import CutlassWeightOnlyMoEMethod
+        from fastdeploy.model_executor.layers.quantization.weight_only import WINT4Config
 
-        logger.info("WINT4: Quantizing MoE expert weights to int4 ...")
-        for name, sublayer in self.named_sublayers():
-            if not isinstance(sublayer, FusedMoE):
+        layer = self.model.layers[layer_idx]
+        moe = layer.mlp.experts  # FusedMoE instance (not MiniMaxM2_5MoE wrapper)
+
+        if not hasattr(moe, 'up_gate_proj_weight'):
+            all_attrs = [a for a in dir(moe) if not a.startswith('_')]
+            logger.warning(f"WINT4: Layer {layer_idx} has no up_gate_proj_weight, skipping. "
+                           f"quant_method={type(moe.quant_method).__name__}, "
+                           f"attrs={all_attrs[:20]}")
+            return
+        if getattr(moe, '_wint4_quantized', False):
+            return
+
+        orig_dtype = moe.up_gate_proj_weight.dtype
+        logger.info(f"WINT4: Layer {layer_idx} MoE weight dtype={orig_dtype}, shape={moe.up_gate_proj_weight.shape}")
+
+        for wname, sname in [
+            ("up_gate_proj_weight", "up_gate_proj_weight_scale"),
+            ("down_proj_weight", "down_proj_weight_scale"),
+        ]:
+            if not hasattr(moe, wname):
                 continue
-            if not hasattr(sublayer, 'up_gate_proj_weight'):
+            orig = getattr(moe, wname)  # [E, K, N] BF16
+            if orig.dtype != paddle.bfloat16:
                 continue
-            if getattr(sublayer, '_wint4_quantized', False):
-                continue
 
-            E = sublayer.num_local_experts
-            for wname, sname in [
-                ("up_gate_proj_weight", "up_gate_proj_weight_scale"),
-                ("down_proj_weight", "down_proj_weight_scale"),
-            ]:
-                orig = getattr(sublayer, wname)  # [E, K, N] BF16
+            E = orig.shape[0]
 
-                # Quantize all experts to CPU int8 + scale first
-                packed_list = []
-                scale_list = []
-                for e in range(E):
-                    wi, ws = _wq(orig[e].cuda(), algo="weight_only_int4")
-                    packed_list.append(wi.cpu())
-                    scale_list.append(ws.cpu())
-                    del wi, ws
+            # Quantize all experts to CPU int8 (one at a time)
+            packed_list = []
+            scale_list = []
+            for e in range(E):
+                wi, ws = _wq(orig[e].cuda(), algo="weight_only_int4")
+                packed_list.append(wi.cpu())
+                scale_list.append(ws.cpu())
+                del wi, ws
 
-                # Use actual output shape from weight_quantize (not assumed)
-                packed_shape = list(packed_list[0].shape)  # e.g. [K//2, N] or [N, K//2]
-                scale_shape = list(scale_list[0].shape)     # e.g. [N]
+            packed_shape = list(packed_list[0].shape)
+            scale_shape = list(scale_list[0].shape)
 
-                # Free BF16 param BEFORE allocating new int8 param
-                if wname in sublayer._parameters:
-                    sublayer._parameters.pop(wname)
-                if hasattr(sublayer, wname):
-                    delattr(sublayer, wname)
-                if sname in sublayer._parameters:
-                    sublayer._parameters.pop(sname)
-                if hasattr(sublayer, sname):
-                    delattr(sublayer, sname)
-                del orig
-                paddle.device.cuda.empty_cache()
+            # Free BF16 param BEFORE allocating new int8 param
+            if wname in moe._parameters:
+                moe._parameters.pop(wname)
+            if hasattr(moe, wname):
+                delattr(moe, wname)
+            if sname in moe._parameters:
+                moe._parameters.pop(sname)
+            if hasattr(moe, sname):
+                delattr(moe, sname)
+            del orig
+            paddle.device.cuda.empty_cache()
 
-                # Now create int8 param with correct shape
-                new_w = sublayer.create_parameter(
-                    shape=[E] + packed_shape, dtype="int8",
-                    default_initializer=paddle.nn.initializer.Constant(0),
-                )
-                new_s = sublayer.create_parameter(
-                    shape=[E] + scale_shape, dtype="bfloat16",
-                    default_initializer=paddle.nn.initializer.Constant(0),
-                )
-                for e in range(E):
-                    new_w[e].set_value(packed_list[e])
-                    new_s[e].set_value(scale_list[e])
+            # Create new int8 param and write expert-by-expert
+            new_w = moe.create_parameter(
+                shape=[E] + packed_shape, dtype="int8",
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
+            new_s = moe.create_parameter(
+                shape=[E] + scale_shape, dtype="bfloat16",
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
+            for e in range(E):
+                new_w[e].set_value(packed_list[e])
+                new_s[e].set_value(scale_list[e])
+                packed_list[e] = None  # Free CPU memory
+                scale_list[e] = None
+            del packed_list, scale_list
 
-                setattr(sublayer, wname, new_w)
-                setattr(sublayer, sname, new_s)
-                paddle.device.cuda.empty_cache()
+            setattr(moe, wname, new_w)
+            setattr(moe, sname, new_s)
+            paddle.device.cuda.empty_cache()
 
-            sublayer._wint4_quantized = True
-            # Replace quant_method so moe_expert_ffn uses int4 kernel
-            from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import CutlassWeightOnlyMoEMethod
-            from fastdeploy.model_executor.layers.quantization.weight_only import WINT4Config
-            wint4_cfg = WINT4Config(is_checkpoint_bf16=True)
-            sublayer.quant_method = CutlassWeightOnlyMoEMethod(wint4_cfg)
-            mem = paddle.device.cuda.memory_allocated() / (1024**3)
-            logger.info(f"WINT4: MoE layer '{name}' quantized to int4, GPU: {mem:.1f} GB")
+        moe._wint4_quantized = True
+        # Replace quant_method so moe_expert_ffn uses int4 kernel
+        wint4_cfg = WINT4Config(is_checkpoint_bf16=True)
+        moe.quant_method = CutlassWeightOnlyMoEMethod(wint4_cfg)
+        mem = paddle.device.cuda.memory_allocated() / (1024**3)
+        logger.info(f"WINT4: Layer {layer_idx} MoE quantized to int4, GPU: {mem:.1f} GB")
+
+    def _wint4_quantize_moe_experts(self):
+        """Quantize MoE expert weights from BF16 to WINT4.
+
+        Uses per-layer quantization (_wint4_quantize_layer) for better memory management.
+        """
+        logger.info("WINT4: Quantizing MoE expert weights to int4 (per-layer) ...")
+        num_layers = self.fd_config.model_config.num_hidden_layers
+        for i in range(num_layers):
+            logger.info(f"WINT4: Quantizing MoE layer {i}/{num_layers}")
+            self._wint4_quantize_layer(i)
+        logger.info("WINT4: All MoE layers quantized")
+
+    @staticmethod
+    def _extract_layer_idx(weight_name: str, num_main_layers: int) -> int:
+        """Extract decoder layer index from weight name. Returns -1 for non-layer weights."""
+        if "model.layers." in weight_name:
+            parts = weight_name.split(".")
+            try:
+                idx = int(parts[parts.index("layers") + 1])
+                return idx
+            except (ValueError, IndexError):
+                pass
+        return -1
+
+    def _dequant_fp8_weights(self, fp8_weights: dict, fp8_scales: dict,
+                              params_dict: dict, stacked_params_mapping: list,
+                              expert_params_mapping: list,
+                              process_weights_after_loading_fn, block_size: int,
+                              enable_wint4: bool):
+        """Dequantize a set of FP8 weights and load them into model parameters.
+
+        If enable_wint4 is True and the weight is a MoE expert weight,
+        immediately quantize to WINT4 after dequant to BF16.
+        """
+        from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import CutlassWeightOnlyMoEMethod
+        from fastdeploy.model_executor.layers.quantization.weight_only import WINT4Config
+
+        for wname, wt in fp8_weights.items():
+            scale_name = wname.replace(".weight", ".weight_scale_inv")
+            scale = fp8_scales.get(scale_name)
+
+            if scale is None:
+                logger.warning(f"No scale for {wname}, loading raw fp8 as bf16")
+                wt_dq = get_tensor(wt).cast("bfloat16")
+            else:
+                wt_f32_t = get_tensor(wt).cast("float32")
+                sc_np = get_tensor(scale).numpy()
+                wt_np = wt_f32_t.numpy()
+                del wt_f32_t
+
+                out_dim, in_dim = wt_np.shape
+                n_blocks_r = (out_dim + block_size - 1) // block_size
+                n_blocks_c = (in_dim + block_size - 1) // block_size
+                pad_r = n_blocks_r * block_size - out_dim
+                pad_c = n_blocks_c * block_size - in_dim
+                if pad_r > 0 or pad_c > 0:
+                    wt_np = np.pad(wt_np, ((0, pad_r), (0, pad_c)))
+                wt_blocked = wt_np.reshape([n_blocks_r, block_size, n_blocks_c, block_size])
+                sc_expanded = sc_np.reshape([n_blocks_r, n_blocks_c])[:, np.newaxis, :, np.newaxis]
+                wt_dequant = (wt_blocked * sc_expanded).reshape(
+                    [n_blocks_r * block_size, n_blocks_c * block_size])[:out_dim, :in_dim]
+                del wt_np, sc_np, wt_blocked, sc_expanded
+
+                wt_dq = paddle.to_tensor(wt_dequant, dtype="bfloat16")
+                del wt_dequant
+
+            # Load into model parameter
+            matched = False
+            for mapping in expert_params_mapping:
+                param_name_e, weight_name_e, expert_id, shard_id = mapping
+                if weight_name_e not in wname:
+                    continue
+                model_param_name = wname.replace(weight_name_e, param_name_e)
+                if model_param_name not in params_dict:
+                    continue
+                param = params_dict[model_param_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, wt_dq, shard_id=shard_id, expert_id=expert_id)
+                msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
+                             "", model_param_name)
+                process_weights_after_loading_fn(msn, param)
+                matched = True
+                break
+
+            if not matched:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in wname or "mlp.experts" in wname:
+                        continue
+                    model_param_name = wname.replace(weight_name, param_name)
+                    if model_param_name not in params_dict:
+                        continue
+                    param = params_dict[model_param_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader(self.fd_config))
+                    weight_loader(param, wt_dq, shard_id)
+                    msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
+                                 "", model_param_name)
+                    process_weights_after_loading_fn(msn, param)
+                    matched = True
+                    break
+
+            if not matched:
+                if wname in params_dict:
+                    param = params_dict[wname]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader(self.fd_config))
+                    weight_loader(param, wt_dq)
+                    msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
+                                 "", wname)
+                    process_weights_after_loading_fn(msn, param)
+
+            del wt_dq
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
@@ -656,10 +792,13 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         )
 
         num_main_layers = self.fd_config.model_config.num_hidden_layers  # 62
+        _enable_wint4 = os.environ.get("FD_WINT4_QUANTIZE", "0") == "1"
 
-        # Accumulate FP8 expert weights and their scales for deferred dequantization
-        fp8_weights = {}   # name → fp8 tensor
-        fp8_scales  = {}   # name (weight_scale_inv) → scale tensor
+        # Collect FP8 weights and scales grouped by layer index for streaming dequant.
+        # Layer -1 = non-layer weights (embed, norm, lm_head)
+        fp8_by_layer: Dict[int, dict] = {}   # layer_idx -> {wname: fp8_tensor}
+        scales_by_layer: Dict[int, dict] = {} # layer_idx -> {scale_name: scale_tensor}
+        non_fp8_weights = []  # (name, weight) for non-FP8 weights to load immediately
 
         for loaded_weight_name, loaded_weight in weights_iterator:
             logger.debug(f"Loading weight: {loaded_weight_name}")
@@ -693,19 +832,18 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             )
 
             # MiniMax FP8 checkpoint stores per-block scales as "*.weight_scale_inv".
-            # Collect scale for later dequantization.
-            # NOTE: In TP>1, the scale shape may not match the parameter shape
-            # (parameter is TP-sliced, scale is full). We only collect it for
-            # dequant, not directly set it.
+            # Collect scale for later dequantization, grouped by layer index.
             if ".weight_scale_inv" in loaded_weight_name:
-                fp8_scales[loaded_weight_name] = loaded_weight
+                li = self._extract_layer_idx(loaded_weight_name, num_main_layers)
+                scales_by_layer.setdefault(li, {})[loaded_weight_name] = loaded_weight
                 continue
 
-            # For ALL FP8 weights (both expert and linear), defer loading for dequantization.
+            # For ALL FP8 weights (both expert and linear), collect for streaming dequant.
             if (loaded_weight_name.endswith(".weight") and
                     hasattr(loaded_weight, "dtype") and
                     "float8" in str(loaded_weight.dtype).lower()):
-                fp8_weights[loaded_weight_name] = loaded_weight
+                li = self._extract_layer_idx(loaded_weight_name, num_main_layers)
+                fp8_by_layer.setdefault(li, {})[loaded_weight_name] = loaded_weight
                 continue
 
             # Special handling for q_norm / k_norm weights.
@@ -807,101 +945,53 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             )
             process_weights_after_loading_fn(model_sublayer_name, param)
 
-        # WINT4 mode: all params (Linear + MoE) are int8.
-        # FP8 dequant → int4 quantize → pack int8 → write directly to int8 params.
-        _enable_wint4 = os.environ.get("FD_WINT4_QUANTIZE", "0") == "1"
+        # ---- Streaming FP8 dequant + WINT4 quant (layer-by-layer) ----
+        # Process non-layer weights first (embed, norm, lm_head, etc.)
+        # Then process each decoder layer's FP8 weights independently,
+        # immediately quantizing to WINT4 and freeing BF16 to keep peak memory low.
+        BLOCK_SIZE = 128
 
-        # Dequantize FP8 weights using block-wise scales.
-        if fp8_weights:
-            logger.info(f"Dequantizing {len(fp8_weights)} FP8 weights (CPU numpy"
-                        f"{', WINT4 int4 quantize' if _enable_wint4 else ''}) ...")
-            BLOCK_SIZE = 128
-            tp_size = self.fd_config.parallel_config.tensor_parallel_size
-            tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
+        # Process non-layer FP8 weights (layer_idx = -1)
+        if -1 in fp8_by_layer:
+            logger.info(f"Dequantizing non-layer FP8 weights ({len(fp8_by_layer[-1])} tensors) ...")
+            self._dequant_fp8_weights(
+                fp8_by_layer[-1], scales_by_layer.get(-1, {}),
+                params_dict, stacked_params_mapping, expert_params_mapping,
+                process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
+            )
+            del fp8_by_layer[-1]
+            if -1 in scales_by_layer:
+                del scales_by_layer[-1]
+            paddle.device.cuda.empty_cache()
 
-            for wname, wt in fp8_weights.items():
-                scale_name = wname.replace(".weight", ".weight_scale_inv")
-                scale = fp8_scales.get(scale_name)
+        # Process each decoder layer's FP8 weights (layer-by-layer streaming)
+        layer_indices = sorted(k for k in fp8_by_layer.keys() if k >= 0)
+        for li in layer_indices:
+            n_wts = len(fp8_by_layer[li])
+            mem_before = paddle.device.cuda.memory_allocated() / (1024**3)
+            logger.info(f"FP8 dequant + {'WINT4' if _enable_wint4 else 'BF16'} layer {li}/{num_main_layers} "
+                        f"({n_wts} tensors, GPU: {mem_before:.1f} GB) ...")
+            self._dequant_fp8_weights(
+                fp8_by_layer[li], scales_by_layer.get(li, {}),
+                params_dict, stacked_params_mapping, expert_params_mapping,
+                process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
+            )
+            # Immediately quantize MoE experts of this layer to WINT4 if enabled
+            if _enable_wint4:
+                self._wint4_quantize_layer(li)
+            # Free layer data
+            del fp8_by_layer[li]
+            if li in scales_by_layer:
+                del scales_by_layer[li]
+            paddle.device.cuda.empty_cache()
+            mem_after = paddle.device.cuda.memory_allocated() / (1024**3)
+            logger.info(f"  Layer {li} done. GPU: {mem_after:.1f} GB (freed {mem_before - mem_after:.1f} GB)")
 
-                if scale is None:
-                    logger.warning(f"No scale for {wname}, loading raw fp8 as bf16")
-                    wt_dq = get_tensor(wt).cast("bfloat16")
-                else:
-                    wt_f32_t = get_tensor(wt).cast("float32")
-                    sc_np = get_tensor(scale).numpy()
-                    wt_np = wt_f32_t.numpy()
-                    del wt_f32_t
+        del fp8_by_layer, scales_by_layer
 
-                    out_dim, in_dim = wt_np.shape
-                    n_blocks_r = (out_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-                    n_blocks_c = (in_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-                    pad_r = n_blocks_r * BLOCK_SIZE - out_dim
-                    pad_c = n_blocks_c * BLOCK_SIZE - in_dim
-                    if pad_r > 0 or pad_c > 0:
-                        wt_np = np.pad(wt_np, ((0, pad_r), (0, pad_c)))
-                    wt_blocked = wt_np.reshape([n_blocks_r, BLOCK_SIZE, n_blocks_c, BLOCK_SIZE])
-                    sc_expanded = sc_np.reshape([n_blocks_r, n_blocks_c])[:, np.newaxis, :, np.newaxis]
-                    wt_dequant = (wt_blocked * sc_expanded).reshape(
-                        [n_blocks_r * BLOCK_SIZE, n_blocks_c * BLOCK_SIZE])[:out_dim, :in_dim]
-                    del wt_np, sc_np, wt_blocked, sc_expanded
-
-                    wt_dq = paddle.to_tensor(wt_dequant, dtype="bfloat16")
-                    del wt_dequant
-
-                # Load immediately
-                matched = False
-                for mapping in expert_params_mapping:
-                    param_name_e, weight_name_e, expert_id, shard_id = mapping
-                    if weight_name_e not in wname:
-                        continue
-                    model_param_name = wname.replace(weight_name_e, param_name_e)
-                    if model_param_name not in params_dict:
-                        continue
-                    param = params_dict[model_param_name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, wt_dq, shard_id=shard_id, expert_id=expert_id)
-                    msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
-                                 "", model_param_name)
-                    process_weights_after_loading_fn(msn, param)
-                    matched = True
-                    break
-
-                if not matched:
-                    for param_name, weight_name, shard_id in stacked_params_mapping:
-                        if weight_name not in wname or "mlp.experts" in wname:
-                            continue
-                        model_param_name = wname.replace(weight_name, param_name)
-                        if model_param_name not in params_dict:
-                            continue
-                        param = params_dict[model_param_name]
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader(self.fd_config))
-                        weight_loader(param, wt_dq, shard_id)
-                        msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
-                                     "", model_param_name)
-                        process_weights_after_loading_fn(msn, param)
-                        matched = True
-                        break
-
-                if not matched:
-                    if wname in params_dict:
-                        param = params_dict[wname]
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader(self.fd_config))
-                        weight_loader(param, wt_dq)
-                        msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
-                                     "", wname)
-                        process_weights_after_loading_fn(msn, param)
-
-                del wt_dq
-
-            logger.info(f"FP8 dequant {'+ WINT4' if _enable_wint4 else ''} complete")
-
-        # WINT4: quantize Linear layers after loading
+        # WINT4: quantize Linear layers after loading (SM90+ only, SM80 skips)
         if _enable_wint4:
             self._wint4_quantize_linear_layers()
-            paddle.device.cuda.empty_cache()
-            self._wint4_quantize_moe_experts()
             paddle.device.cuda.empty_cache()
 
         # Transpose all Linear weights after loading.
