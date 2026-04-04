@@ -540,6 +540,7 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                     x.cast("bfloat16"), weight=layer.weight,
                     bias=layer.bias if layer.with_bias else None,
                     weight_scale=layer.weight_scale, weight_dtype="int4",
+                    arch=80,  # SM80 for A800
                 )
             sublayer.quant_method.apply = _wint4_apply
             count += 1
