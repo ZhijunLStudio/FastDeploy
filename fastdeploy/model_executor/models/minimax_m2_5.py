@@ -583,7 +583,6 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 ("down_proj_weight", "down_proj_weight_scale"),
             ]:
                 orig = getattr(sublayer, wname)  # [E, K, N] BF16
-                K, N = orig.shape[1], orig.shape[2]
 
                 # Quantize all experts to CPU int8 + scale first
                 packed_list = []
@@ -593,6 +592,10 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                     packed_list.append(wi.cpu())
                     scale_list.append(ws.cpu())
                     del wi, ws
+
+                # Use actual output shape from weight_quantize (not assumed)
+                packed_shape = list(packed_list[0].shape)  # e.g. [K//2, N] or [N, K//2]
+                scale_shape = list(scale_list[0].shape)     # e.g. [N]
 
                 # Free BF16 param BEFORE allocating new int8 param
                 if wname in sublayer._parameters:
@@ -606,23 +609,18 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 del orig
                 paddle.device.cuda.empty_cache()
 
-                # Now create int8 param (pool has freed BF16 memory)
+                # Now create int8 param with correct shape
                 new_w = sublayer.create_parameter(
-                    shape=[E, K//2, N], dtype="int8",
+                    shape=[E] + packed_shape, dtype="int8",
                     default_initializer=paddle.nn.initializer.Constant(0),
                 )
                 new_s = sublayer.create_parameter(
-                    shape=[E, N], dtype="bfloat16",
+                    shape=[E] + scale_shape, dtype="bfloat16",
                     default_initializer=paddle.nn.initializer.Constant(0),
                 )
                 for e in range(E):
-                    expert_slice = new_w[e]
-                    if expert_slice.shape == list(packed_list[e].shape):
-                        new_w[e].set_value(packed_list[e])
-                    else:
-                        new_w[e].copy_(packed_list[e].reshape(expert_slice.shape), False)
+                    new_w[e].set_value(packed_list[e])
                     new_s[e].set_value(scale_list[e])
-                    del packed_list[e], scale_list[e]
 
                 setattr(sublayer, wname, new_w)
                 setattr(sublayer, sname, new_s)
