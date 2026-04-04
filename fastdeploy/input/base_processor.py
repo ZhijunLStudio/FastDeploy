@@ -621,7 +621,15 @@ class BaseTextProcessor(ABC):
         """Return the padding token id, with LlamaTokenizer fallback."""
         if isinstance(self.tokenizer, (LlamaTokenizer, Llama3Tokenizer)) and not self.tokenizer.pad_token_id:
             return self.tokenizer.eos_token
-        return self.tokenizer.pad_token_id
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            # MiniMax and some models don't have pad_token, use eos or -1
+            if self.tokenizer.eos_token_id is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                return self.tokenizer.eos_token_id
+            return -1
+        return pad_id
 
     def pad_batch_data(self, insts, pad_id=0, return_seq_len=False, return_array=True, pad_style="right"):
         """Pad a list of variable-length lists to a rectangular array."""

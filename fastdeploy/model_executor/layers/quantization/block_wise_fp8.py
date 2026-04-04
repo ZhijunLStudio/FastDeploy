@@ -83,6 +83,10 @@ class BlockWiseFP8Config(QuantConfigBase):
         Get quantization method.
         """
         if isinstance(layer, FusedMoE):
+            if get_sm_version() < 90:
+                # SM < 90 (A100/A800): no FP8 tensor cores, MoE uses BF16
+                # Expert weights are dequantized to BF16 during load_weights
+                return None
             if layer.ep_size > 1 or self.use_deep_gemm:
                 from fastdeploy.model_executor.layers.moe.fused_moe_deepgemm_backend import (
                     DeepGemmFusedMoeMethod,
@@ -334,6 +338,35 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
         linear_out = paddle.empty((x.shape[0], layer.output_size), dtype=paddle.bfloat16)
         if x.shape[0] == 0:
             return linear_out
+
+        # On SM < 90 (A100 etc): no FP8 tensor cores, use BF16 directly
+        if get_sm_version() < 90 and current_platform.is_cuda():
+            import paddle.nn.functional as F
+            if layer.weight.dtype == paddle.bfloat16:
+                # Weight already dequantized to BF16 by load_weights
+                linear_out = F.linear(x.cast("bfloat16"), layer.weight)
+            else:
+                # Try to dequant using scales; if scales unavailable, cast directly
+                try:
+                    scale = layer.weight_scale_inv
+                    if scale is not None and scale.shape[0] > 0:
+                        BLOCK = self.quant_config.weight_block_size[0]
+                        weight_f32 = layer.weight.cast("float32")
+                        out_d, in_d = weight_f32.shape
+                        sc_exp = scale.unsqueeze(2).unsqueeze(3)
+                        sc_exp = paddle.expand(sc_exp, [scale.shape[0], scale.shape[1], BLOCK, BLOCK])
+                        sc_exp = sc_exp.reshape([scale.shape[0] * BLOCK, scale.shape[1] * BLOCK])[:out_d, :in_d]
+                        weight_bf16 = (weight_f32 * sc_exp).cast("bfloat16")
+                        linear_out = F.linear(x.cast("bfloat16"), weight_bf16)
+                    else:
+                        linear_out = F.linear(x.cast("bfloat16"), layer.weight.cast("bfloat16"))
+                except Exception:
+                    # Fallback: cast FP8 weight directly to BF16
+                    linear_out = F.linear(x.cast("bfloat16"), layer.weight.cast("bfloat16"))
+            if layer.with_bias:
+                linear_out = paddle.add(linear_out, layer.bias)
+            return linear_out
+
         if not fastdeploy.envs.FD_USE_PHI_FP8_QUANT:
             x, x_scale_tensor = fastdeploy.model_executor.ops.gpu.per_token_quant_padding(
                 x, self.quant_config.weight_block_size[0], self.quant_config.deepgemm_scale_ue8m0
@@ -344,7 +377,6 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                 x,
                 using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
                 output_scale_transpose=True,
-                using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
             )
             x_scale_tensor = x_scale_tensor.T[: x.shape[0], ...]
 
@@ -358,7 +390,8 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                 layer_output_size=layer.output_size,
                 bias=layer.bias if layer.with_bias else None,
             )
-        else:
+        elif get_sm_version() >= 90 and current_platform.is_cuda():
+            # SM 90+ (Hopper): use DeepGEMM
             deep_gemm_fp8_gemm_nt(
                 x,
                 x_scale_tensor,
@@ -367,6 +400,33 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                 linear_out,
                 layer_output_size=layer.output_size,
             )
+            if layer.with_bias:
+                linear_out = paddle.add(linear_out, layer.bias)
+        else:
+            # SM < 90 (A100 etc): dequant FP8 weight to BF16 and use standard GEMM
+            # If weight is already BF16 (dequantized during load_weights), use directly
+            import paddle.nn.functional as F
+            if layer.weight.dtype == paddle.bfloat16:
+                # Weight already dequantized to BF16 by load_weights
+                linear_out = F.linear(x.cast("bfloat16"), layer.weight)
+            else:
+                # Try to dequant using scales; if scales unavailable, cast directly
+                try:
+                    scale = layer.weight_scale_inv
+                    if scale is not None and scale.shape[0] > 0:
+                        BLOCK = self.quant_config.weight_block_size[0]
+                        weight_f32 = layer.weight.cast("float32")
+                        out_d, in_d = weight_f32.shape
+                        sc_exp = scale.unsqueeze(2).unsqueeze(3)
+                        sc_exp = paddle.expand(sc_exp, [scale.shape[0], scale.shape[1], BLOCK, BLOCK])
+                        sc_exp = sc_exp.reshape([scale.shape[0] * BLOCK, scale.shape[1] * BLOCK])[:out_d, :in_d]
+                        weight_bf16 = (weight_f32 * sc_exp).cast("bfloat16")
+                        linear_out = F.linear(x.cast("bfloat16"), weight_bf16)
+                    else:
+                        linear_out = F.linear(x.cast("bfloat16"), layer.weight.cast("bfloat16"))
+                except Exception:
+                    # Fallback: cast FP8 weight directly to BF16
+                    linear_out = F.linear(x.cast("bfloat16"), layer.weight.cast("bfloat16"))
             if layer.with_bias:
                 linear_out = paddle.add(linear_out, layer.bias)
 

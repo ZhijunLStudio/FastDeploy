@@ -650,7 +650,16 @@ class FusedMoE(nn.Layer):
         """
         if self.is_quantized or self.fd_config.model_config.is_moe_quantized:
             if getattr(self.fd_config.quant_config, "is_permuted", True):
-                self.quant_method.process_prequanted_weights(self, state_dict, is_rearrange)
+                if hasattr(self.quant_method, "process_prequanted_weights"):
+                    self.quant_method.process_prequanted_weights(self, state_dict, is_rearrange)
+                else:
+                    # Fallback: quant_method (e.g. CutlassMoEMethod on SM < 90) doesn't
+                    # support process_prequanted_weights. Use process_loaded_weights instead.
+                    # This happens when BlockWiseFP8Config returns None for FusedMoE on
+                    # SM < 90 (no FP8 tensor cores), falling back to CutlassMoEMethod.
+                    # The weights should already be dequantized to BF16 by the model's
+                    # load_weights method before reaching here.
+                    self.quant_method.process_loaded_weights(self, state_dict)
             else:
                 self.quant_method.process_loaded_weights(self, state_dict)
         else:

@@ -378,6 +378,22 @@ class ModelConfig:
             # Because the ERNIE 4.5 config.json contains two sets of keys, adaptation is required.
             self.moe_num_shared_experts = self.n_shared_experts
 
+        # Compute partial_rotary_factor from rotary_dim if not explicitly set.
+        # Some models (e.g. MiniMax-M2.5) specify rotary_dim instead of partial_rotary_factor.
+        if (
+            hasattr(self, "rotary_dim")
+            and hasattr(self, "head_dim")
+            and self.head_dim > 0
+            and self.partial_rotary_factor == 1.0
+        ):
+            self.partial_rotary_factor = self.rotary_dim / self.head_dim
+
+        # Map num_local_experts to num_experts (used by MiniMax-M2.5)
+        if hasattr(self, "num_local_experts") and not hasattr(self, "num_experts"):
+            self.num_experts = self.num_local_experts
+        if hasattr(self, "num_local_experts") and getattr(self, "moe_num_experts") is None:
+            self.moe_num_experts = self.num_local_experts
+
     def read_from_env(self):
         """
         Read configuration information from environment variables and update the object's attributes.
@@ -435,6 +451,13 @@ class ModelConfig:
             ):
                 self.model_format = "torch"
                 logger.info("The model format is Hugging Face")
+            elif (
+                "auto_map" in self.model_config
+                or "transformers_version" in self.model_config
+                or self.model_config.get("model_type", "").startswith("minimax")
+            ):
+                self.model_format = "torch"
+                logger.info("The model format is Hugging Face (inferred from auto_map/transformers_version)")
             else:
                 raise ValueError(
                     "Unknown model format. Please ensure your config.json contains "

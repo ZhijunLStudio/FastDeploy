@@ -586,7 +586,7 @@ class LLMEngine:
             f" --block_size {self.cfg.cache_config.block_size}"
             f" --enc_dec_block_num {self.cfg.cache_config.enc_dec_block_num}"
             f" --eos_tokens_lens {self.engine.data_processor.eos_token_id_len}"
-            f" --pad_token_id {self.engine.data_processor.pad_token_id}"
+            f" --pad_token_id {self.engine.data_processor.pad_token_id if self.engine.data_processor.pad_token_id is not None else -1}"
             f" --engine_pid {self.cfg.parallel_config.engine_worker_queue_port[0]}"
             f" --max_num_batched_tokens {self.cfg.scheduler_config.max_num_batched_tokens}"
             f" --splitwise_role {self.cfg.scheduler_config.splitwise_role}"
