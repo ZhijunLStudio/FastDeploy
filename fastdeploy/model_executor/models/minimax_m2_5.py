@@ -274,8 +274,10 @@ class MiniMaxM2_5MoE(nn.Layer):
             self.gate.e_score_correction_bias = None
 
         # Create FusedMoE with the correction bias reference (only once)
+        # renormalize=True: MiniMax-M2.5 normalizes top-k weights by their sum
         self.experts = FusedMoE(
             fd_config,
+            renormalize=True,
             moe_intermediate_size=fd_config.model_config.intermediate_size,
             num_experts=num_experts,
             top_k=fd_config.model_config.num_experts_per_tok,
