@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-05（第二次更新）**
+> **更新日期：2026-04-05（第三次更新）**
 
 ## 1. 项目目标
 
@@ -100,14 +100,14 @@ tokens: [17195, 8196, 24656, 18030, 23404, 11819, 7657, 13215, 24974, 19954]
 text:   '��inct municípIONS芸来了毕hips móv刺激'
 ```
 
-#### TP=8 FP8 62 层全量（已通过）
+#### TP=8 FP8 62 层全量（已通过，renormalize 修复后）
 ```
 GPU 显存: 53.4 GB/卡
 prompt: 'Hello, my name is'
-tokens: [21735, 16060, 10159, 14001, 15021, 16990, 20719, 5158, 1142, 15339, ...]
-text:   'angkaagues媒 PosATA吹肿anger�stal发挥准ertainienesense看看heimculalu租'
+tokens: [2785, 19781, 15525, 19221, 11937, 2785, 19450, 19450, 17697, 17697, 15525, 6125, 17050, 6210, 5125]
+text:   '统asukcussillet寻统axyaxy撮撮cussoma嘉序留'
 ```
-输出有语义的多语言 token（中、英、日、印尼语混合），每卡 ~53 GB 显存。推理速度约 1.0-1.3s/token。
+renormalize 修复后输出有所改善（有更多有语义的中文 token），但 SM80 上仍有乱码和重复。推理速度约 1.0-1.1s/token。
 
 #### TP=8 WINT4（已通过，MoE 保持 BF16）
 TP=8 WINT4 模式下，MoE 层在 SM80 上保持 BF16（`moe_expert_ffn` 的 int4 kernel 与 TP-sharded weight layout 不兼容）。
@@ -121,6 +121,7 @@ TP=8 WINT4 模式下，MoE 层在 SM80 上保持 BF16（`moe_expert_ffn` 的 int
 #### 仍存在的问题
 1. **TP=8 WINT4 MoE int4 不工作**：`paddle.nn.quant.weight_quantize` 在 SM80 上对 TP-sharded weight 的 packed layout 与 `moe_expert_ffn` int4 kernel 不兼容。需要进一步调试或使用替代量化方案。
 2. **FD LLM API 输出重复 token**：SM80 上 FD 推理流水线的兼容性问题，尚未排查。
+3. **SM80 上输出仍有乱码**（2026-04-05 第三次更新）：renormalize 修复后 5 层模型输出改善（有语义 token 增多），但 62 层全量模型仍有乱码。vLLM 在 SM80 上也完全无法正常工作（5 层输出全换行符，62 层 TP=1 OOM、TP=8 初始化失败）。确认为 SM80 硬件限制。
 
 ### 3.3 显存估算
 
@@ -214,6 +215,23 @@ class WINT4Config(WeightOnlyConfig):
         self.is_quantized = True  # 修复 CutlassWeightOnlyMoEMethod 的 is_quantized 检查
 ```
 
+### 5.4 `minimax_m2_5.py` — MoE renormalize 修复
+
+```python
+# 修复前：FusedMoE 默认 renormalize=False
+self.experts = FusedMoE(fd_config, ...)
+
+# 修复后：MiniMax-M2.5 routing 需要 renormalize
+self.experts = FusedMoE(fd_config, renormalize=True, ...)
+```
+
+**根因**：`noaux_tc` routing 选出 top-8 expert 后，weights 应除以 sum 归一化（sum=1.0）。
+未修复时 weights 是原始 sigmoid 值（sum≈4.0），每层 MoE output 放大约 4 倍，62 层累积后输出乱码。
+
+**验证**：`compare_routing.py` 对比 FD vs vLLM：
+- 修复前：FD topk_weights sum=4.0215，vLLM sum=1.0000
+- 修复后：FD topk_weights sum≈1.0，与 vLLM 一致
+
 ---
 
 ## 6. 关键文件清单
@@ -264,6 +282,8 @@ class WINT4Config(WeightOnlyConfig):
 | 17 | FD LLM API SM80 输出重复 | 推理流水线 SM80 兼容性问题 | **待修复** |
 | 18 | `_dequant_fp8_weights` 每次加载后调用 `process_weights_after_loading` | stacked params (qkv_proj) 被多次 transpose + re-quantize | 修复为加载完所有权重后每个 sublayer 只调用一次 |
 | 19 | SM80 输出乱码 | 硬件不支持 FP8 原生计算，BF16 dequant 精度累积导致 MoE routing 偏差 | 在 SM90+ 上验证或接受 SM80 精度损失 |
+| 20 | FusedMoE 缺少 `renormalize=True` | MiniMax-M2.5 routing 需要对 top-k weights 做 sum 归一化，但 `FusedMoE` 默认 `renormalize=False`，导致 weights 放大约 4 倍 | 添加 `renormalize=True`（cos_sim 对比验证确认） |
+| 21 | vLLM 在 SM80 上也无法正常工作 | vLLM 5 层输出全换行符（MARLIN FP8 精度损失），62 层 TP=1 OOM，TP=8 初始化失败 | 确认为 SM80 硬件限制，不是 FD 独有问题 |
 
 ---
 
