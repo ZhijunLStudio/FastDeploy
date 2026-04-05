@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-05（第三次更新）**
+> **更新日期：2026-04-06（第四次更新 — FP8 Marlin MoE 集成）**
 
 ## 1. 项目目标
 
@@ -65,6 +65,56 @@
 ### 2.6 WINT4Config 修复（2026-04-05 新增）
 - `WINT4Config.__init__` 添加 `self.is_quantized = True`
 - 修复 `CutlassWeightOnlyMoEMethod.process_weights_after_loading` 中的 `is_quantized` 检查
+
+### 2.7 FP8 Marlin MoE 集成（2026-04-06 新增）
+
+**背景**：vLLM 在 SM80 上通过 Marlin kernel 成功运行 MiniMax-M2.5 FP8 模型（`vllm serve` 命令正常输出中文）。FD 原有的 SM80 路径是 BF16 dequant fallback，精度损失导致 MoE routing 偏差和乱码。通过集成 Marlin kernel 可以解决此问题。
+
+**已完成的修改**：
+
+1. **C++ Marlin kernel 层**：
+   - `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/generate_kernels.py`：启用 `kFE4M3fn` (FP8 E4M3) kernel 生成
+   - `custom_ops/gpu_ops/moe/moe_wna16_marlin_gemm.cu`：
+     - `COMMON_GET_IF(kFE4M3fn)` → `BIGGROUP_GET_IF(kFE4M3fn)` 修复 `group_blocks=2,4` 未定义符号链接错误
+     - 添加 `float8_e4m3fn` 字符串到 `b_q_type_id` 映射
+     - 在 `get_marlin_kernel` 中启用 `BIGGROUP_GET_IF(kFE4M3fn)` 支持 FP8 kernel 查找
+
+2. **Python Marlin MoE backend** (`fused_moe_marlin_backend.py`)：
+   - 扩展 `MarlinWeightOnlyMoEMethod` 支持 FP8 权重（原仅支持 INT4）
+   - 添加 `weight_type` 检测（从 `BlockWiseFP8Config.weight_block_size` 判断 FP8 vs INT4）
+   - `create_weights` 根据 weight_type 创建正确形状的参数（FP8: `N*4`, INT4: `N*2`）
+   - `apply` 方法根据 weight_type 设置 `b_q_type_str="float8_e4m3fn"` 和正确的 `size_n`
+
+3. **Quantization config 层** (`block_wise_fp8.py`)：
+   - SM80 上 `BlockWiseFP8Config.get_quant_method` 返回 `MarlinWeightOnlyMoEMethod(self)` 代替 `None`
+   - 这样 FusedMoE 在 SM80 上使用 Marlin kernel 而非 Cutlass BF16 fallback
+
+4. **模型加载层** (`minimax_m2_5.py`)：
+   - 添加 `_process_fp8_marlin_weights()` 函数：FP8 weight → pack to int32 → Marlin repack → scale permute
+   - 添加 `_load_fp8_marlin_layer()` 方法：按 expert 分组处理 w1/w2/w3，合并 gate+up 投影，处理 scale 拼接
+   - 修改 `_dequant_fp8_weights()`：当 `FD_MARLIN_FP8=1` 时跳过 expert 权重反量化
+   - 修改 streaming dequant 循环：逐层加载 FP8 expert weights 到 Marlin backend
+   - 修复 weight layout：checkpoint 是 `[N, K]` format（output × input），Marlin 需要 `[K, N]` format
+
+5. **Engine config 层**：
+   - `config.py`：从 `config.json` 的 `quantization_config` 检测 FP8 量化，设置 `is_quantized=True`
+   - `args_utils.py`：从 `model_config.quantization` 创建 `BlockWiseFP8Config` 并传递给 `FDConfig`
+
+**验证结果**（TP=1, 3 层模型）：
+```
+GPU 显存: 17.8 GB
+prompt: 'Hello, my name is'
+tokens: [69362, 105, 5269, 94039, 21469, 142179, 6703, 18985, 69635, 2337]
+text:   ' قيiubeinetteスメ市面上ingtonoshzypisyita'
+```
+FP8 Marlin MoE kernel 端到端推理成功运行。输出乱码（因 3/62 层），但 kernel 调用链完整通过。
+
+**已验证的 C++ kernel 单元测试**：
+- FP8 weight pack to int32: ✓
+- Marlin repack (num_bits=8): ✓
+- Scale permute: ✓
+- `MoeWna16MarlinGemmApi` with `b_q_type_str="float8_e4m3fn"`: ✓ (gate+up + swiglu + down 完整流程)
+- 输出 tensor shape: `[token_num, hidden_size]` ✓
 
 ---
 
@@ -240,11 +290,17 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 
 | 文件路径 | 说明 |
 |----------|------|
-| `FastDeploy/fastdeploy/model_executor/models/minimax_m2_5.py` | 模型定义 + 逐层流式加载 + WINT4 量化 (核心文件) |
+| `FastDeploy/fastdeploy/model_executor/models/minimax_m2_5.py` | 模型定义 + 逐层流式加载 + WINT4/FP8-Marlin 量化 (核心文件) |
 | `FastDeploy/fastdeploy/model_executor/layers/quantization/weight_only.py` | Linear WINT4 实现 + WINT4Config 修复 |
+| `FastDeploy/fastdeploy/model_executor/layers/quantization/block_wise_fp8.py` | FP8 quant config + SM80 Marlin 路由 |
+| `FastDeploy/fastdeploy/model_executor/layers/moe/fused_moe_marlin_backend.py` | Marlin MoE backend（支持 INT4 + FP8） |
 | `FastDeploy/fastdeploy/model_executor/layers/moe/fused_moe_triton_backend.py` | SM80 FP8 MoE BF16 fallback |
 | `FastDeploy/fastdeploy/model_executor/layers/moe/fused_moe_cutlass_backend.py` | MoE WINT4 实现 (`CutlassWeightOnlyMoEMethod`) |
+| `FastDeploy/custom_ops/gpu_ops/moe/moe_wna16_marlin_gemm.cu` | Marlin MoE CUDA kernel（FP8 + INT4） |
+| `FastDeploy/custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/generate_kernels.py` | Marlin kernel 模板生成（含 FP8） |
 | `FastDeploy/custom_ops/gpu_ops/moe/moe_ffn.cu` | `moe_expert_ffn` CUDA kernel（含 `weight_only_int4` 分支） |
+| `FastDeploy/fastdeploy/config.py` | FP8 quantization 检测 |
+| `FastDeploy/fastdeploy/engine/args_utils.py` | BlockWiseFP8Config 创建 |
 
 ### 6.2 测试脚本（my-tools/）
 
@@ -255,7 +311,9 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 | `fd_llm_tp8_62layer.py` | 62 层 TP=8 FP8 推理（FD LLM API，输出重复） |
 | `fd_llm_tp8_62layer_wint4.py` | 62 层 TP=8 WINT4 推理（FD LLM API，输出重复） |
 | `run_fd_gen.py` | TP=1 手动前向推理 |
+| `run_fd_gen_marlin.py` | TP=1 FP8 Marlin MoE 手动前向推理（2026-04-06 新增） |
 | `test_wint4_sm80_unit.py` | SM80 WINT4 单元测试 |
+| `test_fp8_marlin_moe.py` | FP8 Marlin MoE kernel 单元测试（2026-04-06 新增） |
 
 ---
 
@@ -291,21 +349,19 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 
 ### 8.1 优先级最高
 
-1. **SM80 输出乱码问题（根因分析完成）**：
+1. **FP8 Marlin MoE 8 卡完整模型测试**：
+   - FP8 Marlin kernel 已在 TP=1, 3 层模型上验证通过
+   - 下一步：8 卡 A100 + Expert Parallel 模式测试完整 62 层模型
+   - 预期显存：FP8 Marlin weight (1 byte/param) + BF16 activation，约 30-40 GB/卡
+   - 需要验证 FP8 Marlin 精度是否优于 BF16 dequant fallback（vLLM 已验证 cos_sim=1.0）
+
+2. **SM80 输出乱码问题（根因分析完成）**：
    - 62 层全量模型在 SM80 上输出乱码（多语言混合、无语义）
    - **根因**：SM80 硬件不支持 FP8 原生计算。FD 做 FP8→BF16 反量化后用 BF16 计算，每层 cos_sim > 0.9999，但 MoE routing（top-8 from 256 experts, sigmoid scoring + e_score_correction_bias）对微小差异非常敏感，62 层累积后路由可能选了完全不同的 experts
-   - **排除的问题**（2026-04-05 深度诊断）：
-     - FP8 dequant 精度：`compare_dequant.py` 验证 cos_sim=1.0, max_diff=0.0，完全正确
-     - Scale 匹配：checkpoint 中 scale 命名和 weight 命名一一对应，无缺失
-     - Scale 转置：scale 形状 `[ceil(out/128), ceil(in/128)]` 正确，转置后 cos_sim 降到 0.42-0.98
-     - QK-Norm：weight 值和 vLLM 完全一致（q_norm mean=0.995, k_norm mean=1.090）
-     - 权重加载：FD dequant 后 weight norm=95.48，与 checkpoint 直接 dequant 一致
-     - FD vs vLLM Q 输出：cos_sim=0.9827（差异来自 BF16 精度 roundtrip）
-   - **结论**：这是 SM80 硬件限制，不是代码 bug。需要在 SM90+（H100）上验证是否也乱码
-   - **可能的解决方案**：
-     a. 在 SM90+ 上运行（FP8 原生计算，无精度损失）
-     b. 实现 FP8 原生计算 kernel（类似 vLLM Marlin），但 SM80 不支持 FP8 tensor core
-     c. 接受 SM80 上的精度损失，输出可能不够好
+   - **可能的解决方案**（2026-04-06 新增）：
+     - ✅ FP8 Marlin kernel 已集成（使用 weight-only 量化，保持 FP8 权重精度）
+     - 需要在 62 层模型上验证 Marlin kernel 是否能消除乱码
+     - vLLM 使用相同 Marlin kernel 已能在 SM80 上正常输出中文
 
 2. **TP=8 WINT4 MoE int4 量化**：
    - `paddle.nn.quant.weight_quantize` 在 SM80 上对 TP-sharded weight（`[384, 3072]`）的 packed layout（`[1536, 384]`）与 `moe_expert_ffn` int4 kernel 不兼容

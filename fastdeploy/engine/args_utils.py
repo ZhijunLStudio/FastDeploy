@@ -1503,6 +1503,15 @@ class EngineArgs:
         early_stop_cfg.update_enable_early_stop(self.enable_early_stop)
         structured_outputs_config: StructuredOutputsConfig = StructuredOutputsConfig(args=all_dict)
 
+        # Create quant_config from model_config.quantization
+        quant_cfg = None
+        if model_cfg.is_quantized and model_cfg.quantization:
+            from fastdeploy.model_executor.layers.quantization.block_wise_fp8 import BlockWiseFP8Config
+            qc = model_cfg.quantization
+            if qc.get("quant_method") == "fp8":
+                quant_cfg = BlockWiseFP8Config.from_config(qc)
+                console_logger.info(f"Created BlockWiseFP8Config: weight_block_size={quant_cfg.weight_block_size}")
+
         return FDConfig(
             model_config=model_cfg,
             scheduler_config=scheduler_cfg,
@@ -1514,6 +1523,7 @@ class EngineArgs:
             eplb_config=eplb_cfg,
             structured_outputs_config=structured_outputs_config,
             router_config=router_config,
+            quant_config=quant_cfg,
             ips=self.ips,
             use_warmup=self.use_warmup,
             limit_mm_per_prompt=self.limit_mm_per_prompt,

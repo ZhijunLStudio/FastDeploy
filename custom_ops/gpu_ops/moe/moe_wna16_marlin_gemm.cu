@@ -487,7 +487,7 @@ MarlinFuncPtr get_marlin_kernel(const MARLIN_NAMESPACE_NAME::ScalarType q_type,
   COMMON_GET_IF(MARLIN_NAMESPACE_NAME::kU4B8)
   // COMMON_GET_IF(MARLIN_NAMESPACE_NAME::kU8B128)
 
-  // BIGGROUP_GET_IF(MARLIN_NAMESPACE_NAME::kFE4M3fn)
+  BIGGROUP_GET_IF(MARLIN_NAMESPACE_NAME::kFE4M3fn)
 
   // FP4_GET_IF(MARLIN_NAMESPACE_NAME::kFE2M1f)
 
@@ -1365,6 +1365,8 @@ std::vector<paddle::Tensor> MoeWna16MarlinGemmApi(
     b_q_type_id = MARLIN_NAMESPACE_NAME::kU4.id();
   } else if (b_q_type_str == "uint4b8") {
     b_q_type_id = MARLIN_NAMESPACE_NAME::kU4B8.id();
+  } else if (b_q_type_str == "float8_e4m3fn") {
+    b_q_type_id = MARLIN_NAMESPACE_NAME::kFE4M3fn.id();
   } else {
     PADDLE_ENFORCE(false, "b_q_type_str not supported!");
   }

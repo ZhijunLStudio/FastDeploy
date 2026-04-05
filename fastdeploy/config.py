@@ -458,6 +458,15 @@ class ModelConfig:
             ):
                 self.model_format = "torch"
                 logger.info("The model format is Hugging Face (inferred from auto_map/transformers_version)")
+
+            # Detect quantization from config.json
+            if "quantization_config" in self.model_config:
+                qc = self.model_config["quantization_config"]
+                if qc.get("quant_method") == "fp8":
+                    self.is_quantized = True
+                    self.quantization = qc
+                    logger.info(f"Detected FP8 quantization: {qc.get('quant_method')}, "
+                                f"block_size={qc.get('weight_block_size')}")
             else:
                 raise ValueError(
                     "Unknown model format. Please ensure your config.json contains "

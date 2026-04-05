@@ -54,6 +54,137 @@ from fastdeploy.model_executor.utils import (
 )
 
 
+def _marlin_permute_scales(s, size_k, size_n, group_size):
+    """Permute scales for Marlin format."""
+    scale_perm = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single = []
+    for i in range(4):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    if group_size < size_k and group_size != -1:
+        s = s.reshape([-1, len(scale_perm)])[:, scale_perm]
+    else:
+        s = s.reshape([-1, len(scale_perm_single)])[:, scale_perm_single]
+    return s.reshape([-1, size_n]).contiguous()
+
+
+def _process_fp8_marlin_weights(moe_layer, up_gate_fp8, up_gate_scale,
+                                  down_fp8, down_scale, block_size):
+    """Process FP8 MoE weights for Marlin kernel and load into layer.
+
+    Args:
+        moe_layer: the FusedMoE layer
+        up_gate_fp8: [num_experts, moe_intermediate_size*2, hidden_size] float8_e4m3fn (N, K format)
+        up_gate_scale: [num_experts, n_blocks_n_up, n_blocks_k_up] float32
+        down_fp8: [num_experts, hidden_size, moe_intermediate_size] float8_e4m3fn (N, K format)
+        down_scale: [num_experts, n_blocks_n_down, n_blocks_k_down] float32
+        block_size: FP8 block size (typically 128)
+    """
+    from fastdeploy.model_executor.ops.gpu import gptq_marlin_repack
+
+    for idx, (fp8_weight, scale, weight_name, scale_name) in enumerate([
+        (up_gate_fp8, up_gate_scale, "up_gate_proj_weight", "up_gate_proj_weight_scale"),
+        (down_fp8, down_scale, "down_proj_weight", "down_proj_weight_scale"),
+    ]):
+        # Checkpoint weight is [E, N, K] format (output, input)
+        E, N, K = fp8_weight.shape
+        group_size = block_size
+        num_bits = 8
+
+        marlin_qweights = []
+        marlin_scales = []
+        perm = paddle.empty([0], dtype="int32")
+
+        for i in range(E):
+            # fp8_weight[i] is [N, K] format
+            # For Marlin: pack K dimension, then repack
+            fp8_i = fp8_weight[i]  # [N, K]
+            # Transpose to [K, N] for packing
+            fp8_i_t = fp8_i.T.contiguous()  # [K, N]
+            # Pack: [K, N] -> [K, N//4] (4 FP8 per int32)
+            packed = fp8_i_t.view("int32")  # [K, N//4]
+            # Transpose for Marlin: [N//4, K]
+            packed_t = packed.T.contiguous()  # [N//4, K]
+            # Wait - gptq_marlin_repack expects [K//4, N] for input?
+            # Let me check: the INT4 code does quanted_weight.reshape([0, K//8, 8, N])
+            # which gives [E, K//8, N] and then repack with K, N
+            # For FP8: packed is [K, N//4], so we need [K//4, N] as input?
+            # Actually, gptq_marlin_repack expects b_q_weight of shape [K//pack_factor, N]
+            # where pack_factor = 32/num_bits = 4 for FP8
+            # So input should be [K//4, N]
+            # Currently we have [N//4, K] which is wrong
+            # We need to transpose: [K//4, N] from [K, N//4] by doing packed.T
+            # But packed is [K, N//4], so packed.T is [N//4, K]
+            # We need [K//4, N] which is packed transposed differently
+            # Actually: the repack function signature is gptq_marlin_repack(b_q_weight, perm, size_k, size_n, num_bits)
+            # where b_q_weight is [size_k//pack_factor, size_n]
+            # So for K=3072, N=3072: input should be [3072//4, 3072] = [768, 3072]
+            # packed is [K, N//4] = [3072, 768]
+            # We need [K//4, N] = [768, 3072]
+            # So: reshape packed [3072, 768] to [768, 3072]?
+            # No, just transpose: [K, N//4] -> [N//4, K] which is NOT [K//4, N]
+            # The issue is that view("int32") packs along the last dimension
+            # So [K, N] -> [K, N//4] packs N
+            # But Marlin expects [K//4, N] which packs K
+            # So we need to transpose FIRST, then pack, then transpose back
+            # [N, K] -> transpose -> [K, N] -> pack N -> [K, N//4] -> transpose -> [N//4, K]
+            # But we want [K//4, N]
+            # So: [N, K] -> pack K -> [N, K//4] -> transpose -> [K//4, N]
+            # This means we should NOT transpose before packing!
+            packed_k = fp8_i.view("int32")  # [N, K//4] - pack along K
+            packed_k_t = packed_k.T.contiguous()  # [K//4, N]
+            marlin_qw = gptq_marlin_repack(packed_k_t, perm, K, N, num_bits)
+            marlin_qweights.append(marlin_qw)
+
+            # Permute scales
+            # scale[i] is [n_blocks_n, n_blocks_k] in checkpoint format
+            # Need to expand to [n_blocks_k, N] for Marlin
+            s = scale[i]  # [n_blocks_n, n_blocks_k]
+            # Transpose to [n_blocks_k, n_blocks_n]
+            s = s.T
+            n_blocks_n = s.shape[1]
+            s_expanded = s.unsqueeze(2).expand(
+                [s.shape[0], n_blocks_n, block_size]
+            ).reshape([s.shape[0], n_blocks_n * block_size])
+            s_expanded = s_expanded[:, :N]
+            marlin_s = _marlin_permute_scales(s_expanded, K, N, group_size)
+            marlin_scales.append(marlin_s)
+
+        marlin_qweight = paddle.stack(marlin_qweights, axis=0).contiguous()
+        marlin_scale = paddle.stack(marlin_scales, axis=0).contiguous()
+
+        # Set weight and scale
+        target_weight = getattr(moe_layer, weight_name)
+        target_scale = getattr(moe_layer, scale_name)
+
+        if marlin_qweight.shape != target_weight.shape:
+            # Need to recreate parameter with correct shape
+            logger.info(f"Marlin FP8: Resizing {weight_name} from {target_weight.shape} to {marlin_qweight.shape}")
+            new_param = moe_layer.create_parameter(
+                shape=marlin_qweight.shape, dtype="int32",
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
+            new_param.set_value(marlin_qweight)
+            setattr(moe_layer, weight_name, new_param)
+        else:
+            target_weight.set_value(marlin_qweight)
+
+        if marlin_scale.shape != target_scale.shape:
+            logger.info(f"Marlin FP8: Resizing {scale_name} from {target_scale.shape} to {marlin_scale.shape}")
+            new_scale = moe_layer.create_parameter(
+                shape=marlin_scale.shape, dtype=target_scale.dtype,
+                default_initializer=paddle.nn.initializer.Constant(0),
+            )
+            new_scale.set_value(marlin_scale.cast(target_scale.dtype))
+            setattr(moe_layer, scale_name, new_scale)
+        else:
+            target_scale.set_value(marlin_scale.cast(target_scale.dtype))
+
+    logger.info(f"Marlin FP8: Loaded up_gate={moe_layer.up_gate_proj_weight.shape}, "
+                f"down={moe_layer.down_proj_weight.shape}")
+
+
 def _numpy_int4_quant_and_pack(wt_np):
     """
     Quantize a float32 numpy array to int4 and pack as int8.
@@ -702,6 +833,9 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         If enable_wint4 is True and the weight is a MoE expert weight,
         immediately quantize to WINT4 after dequant to BF16.
 
+        If enable_marlin_fp8 is True, skip expert weight dequant (they stay FP8
+        and are passed to the Marlin backend).
+
         NOTE: process_weights_after_loading_fn is called ONCE per unique sublayer
         AFTER all weights are loaded, to avoid repeated transpose/re-quantize
         for stacked params (qkv_proj gets Q, K, V separately).
@@ -712,7 +846,13 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         # Track which sublayers need process_weights_after_loading (deduplicated)
         pending_process: set = set()
 
+        _enable_marlin_fp8 = os.environ.get("FD_MARLIN_FP8", "0") == "1"
+
         for wname, wt in fp8_weights.items():
+            # Skip expert weights if Marlin FP8 mode is active
+            if _enable_marlin_fp8 and "mlp.experts" in wname:
+                continue
+
             scale_name = wname.replace(".weight", ".weight_scale_inv")
             scale = fp8_scales.get(scale_name)
 
@@ -793,6 +933,109 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         for msn in pending_process:
             if msn in sublayers_dict:
                 process_weights_after_loading_fn(msn)
+
+    def _load_fp8_marlin_layer(self, layer_idx, fp8_weights, fp8_scales,
+                                params_dict, expert_params_mapping, block_size):
+        """Load FP8 expert weights directly to Marlin backend for a single layer."""
+        # Find the MoE layer for this decoder layer
+        moe_layer = None
+        for name, sublayer in self.named_sublayers():
+            if f"layers.{layer_idx}." in name and hasattr(sublayer, 'up_gate_proj_weight'):
+                moe_layer = sublayer
+                break
+
+        if moe_layer is None:
+            logger.warning(f"Marlin FP8: No MoE layer found for layer {layer_idx}")
+            return
+
+        num_experts = moe_layer.num_local_experts
+
+        # Group weights by expert
+        # Note: fp8_weights keys are already renamed (block_sparse_moe -> mlp)
+        expert_up_gate = {}
+        expert_down = {}
+        expert_up_gate_scales = {}
+        expert_down_scales = {}
+
+        for wname, wt in fp8_weights.items():
+            if "mlp.experts" not in wname:
+                continue
+            wt_tensor = get_tensor(wt)
+            parts = wname.split(".")
+            try:
+                exp_idx = parts.index("experts") + 1
+                expert_id = int(parts[exp_idx])
+            except (ValueError, IndexError):
+                continue
+
+            if "w1" in wname or "w3" in wname:
+                # w1 = gate_proj, w3 = up_proj -> combined as up_gate_proj
+                if expert_id not in expert_up_gate:
+                    expert_up_gate[expert_id] = {}
+                if "w1" in wname:
+                    expert_up_gate[expert_id]["gate"] = wt_tensor
+                else:
+                    expert_up_gate[expert_id]["up"] = wt_tensor
+
+                scale_name = wname.replace(".weight", ".weight_scale_inv")
+                if scale_name in fp8_scales:
+                    if expert_id not in expert_up_gate_scales:
+                        expert_up_gate_scales[expert_id] = {}
+                    if "w1" in wname:
+                        expert_up_gate_scales[expert_id]["gate"] = get_tensor(fp8_scales[scale_name])
+                    else:
+                        expert_up_gate_scales[expert_id]["up"] = get_tensor(fp8_scales[scale_name])
+            elif "w2" in wname:
+                expert_down[expert_id] = wt_tensor
+                scale_name = wname.replace(".weight", ".weight_scale_inv")
+                if scale_name in fp8_scales:
+                    expert_down_scales[expert_id] = get_tensor(fp8_scales[scale_name])
+
+        if not expert_up_gate or not expert_down:
+            logger.warning(f"Marlin FP8: No expert weights found for layer {layer_idx}, "
+                           f"up_gate={len(expert_up_gate)}, down={len(expert_down)}")
+            return
+
+        # Concatenate gate and up projections
+        # Each w1/w3 is [moe_intermediate_size, hidden_size] = [1536, 3072] (N, K format)
+        # Combined: [moe_intermediate_size*2, hidden_size] = [3072, 3072] (N, K format)
+        up_gate_list = []
+        for i in range(num_experts):
+            gate_w = expert_up_gate[i]["gate"]  # [1536, 3072]
+            up_w = expert_up_gate[i]["up"]      # [1536, 3072]
+            # Concatenate along output (N) dimension: [3072, 3072]
+            combined = paddle.concat([gate_w, up_w], axis=0)
+            up_gate_list.append(combined)
+        up_gate_tensor = paddle.stack(up_gate_list, axis=0)
+
+        down_list = [expert_down[i] for i in range(num_experts)]
+        down_tensor = paddle.stack(down_list, axis=0)
+
+        # Stack scales - concatenate gate and up scales
+        # Each scale is [n_blocks_n, n_blocks_k] = [12, 24] for w1/w3
+        # Combined: [n_blocks_n*2, n_blocks_k] = [24, 24] (concat along N dimension)
+        up_gate_scale_list = []
+        for i in range(num_experts):
+            gate_s = expert_up_gate_scales[i]["gate"]  # [12, 24]
+            up_s = expert_up_gate_scales[i]["up"]      # [12, 24]
+            combined_s = paddle.concat([gate_s, up_s], axis=0)  # [24, 24]
+            up_gate_scale_list.append(combined_s)
+        up_gate_scale_tensor = paddle.stack(up_gate_scale_list, axis=0)
+
+        down_scale_list = [expert_down_scales[i] for i in range(num_experts)]
+        down_scale_tensor = paddle.stack(down_scale_list, axis=0)
+
+        logger.info(f"Marlin FP8: Loading layer {layer_idx} experts, "
+                     f"up_gate={up_gate_tensor.shape} {up_gate_tensor.dtype}, "
+                     f"down={down_tensor.shape} {down_tensor.dtype}, "
+                     f"up_gate_scale={up_gate_scale_tensor.shape}, "
+                     f"down_scale={down_scale_tensor.shape}")
+
+        # Process through Marlin backend
+        _process_fp8_marlin_weights(
+            moe_layer, up_gate_tensor, up_gate_scale_tensor,
+            down_tensor, down_scale_tensor, block_size,
+        )
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
@@ -999,17 +1242,37 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             paddle.device.cuda.empty_cache()
 
         # Process each decoder layer's FP8 weights (layer-by-layer streaming)
+        _enable_marlin_fp8 = os.environ.get("FD_MARLIN_FP8", "0") == "1"
         layer_indices = sorted(k for k in fp8_by_layer.keys() if k >= 0)
         for li in layer_indices:
             n_wts = len(fp8_by_layer[li])
             mem_before = paddle.device.cuda.memory_allocated() / (1024**3)
             logger.info(f"FP8 dequant + {'WINT4' if _enable_wint4 else 'BF16'} layer {li}/{num_main_layers} "
                         f"({n_wts} tensors, GPU: {mem_before:.1f} GB) ...")
-            self._dequant_fp8_weights(
-                fp8_by_layer[li], scales_by_layer.get(li, {}),
-                params_dict, stacked_params_mapping, expert_params_mapping,
-                process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
-            )
+
+            if _enable_marlin_fp8:
+                # Marlin FP8 mode: load FP8 expert weights directly to Marlin backend
+                self._load_fp8_marlin_layer(
+                    li, fp8_by_layer[li], scales_by_layer.get(li, {}),
+                    params_dict, expert_params_mapping, BLOCK_SIZE,
+                )
+                # Still dequantize non-expert FP8 weights (attention, etc.)
+                non_expert_fp8 = {k: v for k, v in fp8_by_layer[li].items()
+                                  if "mlp.experts" not in k}
+                non_expert_scales = {k: v for k, v in scales_by_layer.get(li, {}).items()
+                                     if "mlp.experts" not in k}
+                if non_expert_fp8:
+                    self._dequant_fp8_weights(
+                        non_expert_fp8, non_expert_scales,
+                        params_dict, stacked_params_mapping, expert_params_mapping,
+                        process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
+                    )
+            else:
+                self._dequant_fp8_weights(
+                    fp8_by_layer[li], scales_by_layer.get(li, {}),
+                    params_dict, stacked_params_mapping, expert_params_mapping,
+                    process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
+                )
             # Immediately quantize MoE experts of this layer to WINT4 if enabled
             if _enable_wint4:
                 self._wint4_quantize_layer(li)
