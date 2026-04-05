@@ -78,9 +78,83 @@ Layer 0 norm: cos=1.0000  (per-token cos_sim: [0.999997, 0.999997, 0.999992, 0.9
 
 ---
 
-## 3. 失败的部分
+## 3. 关键发现：vLLM 对 MiniMax-M2.5 的支持
 
-### 3.1 FD LLM API 无法在 A100 上启动
+### 3.1 vLLM 已成功支持 MiniMax-M2.5
+
+**验证结果**：使用 `vllm17` 环境，按照 MiniMax 官方部署指南，vLLM 可以成功在 8 卡 A100 (SM80) 上运行 MiniMax-M2.5 FP8 模型。
+
+**成功运行的命令**：
+```bash
+# 8 卡 Expert Parallel 模式
+SAFETENSORS_FAST_GPU=1 vllm serve \
+    /data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5 --trust-remote-code \
+    --enable_expert_parallel --tensor-parallel-size 8 \
+    --enable-auto-tool-choice --tool-call-parser minimax_m2 \
+    --reasoning-parser minimax_m2_append_think
+```
+
+**测试输出示例**：
+```json
+{
+  "model": "/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5",
+  "choices": [{
+    "message": {
+      "content": "你好！我是 MiniMax-M2.5，一个由 MiniMax 公司开发的AI助手。我可以帮助你完成很多事情..."
+    }
+  }]
+}
+```
+
+### 3.2 Expert Parallel 模式的关键作用
+
+**为什么需要 `--enable_expert_parallel`？**
+
+MiniMax-M2.5 的 `intermediate_size=1536`，使用 FP8 block quantization（block_size=128）。
+
+- **不使用 Expert Parallel**：`intermediate_size_per_partition = 1536 / 8 = 192`，`192 % 128 != 0`，block quant 验证失败
+- **使用 Expert Parallel**：`tp_size=1`，`intermediate_size_per_partition = 1536 / 1 = 1536`，`1536 % 128 = 0`，验证通过
+
+**vLLM 的实现逻辑**（`vllm/vllm/model_executor/layers/fused_moe/config.py` 第 1033 行）：
+```python
+if use_ep:
+    return FusedMoEParallelConfig(
+        tp_size=1,  # 关键：Expert Parallel 模式下 tp_size=1
+        ep_size=tp_size,  # 原始的 tp_size 变成 ep_size
+        ...
+    )
+```
+
+### 3.3 SM80 (A100) 的 FP8 处理
+
+虽然 A100 没有原生 FP8 支持，但 vLLM 通过 **Marlin kernel** 实现了 FP8 weight-only 量化：
+
+- 权重以 FP8 格式存储（节省显存）
+- 计算时使用 Marlin kernel 进行 weight-only 反量化
+- 激活值使用 BF16
+
+**官方部署指南的关键信息**：
+- GPU compute capability >= 7.0 即可（A100 是 8.0）
+- 显存需求：权重 220 GB，每 1M 上下文 token 需要 240 GB
+- 8 × A100 80GB 可支持最多 3M token 的 KV Cache
+
+### 3.4 已知问题和解决方案
+
+**1. CUDA illegal memory access**
+```bash
+# 添加 --compilation-config 参数
+--compilation-config "{\"cudagraph_mode\": \"PIECEWISE\"}"
+```
+
+**2. 输出乱码**
+- 需要 vLLM 版本 >= commit cf3eacfe58fa9e745c2854782ada884a9f992cf7
+- `vllm17` 环境已满足此要求
+
+---
+
+## 4. 失败的部分（历史记录）
+
+### 4.1 FD LLM API 无法在 A100 上启动
 **命令**: `CUDA_VISIBLE_DEVICES=4 python fd_llm_demo.py`
 
 **失败原因**：
@@ -90,32 +164,73 @@ Layer 0 norm: cos=1.0000  (per-token cos_sim: [0.999997, 0.999997, 0.999992, 0.9
 
 **根本原因**：FD 的 LLM API 路径强制使用 `block_wise_fp8` quantization（根据 config.json 的 `quantization_config`），而这个 quantization 在 SM 80 上不完整。
 
-### 3.2 vLLM LLM API 在 A100 上输出全是 `\n`
-**命令**: `CUDA_VISIBLE_DEVICES=5 python run_vllm_gen.py`
+**最新进展**：FD-LLM 的 `block_wise_fp8.py` 已经添加了 SM80 的 BF16 fallback 逻辑（第 86-89 行、第 343-368 行），但尚未测试是否完全修复。
 
-**原因**：vLLM 在 SM 80 上使用 Marlin weight-only FP8 kernel，精度损失大，5层模型输出基本是噪声。
+### 4.2 vLLM LLM API 在 A100 上输出全是 `\n`（历史记录）
+**原因**：早期测试时 vLLM 版本过旧，Marlin kernel 精度有问题。
 
-### 3.3 全参模型无法在 4 张 A100 上运行
+**当前状态**：使用 `vllm17` 环境和正确的启动参数，vLLM 已能正常输出。
+
+### 4.3 全参模型无法在 4 张 A100 上运行
 - BF16 模型需要 ~460 GB 显存
 - 4 × A100 = 320 GB，不够
 - 需要 8 张卡 (TP=8) 或保持 FP8 量化
 
-### 3.4 TP=4 无法工作
+### 4.4 TP=4 无法工作（FD-LLM）
 FD 的 TP=4 路径有 attention kernel 兼容问题（`group_size=0` 不支持）。
 
 ---
 
-## 4. 运行命令汇总
+## 5. 运行命令汇总
 
-### 4.1 FD 手动方式（能工作）
+### 5.1 vLLM 官方部署（推荐，已验证成功）
+
+**8 卡 Expert Parallel 模式**：
 ```bash
-# 5层模型，TP=1，GPU 6
-CUDA_VISIBLE_DEVICES=6 python run_fd_gen.py
+# 激活环境
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate vllm17
 
-# 输出见上文"验证通过的输出"
+# 启动 vLLM server
+SAFETENSORS_FAST_GPU=1 vllm serve \
+    /data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5 --trust-remote-code \
+    --enable_expert_parallel --tensor-parallel-size 8 \
+    --enable-auto-tool-choice --tool-call-parser minimax_m2 \
+    --reasoning-parser minimax_m2_append_think
 ```
 
-### 4.2 FD 1层精度对齐测试
+**4 卡部署**：
+```bash
+SAFETENSORS_FAST_GPU=1 vllm serve \
+    /data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5 --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --enable-auto-tool-choice --tool-call-parser minimax_m2 \
+    --reasoning-parser minimax_m2_append_think
+```
+
+**测试 API**：
+```bash
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5",
+        "messages": [
+            {"role": "user", "content": "你好，请用中文介绍一下你自己。"}
+        ],
+        "max_tokens": 512,
+        "temperature": 0.7
+    }' | jq
+```
+
+### 5.2 FD 手动方式（能工作，5层测试）
+```bash
+# 激活环境
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate paddle
+
+# 5层模型，TP=1，GPU 6
+CUDA_VISIBLE_DEVICES=6 python run_fd_gen.py
+```
+
+### 5.3 FD 1层精度对齐测试
 ```bash
 # FD 端（GPU 6）
 CUDA_VISIBLE_DEVICES=6 python test_step_align.py --backend fd
@@ -127,27 +242,15 @@ CUDA_VISIBLE_DEVICES=5 python test_step_align.py --backend vllm
 python test_step_align.py --backend compare
 ```
 
-### 4.3 vLLM 手动方式（能工作但输出全\n）
+### 5.4 vLLM 手动方式（5层测试）
 ```bash
 # 5层模型，TP=1，GPU 5
 CUDA_VISIBLE_DEVICES=5 python run_vllm_gen.py
 ```
 
-### 4.4 FD LLM API（失败）
-```bash
-CUDA_VISIBLE_DEVICES=4 python fd_llm_demo.py
-# 失败原因：block_wise_fp8 在 SM 80 上不兼容
-```
-
-### 4.5 vLLM LLM API（能启动但输出全\n）
-```bash
-# 需要先修改 config.json 的 num_hidden_layers=5
-CUDA_VISIBLE_DEVICES=5 python vllm_llm_demo.py
-```
-
 ---
 
-## 5. 已踩的坑
+## 6. 已踩的坑
 
 | # | 坑 | 原因 | 修复方式 |
 |---|-----|------|---------|
@@ -165,49 +268,106 @@ CUDA_VISIBLE_DEVICES=5 python vllm_llm_demo.py
 | 12 | `fp8_quant_blockwise()` 参数不兼容 | paddle 版本不支持 `using_ue8m0_scale` | 删除该参数 |
 | 13 | DeepGEMM 在 SM 80 上不支持 | 需要 SM 90+ | 添加 BF16 dequant fallback |
 | 14 | `weight_scale_inv` 未加载 | q/k/v 合并后 scale 没有合并 | 在 `load_weights` 中加载 scale（部分修复） |
+| 15 | vLLM TP=8 block quant 验证失败 | `192 % 128 != 0` | 使用 `--enable_expert_parallel` 绕过 |
+| 16 | vLLM flash_attn ABI 不兼容 | PyTorch 版本不匹配 | 使用 `vllm17` 环境（无 flash_attn 依赖） |
 
 ---
 
-## 6. 下一步需要做的
+## 7. 技术细节：Expert Parallel 与 Block Quant 验证
 
-### 6.1 优先级高
-1. **修复 FD LLM API 在 SM 80 上的兼容性**：
-   - 在 `block_wise_fp8.py` 的 `apply` 方法中，SM 80 需要完整的 BF16 dequant fallback（包括 scale 的正确处理）
-   - 或者让 FD 在 SM 80 上跳过 `block_wise_fp8` quantization，直接用 BF16 GEMM
-   - 需要处理 q/k/v 合并后 `weight_scale_inv` 的合并逻辑
+### 7.1 问题背景
+
+MiniMax-M2.5 使用 FP8 block quantization（block_size=128x128）。vLLM 在创建 MoE 权重时会验证：
+```python
+# vllm/vllm/model_executor/layers/quantization/fp8.py 第 710 行
+if intermediate_size_per_partition % block_n != 0:
+    raise ValueError(...)
+```
+
+### 7.2 不同并行模式的影响
+
+| 模式 | tp_size | intermediate_size_per_partition | 1536 % 128 | 结果 |
+|------|---------|--------------------------------|-------------|------|
+| TP=1 | 1 | 1536 / 1 = 1536 | 0 | ✓ 通过 |
+| TP=4 | 4 | 1536 / 4 = 384 | 0 | ✓ 通过 |
+| TP=8 (无 EP) | 8 | 1536 / 8 = 192 | 64 | ✗ 失败 |
+| TP=8 + EP | 1 | 1536 / 1 = 1536 | 0 | ✓ 通过 |
+
+### 7.3 Expert Parallel 的实现
+
+**vLLM** (`vllm/vllm/model_executor/layers/fused_moe/config.py`):
+```python
+if use_ep:
+    ep_size = tp_size
+    return FusedMoEParallelConfig(
+        tp_size=1,  # MoE 层不使用 TP
+        ep_size=ep_size,  # 使用 EP
+        ...
+    )
+```
+
+**FD-LLM** (`FastDeploy/fastdeploy/model_executor/layers/moe/moe.py`):
+```python
+if self.ep_size > 1:
+    self.tp_size = 1  # MoE 层 tp_size=1
+    self.tp_rank = 0
+self.moe_intermediate_size = moe_intermediate_size // self.tp_size
+```
+
+### 7.4 SM80 的 FP8 处理策略
+
+虽然 A100 没有原生 FP8 tensor core，但可以通过 weight-only 量化节省显存：
+
+**vLLM (Marlin kernel)**:
+- 权重：FP8 格式存储（1 byte/param）
+- 激活：BF16 格式
+- 计算：Marlin kernel 进行 weight-only 反量化 + BF16 GEMM
+
+**FD-LLM (BF16 dequant fallback)**:
+- 权重：FP8 格式存储
+- 激活：BF16 格式
+- 计算：在 `block_wise_fp8.py` 的 `apply` 方法中，SM < 90 时直接反量化到 BF16 再计算
+
+---
+
+## 8. 下一步需要做的
+
+### 8.1 优先级高
+1. **验证 FD-LLM 在 Expert Parallel 模式下的运行**：
+   - 测试 `--enable-expert-parallel --tensor-parallel-size 8`
+   - 对比 FD-LLM 和 vLLM 的输出是否一致
+   - 检查 FD-LLM 的 SM80 BF16 fallback 是否完全工作
 
 2. **全参模型验证**：
-   - 需要 8 张 A100 (TP=8) 或在 H100 上验证
-   - 或者实现 FP8 原生计算 kernel（类似 vLLM 的 Marlin kernel），减少显存占用
+   - 使用 vLLM 已验证成功的配置
+   - 确保 62 层完整模型 + MTP 层都能正常工作
 
-3. **vLLM BF16 模式对齐**：
-   - 修改 vLLM 的 `fp8.py` 让它在 SM 80 上也走 BF16 dequant 路径（`self.use_marlin = False`）
-   - 这样 FD 和 vLLM 用相同的精度路径，token 就能对齐
+3. **性能对比**：
+   - 对比 vLLM 和 FD-LLM 的吞吐量和延迟
+   - 优化 FD-LLM 的 Expert Parallel 实现
 
-### 6.2 优先级中
+### 8.2 优先级中
 4. **FD LLM API 的 tokenizer fork 问题**：
    - `huggingface/tokenizers` 在 fork 后报错
    - 需要设置 `TOKENIZERS_PARALLELISM=false` 或在 fork 前不使用 tokenizer
 
-5. **MTP (Multi-Token Prediction) 支持**：
-   - 当前跳过了 MTP 层（62+），完整模型需要支持
-
-6. **CUDA Graph 支持**：
+5. **CUDA Graph 支持**：
    - 模型有 `@support_graph_optimization` 装饰器但未测试
+   - 可以提升推理性能
 
-### 6.3 优先级低
+### 8.3 优先级低
+6. **TP > 1 支持（非 Expert Parallel 模式）**：
+   - 当前 TP=4 有 attention kernel 兼容问题
+   - 需要修复 block quant 验证逻辑或添加 TP=8 的特殊处理
+
 7. **FP8 原生计算 kernel**：
    - 类似 vLLM 的 Marlin kernel，需要 CUDA 代码
-   - 可以大幅减少显存占用（FP8 1 byte/param vs BF16 2 bytes/param）
+   - 可以进一步减少显存占用并提升性能
    - 但实现复杂度高（~3000 行 CUDA 代码）
-
-8. **TP > 1 支持**：
-   - 当前 TP=4 有 attention kernel 兼容问题
-   - 需要验证 TP=2, TP=4, TP=8 的正确性
 
 ---
 
-## 7. 关键文件列表
+## 9. 关键文件列表
 
 | 文件 | 操作 | 说明 |
 |------|------|------|
@@ -225,13 +385,15 @@ CUDA_VISIBLE_DEVICES=5 python vllm_llm_demo.py
 | `compare_fd_vllm.py` | **新建** | FD vs vLLM token 对比 |
 | `fd_llm_demo.py` | **新建** | FD LLM API demo（A100 上失败） |
 | `vllm_llm_demo.py` | **新建** | vLLM LLM API demo |
+| `my-tools/test_fd_ep.py` | **新建** | FD-LLM Expert Parallel 测试脚本 |
 
 ---
 
-## 8. 环境信息
+## 10. 环境信息
 
 - **GPU**: 8 × A100 80GB (SM 8.0)
 - **FD 环境**: conda activate `paddle` (Python 3.10, PaddlePaddle 3.3.0)
 - **vLLM 环境**: conda activate `vllm17` (Python 3.10, PyTorch, vLLM v0.17 dev)
 - **模型路径**: `/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5`
 - **Checkpoint**: 125 个 safetensors 文件，总计 230 GB (FP8)
+- **官方文档**: `/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5/docs/vllm_deploy_guide.md`
