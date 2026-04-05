@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-05**
+> **更新日期：2026-04-05（第二次更新）**
 
 ## 1. 项目目标
 
@@ -262,6 +262,8 @@ class WINT4Config(WeightOnlyConfig):
 | 15 | WINT4Config 缺少 `is_quantized` | `CutlassWeightOnlyMoEMethod` 检查此字段 | 添加 `self.is_quantized = True` |
 | 16 | TP=8 append_attention shape 错误 | KV head=1 时 kernel shape 计算 bug | **待修复** |
 | 17 | FD LLM API SM80 输出重复 | 推理流水线 SM80 兼容性问题 | **待修复** |
+| 18 | `_dequant_fp8_weights` 每次加载后调用 `process_weights_after_loading` | stacked params (qkv_proj) 被多次 transpose + re-quantize | 修复为加载完所有权重后每个 sublayer 只调用一次 |
+| 19 | SM80 输出乱码 | 硬件不支持 FP8 原生计算，BF16 dequant 精度累积导致 MoE routing 偏差 | 在 SM90+ 上验证或接受 SM80 精度损失 |
 
 ---
 
@@ -269,7 +271,23 @@ class WINT4Config(WeightOnlyConfig):
 
 ### 8.1 优先级最高
 
-1. **TP=8 WINT4 MoE int4 量化**：
+1. **SM80 输出乱码问题（根因分析完成）**：
+   - 62 层全量模型在 SM80 上输出乱码（多语言混合、无语义）
+   - **根因**：SM80 硬件不支持 FP8 原生计算。FD 做 FP8→BF16 反量化后用 BF16 计算，每层 cos_sim > 0.9999，但 MoE routing（top-8 from 256 experts, sigmoid scoring + e_score_correction_bias）对微小差异非常敏感，62 层累积后路由可能选了完全不同的 experts
+   - **排除的问题**（2026-04-05 深度诊断）：
+     - FP8 dequant 精度：`compare_dequant.py` 验证 cos_sim=1.0, max_diff=0.0，完全正确
+     - Scale 匹配：checkpoint 中 scale 命名和 weight 命名一一对应，无缺失
+     - Scale 转置：scale 形状 `[ceil(out/128), ceil(in/128)]` 正确，转置后 cos_sim 降到 0.42-0.98
+     - QK-Norm：weight 值和 vLLM 完全一致（q_norm mean=0.995, k_norm mean=1.090）
+     - 权重加载：FD dequant 后 weight norm=95.48，与 checkpoint 直接 dequant 一致
+     - FD vs vLLM Q 输出：cos_sim=0.9827（差异来自 BF16 精度 roundtrip）
+   - **结论**：这是 SM80 硬件限制，不是代码 bug。需要在 SM90+（H100）上验证是否也乱码
+   - **可能的解决方案**：
+     a. 在 SM90+ 上运行（FP8 原生计算，无精度损失）
+     b. 实现 FP8 原生计算 kernel（类似 vLLM Marlin），但 SM80 不支持 FP8 tensor core
+     c. 接受 SM80 上的精度损失，输出可能不够好
+
+2. **TP=8 WINT4 MoE int4 量化**：
    - `paddle.nn.quant.weight_quantize` 在 SM80 上对 TP-sharded weight（`[384, 3072]`）的 packed layout（`[1536, 384]`）与 `moe_expert_ffn` int4 kernel 不兼容
    - 解决方案选项：
      a. 使用 `_numpy_int4_quant_and_pack` 替代 `_wq`（保持 `[out, in//8*4]` layout）

@@ -699,9 +699,16 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
         If enable_wint4 is True and the weight is a MoE expert weight,
         immediately quantize to WINT4 after dequant to BF16.
+
+        NOTE: process_weights_after_loading_fn is called ONCE per unique sublayer
+        AFTER all weights are loaded, to avoid repeated transpose/re-quantize
+        for stacked params (qkv_proj gets Q, K, V separately).
         """
         from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import CutlassWeightOnlyMoEMethod
         from fastdeploy.model_executor.layers.quantization.weight_only import WINT4Config
+
+        # Track which sublayers need process_weights_after_loading (deduplicated)
+        pending_process: set = set()
 
         for wname, wt in fp8_weights.items():
             scale_name = wname.replace(".weight", ".weight_scale_inv")
@@ -746,7 +753,7 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 weight_loader(param, wt_dq, shard_id=shard_id, expert_id=expert_id)
                 msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
                              "", model_param_name)
-                process_weights_after_loading_fn(msn, param)
+                pending_process.add(msn)
                 matched = True
                 break
 
@@ -763,7 +770,7 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                     weight_loader(param, wt_dq, shard_id)
                     msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
                                  "", model_param_name)
-                    process_weights_after_loading_fn(msn, param)
+                    pending_process.add(msn)
                     matched = True
                     break
 
@@ -775,9 +782,15 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                     weight_loader(param, wt_dq)
                     msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
                                  "", wname)
-                    process_weights_after_loading_fn(msn, param)
+                    pending_process.add(msn)
 
             del wt_dq
+
+        # Call process_weights_after_loading ONCE per unique sublayer
+        sublayers_dict = dict(self.named_sublayers())
+        for msn in pending_process:
+            if msn in sublayers_dict:
+                process_weights_after_loading_fn(msn)
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
