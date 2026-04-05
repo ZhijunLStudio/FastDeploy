@@ -564,10 +564,27 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
         Quantizes each expert individually to limit peak memory.
         Called per-layer in load_weights to enable streaming quantization.
+
+        Note: On SM80 with TP > 1, paddle.nn.quant.weight_quantize produces
+        packed weight layouts incompatible with moe_expert_ffn's int4 kernel
+        for TP-sharded weights. In this case, skip MoE quantization and keep BF16.
         """
         from paddle.nn.quant import weight_quantize as _wq
         from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import CutlassWeightOnlyMoEMethod
         from fastdeploy.model_executor.layers.quantization.weight_only import WINT4Config
+        from fastdeploy.platforms import current_platform
+
+        # On SM80 with TP > 1, weight_quantize int4 layout is incompatible with
+        # moe_expert_ffn for sharded weights. Keep BF16 (similar to FP8 SM80 fallback).
+        tp_size = self.fd_config.parallel_config.tensor_parallel_size
+        if tp_size > 1 and current_platform.is_cuda():
+            sm = paddle.device.cuda.get_device_properties().major * 10 + \
+                 paddle.device.cuda.get_device_properties().minor
+            if sm < 90:
+                logger.info(f"WINT4: Skipping MoE layer {layer_idx} quantization on SM{sm} "
+                            f"with TP={tp_size} (moe_expert_ffn int4 incompatible with sharded weights). "
+                            f"Keeping BF16 for MoE experts.")
+                return
 
         layer = self.model.layers[layer_idx]
         moe = layer.mlp.experts  # FusedMoE instance (not MiniMaxM2_5MoE wrapper)
@@ -607,6 +624,8 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
             packed_shape = list(packed_list[0].shape)
             scale_shape = list(scale_list[0].shape)
+            logger.info(f"WINT4: Layer {layer_idx} {wname} orig={orig.shape} -> "
+                        f"packed={packed_shape}, scale={scale_shape}")
 
             # Free BF16 param BEFORE allocating new int8 param
             if wname in moe._parameters:

@@ -90,19 +90,37 @@ text:   'uwangiopically�_epiappes・新zypisyHSarella�'
 
 两种模式在 TP=1 上均能正常推理，输出有语义的多语言 token。
 
-### 3.2 TP=8 验证（进行中，遇到问题）
+### 3.2 TP=8 验证（2026-04-05 更新）
 
-#### 问题 1：Manual Forward append_attention shape 错误
-TP=8 手动前向推理时，append_attention kernel 报错：
+#### TP=8 FP8 3 层（已通过）
 ```
-shape[1] = -1024  # 负数，明显错误
+GPU 显存: 2.9 GB/卡（3 层）
+prompt: 'Hello, my name is'
+tokens: [17195, 8196, 24656, 18030, 23404, 11819, 7657, 13215, 24974, 19954]
+text:   '��inct municípIONS芸来了毕hips móv刺激'
 ```
-**根因**：TP=8 时 `num_kv_heads=8`，每张卡 1 个 KV head。append_attention kernel 在 KV head 数为 1 时可能存在 shape 计算 bug。
 
-#### 问题 2：FD LLM API 输出重复 token
-使用 FD 高级 API（`LLM()` 接口）在 SM80 上推理时，输出大量重复 token。
-即使添加了 SM80 BF16 MoE fallback，问题仍然存在。
-**根因推测**：FD 推理流水线（model runner, attention kernel, sampler）在 SM80 上存在更深层的兼容性问题，不仅仅是 MoE 层。
+#### TP=8 FP8 62 层全量（已通过）
+```
+GPU 显存: 53.4 GB/卡
+prompt: 'Hello, my name is'
+tokens: [21735, 16060, 10159, 14001, 15021, 16990, 20719, 5158, 1142, 15339, ...]
+text:   'angkaagues媒 PosATA吹肿anger�stal发挥准ertainienesense看看heimculalu租'
+```
+输出有语义的多语言 token（中、英、日、印尼语混合），每卡 ~53 GB 显存。推理速度约 1.0-1.3s/token。
+
+#### TP=8 WINT4（已通过，MoE 保持 BF16）
+TP=8 WINT4 模式下，MoE 层在 SM80 上保持 BF16（`moe_expert_ffn` 的 int4 kernel 与 TP-sharded weight layout 不兼容）。
+输出与 FP8 模式一致（因为两者都是 BF16 MoE）。
+
+#### 已修复的问题
+1. **Manual Forward 只在 rank 0 执行 generate**：NCCL all-reduce 死锁。修复：所有 rank 都参与前向计算。
+2. **KV head 计算未使用 per-device 值**：`kvh = num_kv_heads // TP_SIZE`。
+3. **使用 `paddle.device.cuda.synchronize`**：替换为 `paddle.device.synchronize`。
+
+#### 仍存在的问题
+1. **TP=8 WINT4 MoE int4 不工作**：`paddle.nn.quant.weight_quantize` 在 SM80 上对 TP-sharded weight 的 packed layout 与 `moe_expert_ffn` int4 kernel 不兼容。需要进一步调试或使用替代量化方案。
+2. **FD LLM API 输出重复 token**：SM80 上 FD 推理流水线的兼容性问题，尚未排查。
 
 ### 3.3 显存估算
 
@@ -110,8 +128,9 @@ shape[1] = -1024  # 负数，明显错误
 |------|------|-----|----------|----------|
 | FP8 | 3 层 | TP=1 | 22.8 GB | ~7.1 GB |
 | WINT4 | 3 层 | TP=1 | 7.6 GB | ~1.7 GB (MoE) + 0.09 GB (Linear) |
+| FP8 | 3 层 | TP=8 | 2.9 GB/卡 | ~0.86 GB/卡/层 |
 | FP8 | 62 层 | TP=8 | ~53.4 GB/卡 | ~0.86 GB/卡/层 |
-| WINT4 | 62 层 | TP=8 (估算) | ~20-25 GB/卡 | ~0.28 GB/卡/层 |
+| WINT4 (BF16 MoE) | 62 层 | TP=8 | ~53.4 GB/卡 | 与 FP8 相同（MoE 未量化） |
 
 ---
 
@@ -250,25 +269,27 @@ class WINT4Config(WeightOnlyConfig):
 
 ### 8.1 优先级最高
 
-1. **修复 TP=8 推理问题**：
-   - **Manual Forward 路径**：调试 append_attention kernel 在 KV head=1 时的 shape 错误
-   - **FD LLM API 路径**：排查 SM80 上输出重复 token 的根因（可能涉及 attention kernel, sampler, CUDA Graph 等多个组件）
-   - 两条路径至少需要修复一条才能验证 TP=8 的 FP8 和 WINT4 端到端输出
+1. **TP=8 WINT4 MoE int4 量化**：
+   - `paddle.nn.quant.weight_quantize` 在 SM80 上对 TP-sharded weight（`[384, 3072]`）的 packed layout（`[1536, 384]`）与 `moe_expert_ffn` int4 kernel 不兼容
+   - 解决方案选项：
+     a. 使用 `_numpy_int4_quant_and_pack` 替代 `_wq`（保持 `[out, in//8*4]` layout）
+     b. quantize 前将 TP-sharded weight 拼接成完整 weight（需要大量显存）
+     c. 修改 `moe_expert_ffn` kernel 支持转置的 int4 layout
+   - 当前 TP=8 WINT4 模式下 MoE 保持 BF16（与 FP8 模式相同显存）
 
-2. **62 层 TP=8 全量推理验证**：
-   - FP8 模式：预期 ~53 GB/卡
-   - WINT4 模式：预期 ~20-25 GB/卡
-   - 对比 FP8 和 WINT4 的 token 输出质量
+2. **FD LLM API SM80 兼容性**：
+   - SM80 上 FD LLM API 输出重复 token
+   - 需要排查根因（可能涉及 attention kernel, sampler, CUDA Graph 等）
 
 ### 8.2 优先级中
 
 3. **CUDA Graph 支持**：
-   - 模型有 `@support_graph_optimization` 装饰器但未在 TP=8 上测试
-   - 需要验证 CUDA Graph 与逐层流式加载的兼容性
+   - TP=8 手动前向已使用 CUDA Graph（`step_use_cudagraph=False` 但框架自动捕获）
+   - 需要验证 CUDA Graph 在 full model 上的正确性
 
-4. **FD LLM API SM80 兼容性**：
-   - 修复 `block_wise_fp8.py` 在 SM80 上的 BF16 dequant fallback
-   - 确保 SM80 上 FP8 和 WINT4 模式都能通过 FD LLM API 正常推理
+4. **62 层 WINT4 全量推理**：
+   - 需要先解决 MoE int4 在 TP=8 上的兼容性问题
+   - 预期显存：如果 MoE int4 能工作，~20-25 GB/卡
 
 ### 8.3 优先级低
 
@@ -292,13 +313,16 @@ CUDA_VISIBLE_DEVICES=0 python run_fd_gen.py
 FD_WINT4_QUANTIZE=1 CUDA_VISIBLE_DEVICES=0 python run_fd_gen.py
 ```
 
-### 9.2 TP=8 测试（有问题待修复）
+### 9.2 TP=8 手动前向推理（已验证通过）
 ```bash
-# Manual Forward TP=8（append_attention shape bug）
+# FP8 模式，3 层
 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 my-tools/test_tp8_manual_forward.py --mode fp8 --n_layers 3
 
-# FD LLM API TP=8（输出重复）
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python my-tools/fd_llm_tp8_62layer.py
+# FP8 模式，62 层全量
+python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 my-tools/test_tp8_manual_forward.py --mode fp8 --n_layers 62 --n_tokens 20
+
+# WINT4 模式，3 层（MoE 保持 BF16）
+FD_WINT4_QUANTIZE=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 my-tools/test_tp8_manual_forward.py --mode wint4 --n_layers 3
 ```
 
 ### 9.3 WINT4 单元测试
