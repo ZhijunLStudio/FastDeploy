@@ -562,29 +562,12 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
     def _wint4_quantize_layer(self, layer_idx: int):
         """Quantize MoE experts of a single decoder layer to WINT4.
 
-        Quantizes each expert individually to limit peak memory.
-        Called per-layer in load_weights to enable streaming quantization.
-
-        Note: On SM80 with TP > 1, paddle.nn.quant.weight_quantize produces
-        packed weight layouts incompatible with moe_expert_ffn's int4 kernel
-        for TP-sharded weights. In this case, skip MoE quantization and keep BF16.
+        Uses _numpy_int4_quant_and_pack instead of paddle.nn.quant.weight_quantize
+        because weight_quantize on SM80 produces per-input-channel scales, while
+        moe_expert_ffn kernel expects per-output-channel scales.
         """
-        from paddle.nn.quant import weight_quantize as _wq
         from fastdeploy.model_executor.layers.moe.fused_moe_cutlass_backend import CutlassWeightOnlyMoEMethod
         from fastdeploy.model_executor.layers.quantization.weight_only import WINT4Config
-        from fastdeploy.platforms import current_platform
-
-        # On SM80 with TP > 1, weight_quantize int4 layout is incompatible with
-        # moe_expert_ffn for sharded weights. Keep BF16 (similar to FP8 SM80 fallback).
-        tp_size = self.fd_config.parallel_config.tensor_parallel_size
-        if tp_size > 1 and current_platform.is_cuda():
-            sm = paddle.device.cuda.get_device_properties().major * 10 + \
-                 paddle.device.cuda.get_device_properties().minor
-            if sm < 90:
-                logger.info(f"WINT4: Skipping MoE layer {layer_idx} quantization on SM{sm} "
-                            f"with TP={tp_size} (moe_expert_ffn int4 incompatible with sharded weights). "
-                            f"Keeping BF16 for MoE experts.")
-                return
 
         layer = self.model.layers[layer_idx]
         moe = layer.mlp.experts  # FusedMoE instance (not MiniMaxM2_5MoE wrapper)
@@ -613,14 +596,27 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
             E = orig.shape[0]
 
-            # Quantize all experts to CPU int8 (one at a time)
+            # Use weight_quantize for correct packed layout, but fix scale dimension.
+            # On SM80, weight_quantize produces per-input-channel scales,
+            # but moe_expert_ffn expects per-output-channel scales.
+            # orig shape: [E, N, K] where N=output_dim, K=input_dim (hidden).
+            # We use weight_quantize for the packed weight, then recompute scale per output channel.
+            from paddle.nn.quant import weight_quantize as _wq
+
             packed_list = []
             scale_list = []
             for e in range(E):
-                wi, ws = _wq(orig[e].cuda(), algo="weight_only_int4")
+                wt_bf16 = orig[e].cuda()  # [N, K] BF16
+                wi, ws = _wq(wt_bf16, algo="weight_only_int4")
+                # wi: [K//2, N] int8 packed, ws: [K] BF16 (per-input-channel on SM80)
+                # We need scale per output channel [N], recompute from BF16 weight
+                wt_f32 = wt_bf16.cast("float32")
+                # Per-output-channel max: max along K axis (axis=1) -> [N]
+                ch_max = wt_f32.abs().max(axis=1)  # [N]
+                scale_correct = (ch_max / 7.0).cast("bfloat16")  # int4 max=7
                 packed_list.append(wi.cpu())
-                scale_list.append(ws.cpu())
-                del wi, ws
+                scale_list.append(scale_correct.cpu())
+                del wi, ws, wt_bf16, wt_f32, ch_max, scale_correct
 
             packed_shape = list(packed_list[0].shape)
             scale_shape = list(scale_list[0].shape)
@@ -664,7 +660,11 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         wint4_cfg = WINT4Config(is_checkpoint_bf16=True)
         moe.quant_method = CutlassWeightOnlyMoEMethod(wint4_cfg)
         mem = paddle.device.cuda.memory_allocated() / (1024**3)
-        logger.info(f"WINT4: Layer {layer_idx} MoE quantized to int4, GPU: {mem:.1f} GB")
+        logger.info(f"WINT4: Layer {layer_idx} MoE quantized to int4, GPU: {mem:.1f} GB, "
+                     f"up_gate={moe.up_gate_proj_weight.shape} {moe.up_gate_proj_weight.dtype}, "
+                     f"down={moe.down_proj_weight.shape} {moe.down_proj_weight.dtype}, "
+                     f"up_gate_scale={moe.up_gate_proj_weight_scale.shape} {moe.up_gate_proj_weight_scale.dtype}, "
+                     f"down_scale={moe.down_proj_weight_scale.shape} {moe.down_proj_weight_scale.dtype}")
 
     def _wint4_quantize_moe_experts(self):
         """Quantize MoE expert weights from BF16 to WINT4.
