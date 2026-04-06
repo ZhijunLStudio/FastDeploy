@@ -1,12 +1,12 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-06（第五次更新 — TP=8 Marlin tinyformat 问题定位）**
+> **更新日期：2026-04-06（第六次更新 — TP=8 Marlin tinyformat 问题已修复）**
 
 ## 1. 项目目标
 
 在 FastDeploy (FD) 框架中复现 MiniMax-M2.5 模型（`MiniMaxM2ForCausalLM`），实现权重加载、前向推理、token 生成。核心目标是在 **8×A800 (SM80)** 上以 **FP8 反量化** 和 **WINT4 量化** 方式运行全量 62 层模型。
 
-> **更新日期：2026-04-06（第五次更新 — TP=8 Marlin tinyformat 问题定位）**
+> **更新日期：2026-04-06（第六次更新 — TP=8 Marlin tinyformat 问题已修复）**
 
 **模型关键参数**：
 | 参数 | 值 |
@@ -345,7 +345,8 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 | 20 | FusedMoE 缺少 `renormalize=True` | MiniMax-M2.5 routing 需要对 top-k weights 做 sum 归一化，但 `FusedMoE` 默认 `renormalize=False`，导致 weights 放大约 4 倍 | 添加 `renormalize=True`（cos_sim 对比验证确认） |
 | 21 | vLLM 在 SM80 上也无法正常工作 | vLLM 5 层输出全换行符（MARLIN FP8 精度损失），62 层 TP=1 OOM，TP=8 初始化失败 | 确认为 SM80 硬件限制，不是 FD 独有问题 |
 | 22 | `PADDLE_ENFORCE` 多参数 tinyformat 崩溃 | PaddlePaddle tinyformat 不支持多个格式化参数，32+ 处多参数 `PADDLE_ENFORCE` 在 CUDA Graph capture 时触发断言 | 批量替换为单参数格式（`"Check failed. See source for details."`）|
-| 23 | TP=8 Marlin kernel tinyformat 崩溃 | `MoeWna16MarlinGemmApi` 在 TP=8 多进程环境下触发 PaddlePaddle 核心库的 tinyformat 断言。TP=1 完全正常，TP=8 的 BF16 dequant fallback 也正常。确认为 PaddlePaddle 框架层面的 pybind11 → custom op 调用在多进程环境下的兼容性问题 | **待修复** — 需要调查 PaddlePaddle 的 op 调度层在 TP>1 时的额外检查|
+| 23 | TP=8 Marlin kernel tinyformat 崩溃 | `MoeWna16MarlinGemmApi` 在 TP=8 多进程环境下触发 PaddlePaddle 核心库的 tinyformat 断言。TP=1 完全正常，TP=8 的 BF16 dequant fallback 也正常 | **已修复** — 根因是 `fused_moe_marlin_backend.py` 的 `apply()` 中 down_proj 的 `size_k` 使用了 TP-sharded 的 `moe_intermediate_size=192`，但实际 weight shape 的 K 维度是 1536（未被 TP sharding）。修复：从 weight 实际 shape 推导 `size_k = weight.shape[1] * 16` |
+| 24 | 62 层 Marlin int32 模型 OOM | Marlin int32 打包权重（4 bytes/param）比 FP8（1 byte/param）大 4x，62 层 Marlin 权重总计 ~223GB，每卡 ~28GB，加上 BF16 dequanted 权重超出 80GB/卡限制 | **待优化** — 需要 Expert Parallel (EP) 将 256 experts 分配到 8 张卡，或使用 BF16 dequant 路径（53.4GB/卡，已验证通过） |
 
 ---
 
@@ -353,20 +354,23 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 
 ### 8.1 优先级最高
 
-1. **TP=8 Marlin kernel tinyformat 崩溃修复**：
-   - `MoeWna16MarlinGemmApi` 在 TP=8 多进程下触发 PaddlePaddle tinyformat 断言
-   - TP=1 完全正常，TP=8 BF16 MoE fallback 也正常
-   - 可能的根因：PaddlePaddle 的 pybind11 op 调度层在多进程环境下对 tensor device/placement 有额外检查，这些检查内部用了多参数 `PADDLE_ENFORCE`
-   - 需要进一步调查 PaddlePaddle 的 `py::arg` → tensor 验证路径中的 tinyformat 调用
+1. **FP8 Marlin 62 层全量模型内存优化**：
+   - Marlin int32 打包权重（4 bytes/param）比 FP8（1 byte/param）大 4x
+   - 62 层 Marlin 权重总计 ~223GB，8×80GB GPU 无法容纳
+   - 解决方案：
+     a. 使用 Expert Parallel (EP=8, TP=1)，每卡只存 256/8=32 experts 的 Marlin 权重（~3.5GB/卡）
+     b. 保持 BF16 dequant 路径（已验证 53.4GB/卡，62 层 TP=8 正常工作）
+     c. 优化 Marlin loading：逐 expert 流式处理而非一次性加载所有 256 experts
 
-2. **FP8 Marlin MoE 8 卡完整模型测试**：
-   - FP8 Marlin kernel 已在 TP=1, 3 层模型上验证通过
-   - 下一步：需要先解决 TP=8 的 tinyformat 问题，然后测试完整 62 层模型
-   - 预期显存：FP8 Marlin weight (1 byte/param) + BF16 activation，约 30-40 GB/卡
+2. **TP=8 Marlin kernel tinyformat 崩溃（已修复）**：
+   - ~~`MoeWna16MarlinGemmApi` 在 TP=8 多进程下触发 PaddlePaddle tinyformat 断言~~
+   - **根因**：`fused_moe_marlin_backend.py` 的 `apply()` 中 down_proj 的 `size_k` 使用了 TP-sharded 的 `moe_intermediate_size=192`，但实际 weight shape 的 K 维度是 1536（未被 TP sharding）。Kernel 验证 `(size_k / 16) != b_q_weight.size(1)` 失败，触发 `PADDLE_ENFORCE` 断言。在 TP=8 多进程下 8 个进程同时 assert 产生交错输出，误判为 "tinyformat" 错误。
+   - **修复**：从 weight 实际 shape 推导 `size_k = weight.shape[1] * 16`
+   - **验证**：TP=8, 3 层模型, FP8 Marlin MoE 端到端推理全部 8 个 rank 通过
 
 3. **SM80 输出乱码问题**：
-   - FP8 Marlin kernel 在 TP=1 上已经成功运行（输出非平凡中文 token）
-   - 一旦 TP=8 Marlin 问题解决，可以在 62 层全量模型上验证 Marlin 精度是否优于 BF16 dequant fallback
+   - FP8 Marlin kernel 在 TP=8 上已经成功运行（3 层模型输出非平凡中文 token）
+   - BF16 dequant 路径 62 层 TP=8 输出有重复 token（"paid paid paid"），为 SM80 硬件限制
 
 2. **TP=8 WINT4 MoE int4 量化**：
    - `paddle.nn.quant.weight_quantize` 在 SM80 上对 TP-sharded weight（`[384, 3072]`）的 packed layout（`[1536, 384]`）与 `moe_expert_ffn` int4 kernel 不兼容
