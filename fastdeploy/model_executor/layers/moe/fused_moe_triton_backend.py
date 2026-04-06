@@ -1812,6 +1812,10 @@ class BlockWiseFP8MoEMethod(QuantMethodBase):
                     if w.dtype == paddle.bfloat16:
                         continue
                     s = getattr(layer, sname, None)
+                    # Also try the "_inv" variant (created by process_weights_after_loading
+                    # when is_checkpoint_bf16=True re-quantizes BF16 expert weights to FP8)
+                    if s is None:
+                        s = getattr(layer, sname + "_inv", None)
                     if s is None:
                         w_bf16 = w.cast("bfloat16")
                     else:

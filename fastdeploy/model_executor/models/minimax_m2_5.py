@@ -848,10 +848,17 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
         _enable_marlin_fp8 = os.environ.get("FD_MARLIN_FP8", "0") == "1"
 
-        for wname, wt in fp8_weights.items():
+        for _wi, (wname, wt) in enumerate(fp8_weights.items()):
             # Skip expert weights if Marlin FP8 mode is active
             if _enable_marlin_fp8 and "mlp.experts" in wname:
                 continue
+
+            # Periodically flush the GPU memory pool to prevent OOM from accumulated
+            # pool-held tensors. MUST synchronize first to ensure all async GPU copies
+            # (from weight_loader) complete before pool memory is freed.
+            if _wi > 0 and _wi % 32 == 0:
+                paddle.device.synchronize()
+                paddle.device.cuda.empty_cache()
 
             scale_name = wname.replace(".weight", ".weight_scale_inv")
             scale = fp8_scales.get(scale_name)
@@ -950,7 +957,11 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
         num_experts = moe_layer.num_local_experts
 
-        # Group weights by expert
+        # EP filter: with EP=8, each GPU only loads its 32 local experts
+        expert_id_offset = moe_layer.expert_id_offset  # e.g., rank * 32
+        ep_expert_end = expert_id_offset + num_experts   # e.g., rank * 32 + 32
+
+        # Group weights by expert (only local experts when EP is enabled)
         # Note: fp8_weights keys are already renamed (block_sparse_moe -> mlp)
         expert_up_gate = {}
         expert_down = {}
@@ -968,28 +979,33 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             except (ValueError, IndexError):
                 continue
 
+            # Skip non-local experts (EP filter)
+            if not (expert_id_offset <= expert_id < ep_expert_end):
+                continue
+            local_expert_id = expert_id - expert_id_offset  # 0-based local ID
+
             if "w1" in wname or "w3" in wname:
                 # w1 = gate_proj, w3 = up_proj -> combined as up_gate_proj
-                if expert_id not in expert_up_gate:
-                    expert_up_gate[expert_id] = {}
+                if local_expert_id not in expert_up_gate:
+                    expert_up_gate[local_expert_id] = {}
                 if "w1" in wname:
-                    expert_up_gate[expert_id]["gate"] = wt_tensor
+                    expert_up_gate[local_expert_id]["gate"] = wt_tensor
                 else:
-                    expert_up_gate[expert_id]["up"] = wt_tensor
+                    expert_up_gate[local_expert_id]["up"] = wt_tensor
 
                 scale_name = wname.replace(".weight", ".weight_scale_inv")
                 if scale_name in fp8_scales:
-                    if expert_id not in expert_up_gate_scales:
-                        expert_up_gate_scales[expert_id] = {}
+                    if local_expert_id not in expert_up_gate_scales:
+                        expert_up_gate_scales[local_expert_id] = {}
                     if "w1" in wname:
-                        expert_up_gate_scales[expert_id]["gate"] = get_tensor(fp8_scales[scale_name])
+                        expert_up_gate_scales[local_expert_id]["gate"] = get_tensor(fp8_scales[scale_name])
                     else:
-                        expert_up_gate_scales[expert_id]["up"] = get_tensor(fp8_scales[scale_name])
+                        expert_up_gate_scales[local_expert_id]["up"] = get_tensor(fp8_scales[scale_name])
             elif "w2" in wname:
-                expert_down[expert_id] = wt_tensor
+                expert_down[local_expert_id] = wt_tensor
                 scale_name = wname.replace(".weight", ".weight_scale_inv")
                 if scale_name in fp8_scales:
-                    expert_down_scales[expert_id] = get_tensor(fp8_scales[scale_name])
+                    expert_down_scales[local_expert_id] = get_tensor(fp8_scales[scale_name])
 
         if not expert_up_gate or not expert_down:
             logger.warning(f"Marlin FP8: No expert weights found for layer {layer_idx}, "
@@ -1030,6 +1046,12 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                      f"down={down_tensor.shape} {down_tensor.dtype}, "
                      f"up_gate_scale={up_gate_scale_tensor.shape}, "
                      f"down_scale={down_scale_tensor.shape}")
+
+        # NOTE: Marlin FP8 kernel requires full N dimension (N=3072 for up_gate, N=3072 for down).
+        # TP sharding of N is NOT supported (N=384 per TP=8 rank triggers kernel assertion).
+        # To fit 62-layer Marlin in 80GB, use EP=8 instead of TP: each GPU gets 32 experts
+        # with full N=3072 per expert (total ~28 GB Marlin weights vs 224 GB with 256 experts).
+        # TP-sharding of Marlin weights is NOT done here; EP routing distributes experts.
 
         # Process through Marlin backend
         _process_fp8_marlin_weights(

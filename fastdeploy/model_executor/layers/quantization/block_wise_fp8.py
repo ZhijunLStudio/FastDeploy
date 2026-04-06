@@ -75,7 +75,12 @@ class BlockWiseFP8Config(QuantConfigBase):
     @classmethod
     def from_config(cls, config: dict) -> "BlockWiseFP8Config":
         weight_block_size = config.get("weight_block_size", [128, 128])
-        is_checkpoint_bf16 = not config.get("is_quantized", False)
+        # If quant_method is "fp8", it's a pre-quantized FP8 checkpoint (not a BF16 checkpoint).
+        # MiniMax and similar models may not include an "is_quantized" key, so we infer it
+        # from quant_method. This affects whether expert weight params are created as int32
+        # (Marlin-packed FP8) or BF16 during model initialization.
+        is_quantized = config.get("is_quantized", config.get("quant_method") == "fp8")
+        is_checkpoint_bf16 = not is_quantized
         return cls(weight_block_size, is_checkpoint_bf16)
 
     def get_quant_method(self, layer) -> Optional[QuantMethodBase]:
@@ -93,7 +98,7 @@ class BlockWiseFP8Config(QuantConfigBase):
                     )
                     return MarlinWeightOnlyMoEMethod(self)
                 else:
-                    # Fall back to BF16 dequant
+                    # Fall back to BF16 dequant (SM80 limitation: 62-layer output may be garbled)
                     return None
             if layer.ep_size > 1 or self.use_deep_gemm:
                 from fastdeploy.model_executor.layers.moe.fused_moe_deepgemm_backend import (

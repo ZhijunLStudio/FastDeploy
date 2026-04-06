@@ -60,8 +60,8 @@ def load_deep_ep() -> ModuleType:
         logger.error(
             f"import deep_ep failed! FD_USE_PFCC_DEEP_EP={envs.FD_USE_PFCC_DEEP_EP}. type={type(e).__name__}, err={e}"
         )
-        logger.error(f"Traceback:{traceback.format_exc()}")
-        raise
+        logger.warning("deep_ep not available (requires SM90+). EP on SM80 will use NCCL fallback.")
+        return None
 
 
 deep_ep = load_deep_ep()

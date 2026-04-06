@@ -442,6 +442,144 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         return weight_scale
 
+    def init_ep(self, layer):
+        """Initialize NCCL-based EP runner for SM80 (no deep_ep required)."""
+        from .nccl_ep_runner import NCCLEPPrefillRunner
+        fd_config = layer.fd_config
+        ep_size = layer.ep_size
+        ep_rank = fd_config.parallel_config.expert_parallel_rank
+        ep_group = fd_config.parallel_config.ep_group
+        num_local_experts = layer.num_local_experts
+        layer._nccl_ep_runner = NCCLEPPrefillRunner(
+            ep_size, ep_rank, ep_group, num_local_experts
+        )
+
+    def apply_ep(
+        self,
+        layer: nn.Layer,
+        x: paddle.Tensor,
+        gate: nn.Layer,
+        topk_ids_hookfunc: Callable = None,
+        shared_experts: nn.Layer = None,
+    ) -> paddle.Tensor:
+        """
+        Marlin FP8 MoE with Expert Parallel via NCCL all-to-all (SM80 compatible).
+
+        Flow:
+          1. Routing: compute global top-k expert IDs
+          2. Dispatch: NCCL all-to-all to send tokens to expert-owner ranks
+          3. Local Marlin GEMM: run only local experts on received tokens
+          4. Combine: NCCL all-to-all to return results to originating ranks
+        """
+        from fastdeploy.model_executor.layers.moe.moe import get_moe_scores
+
+        M, hidden_size = x.shape
+        top_k = layer.top_k
+        num_local_experts = layer.num_local_experts
+
+        # Step 1: Routing
+        gate_out = gate(x).cast("float32")
+        _, topk_weights, topk_ids = get_moe_scores(
+            gate_out,
+            layer.n_group,
+            layer.topk_group,
+            top_k,
+            layer.routed_scaling_factor,
+            layer.gate_correction_bias,
+            getattr(layer, "renormalize", True),
+        )
+        if topk_ids_hookfunc is not None:
+            topk_ids_hookfunc(topk_ids=topk_ids)
+
+        # Step 2: Dispatch via NCCL
+        runner = layer._nccl_ep_runner
+        recv_x, recv_local_eids, recv_ws, recv_orig, send_counts, recv_counts = runner.dispatch(
+            x, topk_ids, topk_weights
+        )
+        # Ensure correct dtype for downstream ops
+        recv_local_eids = recv_local_eids.cast("int64")
+
+        R = recv_x.shape[0]
+        ffn_outs = paddle.zeros([R, hidden_size], dtype=x.dtype)
+
+        if R > 0:
+            # Max number of local experts any received token has on this rank
+            valid_mask = (recv_local_eids >= 0)
+            max_local_k = int(valid_mask.sum(axis=1).max().item())
+            if max_local_k == 0:
+                max_local_k = 1
+
+            # Clip to max_local_k, pad -1 with 0 and zero weights
+            local_eids = recv_local_eids[:, :max_local_k].clone()
+            local_ws = recv_ws[:, :max_local_k].clone()
+            pad_mask = (local_eids < 0)
+            if pad_mask.any():
+                local_eids = paddle.where(pad_mask, paddle.zeros_like(local_eids), local_eids)
+                local_ws = paddle.where(
+                    pad_mask.cast("float32") > 0,
+                    paddle.zeros_like(local_ws), local_ws
+                )
+
+            block_size_m = 64
+            for m in [8, 16, 32, 48, 64]:
+                if R * max_local_k / num_local_experts / m < 0.9:
+                    block_size_m = m
+                    break
+
+            sorted_token_ids, expert_ids, num_tokens_pp = tritonmoe_preprocess_func(
+                local_eids.cast("int64"), num_local_experts, block_size_m
+            )
+
+            up_gate_weight = layer.up_gate_proj_weight
+            down_weight = layer.down_proj_weight
+            actual_size_k_up = up_gate_weight.shape[1] * 16
+            actual_size_n_up = up_gate_weight.shape[2] // 4
+            actual_size_k_down = down_weight.shape[1] * 16
+            actual_size_n_down = down_weight.shape[2] // 4
+
+            b_q_type_str = "float8_e4m3fn" if self.weight_type == "fp8" else "uint4b8"
+            workspace = paddle.empty([528], dtype="int32")
+
+            ffn_out = MoeWna16MarlinGemmApi(
+                recv_x, None,
+                b_q_weight=up_gate_weight,
+                b_scales=layer.up_gate_proj_weight_scale,
+                global_scale_or_none=None, b_zeros_or_none=None,
+                g_idx_or_none=None, perm_or_none=None,
+                workspace=workspace,
+                sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_pp,
+                topk_weights=local_ws, moe_block_size=block_size_m,
+                top_k=max_local_k, mul_topk_weights=False, is_ep=False,
+                b_q_type_str=b_q_type_str,
+                size_m=R, size_n=actual_size_n_up, size_k=actual_size_k_up,
+                is_k_full=True, use_atomic_add=True, use_fp32_reduce=True, is_zp_float=False,
+            )[0]
+
+            swiglu_out = paddle.nn.functional.swiglu(ffn_out)
+
+            ffn_outs = MoeWna16MarlinGemmApi(
+                swiglu_out, None,
+                b_q_weight=down_weight,
+                b_scales=layer.down_proj_weight_scale,
+                global_scale_or_none=None, b_zeros_or_none=None,
+                g_idx_or_none=None, perm_or_none=None,
+                workspace=workspace,
+                sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_pp,
+                topk_weights=local_ws, moe_block_size=block_size_m,
+                top_k=1, mul_topk_weights=True, is_ep=False,
+                b_q_type_str=b_q_type_str,
+                size_m=R * max_local_k, size_n=actual_size_n_down, size_k=actual_size_k_down,
+                is_k_full=True, use_atomic_add=True, use_fp32_reduce=True, is_zp_float=False,
+            )[0]
+
+            ffn_outs = ffn_outs.reshape([R, max_local_k, hidden_size]).sum(axis=1)
+
+        # Step 4: Combine via NCCL
+        output = runner.combine(M, ffn_outs, recv_ws, recv_orig, send_counts, recv_counts)
+        return output
+
     def apply(
         self,
         layer: nn.Layer,
@@ -451,8 +589,11 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         shared_experts: nn.Layer = None,
     ) -> paddle.Tensor:
         """
-        Marlin compute Fused MoE.
+        Marlin compute Fused MoE. Routes to apply_ep() when ep_size > 1.
         """
+        if getattr(layer, 'ep_size', 1) > 1:
+            return self.apply_ep(layer, x, gate, topk_ids_hookfunc, shared_experts)
+
         gate_out = gate(x)
         gate_out = gate_out.cast("float32")
         token_num = x.shape[0]
