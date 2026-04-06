@@ -734,8 +734,14 @@ class FusedMoE(nn.Layer):
             return out
 
         token_num = x.shape[0]
+        # When using NCCL-based EP (apply_ep with NCCLEPPrefillRunner), skip
+        # forward_split_allgather - it adds an unnecessary outer split+gather
+        # on top of the inner NCCL all-to-all, causing incorrect results.
+        # Instead, always use forward_normal which calls apply_ep directly.
+        _use_nccl_ep = self.ep_size > 1 and hasattr(self, '_nccl_ep_runner')
         if (
-            self.ep_size > 1
+            not _use_nccl_ep
+            and self.ep_size > 1
             and self.attn_tp_size > 1
             and (not self.fd_config.parallel_config.use_sequence_parallel_moe)
             and token_num >= self.attn_tp_size

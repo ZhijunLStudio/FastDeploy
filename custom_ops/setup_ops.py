@@ -567,8 +567,9 @@ elif paddle.is_compiled_with_cuda():
         ext_modules=CUDAExtension(
             sources=sources,
             extra_compile_args={"cxx": cc_compile_args, "nvcc": nvcc_compile_args},
-            libraries=["cublasLt"],
-            extra_link_args=["-lcuda", "-lnvidia-ml"],
+            libraries=["cublasLt", "cuda", "nvidia-ml"],
+            library_dirs=["/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/lib64"],
+            extra_link_args=[],
         ),
         packages=find_packages(where="third_party/DeepGEMM"),
         package_dir={"": "third_party/DeepGEMM"},

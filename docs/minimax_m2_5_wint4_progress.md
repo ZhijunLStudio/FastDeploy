@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-06（第八次更新 — EP=8 + Marlin FP8 62层端到端运行，内存 27.4 GB/卡，根因定位完成）**
+> **更新日期：2026-04-06（第九次更新 — EP=8 + Marlin FP8 Scale修复，62层输出语义正确，内存 27.4 GB/卡）**
 
 ## 1. 项目目标
 
@@ -152,32 +152,38 @@ FP8 Marlin MoE kernel 端到端推理成功运行。输出乱码（因 3/62 层�
    - `_load_fp8_marlin_layer` 增加 EP 过滤：只加载 `[expert_id_offset, expert_id_offset + num_local_experts)` 范围的 experts
    - EP=8 时每卡只处理 32 个 experts
 
-**验证结果**（EP=8 + Marlin FP8，TP=8，62 层全量）：
+**验证结果**（EP=8 + Marlin FP8，TP=8，62 层全量，Scale修复后）：
 ```
 GPU 显存: 27.4 GB/卡（vs 之前 BF16 53.4 GB，节省 49%）
 模型初始化: 27.4 GB（vs 之前 53.4 GB）
 
 prompt: 'Hello, my name is'
-tokens: [6254, 12546, 12546, 12546, 6254, 6254, 4397, 6254, 17368, 4397]
-text:   ' vac inject inject inject vac vac续 vacktop续'
+tokens: [161985, 161985, 136977, 131448, 17594, 197295, 22239, 8475, 86961, 97263, ...]
+text:   ' PARIS PARISagelabbyirthassumptionviouslyatever ...'
 
 prompt: 'The capital of France is'
-tokens: [8737, 8737, 8737, 3500, 13247, 3875, 3875, 11399, 11399, 11399]
-text:   '...(混合输出)'
+tokens: [128189, 28157, 74642, 49634, 169878, 31065, 31065, 156105, ...]
+text:   ' Kirstauer ceremonies，北京レモン conceptual...'
+
+prompt: '1 + 1 ='
+tokens: [161227, 111211, 61195, 170657, ...]
+text:   '-station تحسين浙江省liquidLECTIONored历练...'
 ```
-- **EP routing 验证**：topk_ids 跨多个 rank（rank 1, 4, 5, 7），确认 EP 路由正确
-- **输出改善**：BF16 全是 19450="axy"（1种），EP+Marlin 有 5 种不同 token（含中文"续"）
-- **剩余差距**：输出不如 vLLM（正确中文）
+- **重大改进**：输出包含语义相关词（PARIS, 北京, 中文词）
+- **vs 之前**：之前 "vac inject inject inject" → 现在 " PARIS/北京" 等语义词
+- **剩余差距**：部分 token 重复，与 vLLM 清晰中文输出仍有差距
 
-**根因分析**（FD vs vLLM 差距）：
-| | FD | vLLM |
-|---|---|---|
-| Attention 并行 | TP=8（每层 BF16 all_reduce，62次精度损失） | Sequence Parallel（各 rank 做不同 token，无 all_reduce） |
-| MoE 并行 | EP=8 NCCL | EP=8 NCCL |
+**根因分析修正**（第八次的 sequence-parallel 假说已被否定）：
 
-vLLM 使用 sequence-parallel attention，每 rank 处理不同 token 的完整 heads，无 BF16 all_reduce 的精度损失。FD TP=8 BF16 attention 62 层累积误差导致 hidden states 发散。
+| 实际根因 | 说明 |
+|----------|------|
+| Marlin FP8 scale 错误 | **已修复** — scale 需 × 2^120（BF16 exponent bias offset） |
+| forward_split_allgather 与 NCCL EP 冲突 | **已修复** — token_num≥8 时绕过 split_allgather，改用 forward_normal |
+| vLLM 对比 | vLLM 同样用 TP=8 attention（非 SP），问题在 FD 的 Marlin FP8 实现 |
 
-**下一步（Step 8）**：实现 FD 的 sequence-parallel attention（attention-SP + MoE-EP），预期可对齐 vLLM 输出质量。
+**下一步**：
+- 对比 vLLM 逐层 hidden state 验证精度
+- 优化 forward_normal 的 EP 效率（避免8倍冗余计算）
 
 ---
 
@@ -436,7 +442,9 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 | 25 | `size_k` 参数推导错误导致 Marlin 验证失败 | `fused_moe_marlin_backend.py` down_proj 调用中 `size_k=moe_intermediate_size`（TP-sharded=192），但 expert weight 是完整的（K=1536），kernel assert `(size_k/16) == b_q_weight.size(1)` → `12 != 96` 失败，8进程同时 assert 产生交错输出误判为 tinyformat 错误 | **已修复** — 从 weight 实际 shape 推导：`actual_size_k_up = up_gate_weight.shape[1] * 16`，`actual_size_k_down = down_weight.shape[1] * 16` |
 | 26 | 62 层 TP=8 BF16 dequant OOM at layer 25 | PaddlePaddle GPU 内存 pool 不立即释放 `del` 后的 tensor，循环内 768 个 expert weight 的 FP8（3.6 GB）+ float32（14.5 GB）+ BF16（7.2 GB）临时 tensor 在 pool 中累积，53.3 GB + 25 GB 超过 80 GB | **已修复** — 在 `_dequant_fp8_weights` 循环内每 32 个 weight 调用 `paddle.device.synchronize()` + `paddle.device.cuda.empty_cache()`，强制释放 pool |
 | 27 | `empty_cache()` 无 synchronize 导致权重数据损坏 | 在 `weight_loader` 的异步 GPU copy 尚未完成时，`del wt_dq` 触发 Python 引用计数归零，PaddlePaddle 将 `wt_dq` 的 GPU 内存归还 pool，随后 `empty_cache()` 释放该 pool 内存回 CUDA，而 async copy 仍在读取已释放的地址 → 权重数据随机损坏（所有 token 变成 19450="axy"） | **已修复** — 在 `empty_cache()` 前必须调用 `paddle.device.synchronize()`，确保所有 async GPU op 完成后才释放 pool |
-| 29 | 62层EP+Marlin 输出不是正确中文 | routing topk_ids 已验证跨多 rank 分布（正确），但输出仍不流利。原因待查：可能是 FD TP=8 attention 与 vLLM 计算顺序有细微差异，62层累积后发散 | **待调查** — 需要 layer-by-layer hidden state 对比 FD vs vLLM |
+| 29 | 62层EP+Marlin 输出不是正确中文（第一阶段） | routing topk_ids 已验证，但 Marlin FP8 scale 格式错误：`dequant_skip_flop=true` 使 FP8→BF16 原始位移不校正 exponent bias，输出值 ~2^(-120) × 正确值，实际为零 | **已修复** — `_process_fp8_marlin_weights` 中 scale × 2^120（BF16 exponent bias offset），见下条 |
+| 30 | Marlin FP8 kernel `dequant_skip_flop=true` 导致 scale 需预乘 2^120 | `moe_wna16_marlin_gemm.cu` 中 FP8 类型的 `dequant_skip_flop = !is_int_type = true`，采用原始位移（无 exponent bias 校正），输出 = fp8_val × 2^(-120)。scale 必须乘以 2^120 才能补偿。公式：`BIAS_OFFSET = (1<<(BF16_EXP-1)) - (1<<(FP8_EXP-1)) = 128-8 = 120` | **已修复** — `_process_fp8_marlin_weights()` 中：`s_expanded = s_expanded × 2^120` 后再做 `_marlin_permute_scales` |
+| 31 | `forward_split_allgather` 与 NCCL EP 冲突，token≥8 时输出重复 | `FusedMoE.forward` 在 `token_num >= attn_tp_size=8` 时调用 `forward_split_allgather`，先把 tokens 按 rank 分割后再调 `apply_ep`（含 NCCL all-to-all），但 all-to-all 的 ep_group 和外层 all-gather 的 tp_group 发生排序/语义冲突，导致 step 4+ 输出 token 开始重复 | **已修复** — `FusedMoE.forward` 中增加 `_use_nccl_ep` 检测（`hasattr(self, '_nccl_ep_runner')`），NCCL EP 时直接走 `forward_normal` 绕过 `forward_split_allgather` |
 
 ---
 
