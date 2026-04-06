@@ -85,11 +85,16 @@ class BlockWiseFP8Config(QuantConfigBase):
         if isinstance(layer, FusedMoE):
             if get_sm_version() < 90:
                 # SM < 90 (A100/A800): no FP8 tensor cores
-                # Use Marlin kernel for FP8 weight-only quantization
-                from fastdeploy.model_executor.layers.moe.fused_moe_marlin_backend import (
-                    MarlinWeightOnlyMoEMethod,
-                )
-                return MarlinWeightOnlyMoEMethod(self)
+                import os
+                if os.environ.get("FD_MARLIN_FP8", "0") == "1":
+                    # Use Marlin kernel for FP8 weight-only quantization
+                    from fastdeploy.model_executor.layers.moe.fused_moe_marlin_backend import (
+                        MarlinWeightOnlyMoEMethod,
+                    )
+                    return MarlinWeightOnlyMoEMethod(self)
+                else:
+                    # Fall back to BF16 dequant
+                    return None
             if layer.ep_size > 1 or self.use_deep_gemm:
                 from fastdeploy.model_executor.layers.moe.fused_moe_deepgemm_backend import (
                     DeepGemmFusedMoeMethod,

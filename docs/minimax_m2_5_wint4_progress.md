@@ -1,10 +1,12 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-06（第四次更新 — FP8 Marlin MoE 集成）**
+> **更新日期：2026-04-06（第五次更新 — TP=8 Marlin tinyformat 问题定位）**
 
 ## 1. 项目目标
 
 在 FastDeploy (FD) 框架中复现 MiniMax-M2.5 模型（`MiniMaxM2ForCausalLM`），实现权重加载、前向推理、token 生成。核心目标是在 **8×A800 (SM80)** 上以 **FP8 反量化** 和 **WINT4 量化** 方式运行全量 62 层模型。
+
+> **更新日期：2026-04-06（第五次更新 — TP=8 Marlin tinyformat 问题定位）**
 
 **模型关键参数**：
 | 参数 | 值 |
@@ -342,6 +344,8 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 | 19 | SM80 输出乱码 | 硬件不支持 FP8 原生计算，BF16 dequant 精度累积导致 MoE routing 偏差 | 在 SM90+ 上验证或接受 SM80 精度损失 |
 | 20 | FusedMoE 缺少 `renormalize=True` | MiniMax-M2.5 routing 需要对 top-k weights 做 sum 归一化，但 `FusedMoE` 默认 `renormalize=False`，导致 weights 放大约 4 倍 | 添加 `renormalize=True`（cos_sim 对比验证确认） |
 | 21 | vLLM 在 SM80 上也无法正常工作 | vLLM 5 层输出全换行符（MARLIN FP8 精度损失），62 层 TP=1 OOM，TP=8 初始化失败 | 确认为 SM80 硬件限制，不是 FD 独有问题 |
+| 22 | `PADDLE_ENFORCE` 多参数 tinyformat 崩溃 | PaddlePaddle tinyformat 不支持多个格式化参数，32+ 处多参数 `PADDLE_ENFORCE` 在 CUDA Graph capture 时触发断言 | 批量替换为单参数格式（`"Check failed. See source for details."`）|
+| 23 | TP=8 Marlin kernel tinyformat 崩溃 | `MoeWna16MarlinGemmApi` 在 TP=8 多进程环境下触发 PaddlePaddle 核心库的 tinyformat 断言。TP=1 完全正常，TP=8 的 BF16 dequant fallback 也正常。确认为 PaddlePaddle 框架层面的 pybind11 → custom op 调用在多进程环境下的兼容性问题 | **待修复** — 需要调查 PaddlePaddle 的 op 调度层在 TP>1 时的额外检查|
 
 ---
 
@@ -349,19 +353,20 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 
 ### 8.1 优先级最高
 
-1. **FP8 Marlin MoE 8 卡完整模型测试**：
-   - FP8 Marlin kernel 已在 TP=1, 3 层模型上验证通过
-   - 下一步：8 卡 A100 + Expert Parallel 模式测试完整 62 层模型
-   - 预期显存：FP8 Marlin weight (1 byte/param) + BF16 activation，约 30-40 GB/卡
-   - 需要验证 FP8 Marlin 精度是否优于 BF16 dequant fallback（vLLM 已验证 cos_sim=1.0）
+1. **TP=8 Marlin kernel tinyformat 崩溃修复**：
+   - `MoeWna16MarlinGemmApi` 在 TP=8 多进程下触发 PaddlePaddle tinyformat 断言
+   - TP=1 完全正常，TP=8 BF16 MoE fallback 也正常
+   - 可能的根因：PaddlePaddle 的 pybind11 op 调度层在多进程环境下对 tensor device/placement 有额外检查，这些检查内部用了多参数 `PADDLE_ENFORCE`
+   - 需要进一步调查 PaddlePaddle 的 `py::arg` → tensor 验证路径中的 tinyformat 调用
 
-2. **SM80 输出乱码问题（根因分析完成）**：
-   - 62 层全量模型在 SM80 上输出乱码（多语言混合、无语义）
-   - **根因**：SM80 硬件不支持 FP8 原生计算。FD 做 FP8→BF16 反量化后用 BF16 计算，每层 cos_sim > 0.9999，但 MoE routing（top-8 from 256 experts, sigmoid scoring + e_score_correction_bias）对微小差异非常敏感，62 层累积后路由可能选了完全不同的 experts
-   - **可能的解决方案**（2026-04-06 新增）：
-     - ✅ FP8 Marlin kernel 已集成（使用 weight-only 量化，保持 FP8 权重精度）
-     - 需要在 62 层模型上验证 Marlin kernel 是否能消除乱码
-     - vLLM 使用相同 Marlin kernel 已能在 SM80 上正常输出中文
+2. **FP8 Marlin MoE 8 卡完整模型测试**：
+   - FP8 Marlin kernel 已在 TP=1, 3 层模型上验证通过
+   - 下一步：需要先解决 TP=8 的 tinyformat 问题，然后测试完整 62 层模型
+   - 预期显存：FP8 Marlin weight (1 byte/param) + BF16 activation，约 30-40 GB/卡
+
+3. **SM80 输出乱码问题**：
+   - FP8 Marlin kernel 在 TP=1 上已经成功运行（输出非平凡中文 token）
+   - 一旦 TP=8 Marlin 问题解决，可以在 62 层全量模型上验证 Marlin 精度是否优于 BF16 dequant fallback
 
 2. **TP=8 WINT4 MoE int4 量化**：
    - `paddle.nn.quant.weight_quantize` 在 SM80 上对 TP-sharded weight（`[384, 3072]`）的 packed layout（`[1536, 384]`）与 `moe_expert_ffn` int4 kernel 不兼容

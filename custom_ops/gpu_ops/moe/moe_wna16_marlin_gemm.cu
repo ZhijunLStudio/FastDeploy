@@ -635,41 +635,24 @@ void marlin_mm(const void* A,
 
   if (has_zp) {
     PADDLE_ENFORCE(q_type == MARLIN_NAMESPACE_NAME::kU4 ||
-                       q_type == MARLIN_NAMESPACE_NAME::kU8,
-                   "q_type must be u4 or u8 when has_zp = True. Got = ",
-                   q_type.str());
+                       q_type == MARLIN_NAMESPACE_NAME::kU8, "Check failed. See source for details.");
   } else {
-    PADDLE_ENFORCE(
-        q_type == MARLIN_NAMESPACE_NAME::kU4B8 ||
+    PADDLE_ENFORCE(q_type == MARLIN_NAMESPACE_NAME::kU4B8 ||
             q_type == MARLIN_NAMESPACE_NAME::kU8B128 ||
             q_type == MARLIN_NAMESPACE_NAME::kFE4M3fn ||
-            q_type == MARLIN_NAMESPACE_NAME::kFE2M1f,
-        "q_type must be uint4b8, uint8b128, float8_e4m3fn or float4_e2m1f when "
-        "has_zp = False. Got = ",
-        q_type.str());
+            q_type == MARLIN_NAMESPACE_NAME::kFE2M1f, "Check failed. See source for details.");
   }
 
-  PADDLE_ENFORCE(prob_m > 0 && prob_n > 0 && prob_k > 0,
-                 "Invalid MNK = [",
-                 prob_m,
-                 ", ",
-                 prob_n,
-                 ", ",
-                 prob_k,
-                 "]");
+  PADDLE_ENFORCE(prob_m > 0 && prob_n > 0 && prob_k > 0, "Check failed. See source for details.");
 
   int group_blocks = 0;
   if (has_act_order) {
     if (is_k_full) {
-      PADDLE_ENFORCE(group_size != -1, "group_size = ", group_size);
+      PADDLE_ENFORCE(group_size != -1, "group_size must != -1");
       group_blocks = group_size / 16;
-      PADDLE_ENFORCE(prob_k % group_blocks == 0,
-                     "prob_k = ",
-                     prob_k,
-                     " is not divisible by group_blocks = ",
-                     group_blocks);
+      PADDLE_ENFORCE(prob_k % group_blocks == 0, "Check failed. See source for details.");
     } else {
-      PADDLE_ENFORCE(group_size == 0, "group_size = ", group_size);
+      PADDLE_ENFORCE(group_size == 0, "group_size must == 0");
       group_blocks = 0;
     }
   } else {
@@ -677,11 +660,7 @@ void marlin_mm(const void* A,
       group_blocks = -1;
     } else {
       group_blocks = group_size / 16;
-      PADDLE_ENFORCE(prob_k % group_blocks == 0,
-                     "prob_k = ",
-                     prob_k,
-                     " is not divisible by group_blocks = ",
-                     group_blocks);
+      PADDLE_ENFORCE(prob_k % group_blocks == 0, "Check failed. See source for details.");
     }
   }
 
@@ -716,7 +695,7 @@ void marlin_mm(const void* A,
     else if (moe_block_size == 64)
       kernel = permute_cols_kernel<64>;
     else
-      PADDLE_ENFORCE(false, "unsupported moe_block_size ", moe_block_size);
+      PADDLE_ENFORCE(false, "unsupported moe_block_size");
 
     // avoid ">>>" being formatted to "> > >"
     // clang-format off
@@ -737,9 +716,7 @@ void marlin_mm(const void* A,
   int max_shared_mem = 0;
   cudaDeviceGetAttribute(
       &max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  PADDLE_ENFORCE(max_shared_mem > 0,
-                 "max_shared_mem should > 0 ! max_shared_mem = ",
-                 max_shared_mem);
+  PADDLE_ENFORCE(max_shared_mem > 0, "Check failed. See source for details.");
 
   // Set thread config
   exec_config_t exec_cfg;
@@ -747,16 +724,8 @@ void marlin_mm(const void* A,
   if (thread_k != -1 && thread_n != -1) {
     thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
     exec_cfg = exec_config_t{1, thread_tfg};
-    PADDLE_ENFORCE(prob_n % thread_n == 0,
-                   "prob_n = ",
-                   prob_n,
-                   " is not divisible by thread_n = ",
-                   thread_n);
-    PADDLE_ENFORCE(prob_k % thread_k == 0,
-                   "prob_k = ",
-                   prob_k,
-                   " is not divisible by thread_k = ",
-                   thread_k);
+    PADDLE_ENFORCE(prob_n % thread_n == 0, "Check failed. See source for details.");
+    PADDLE_ENFORCE(prob_k % thread_k == 0, "Check failed. See source for details.");
   } else {
     // Auto config
     exec_cfg = determine_exec_config<scalar_t>(q_type,
@@ -797,35 +766,7 @@ void marlin_mm(const void* A,
                                  is_k_full,
                                  has_zp,
                                  is_zp_float,
-                                 max_shared_mem),
-                 "Invalid thread config: thread_m_blocks = ",
-                 thread_m_blocks,
-                 ", thread_k = ",
-                 thread_tfg.thread_k,
-                 ", thread_n = ",
-                 thread_tfg.thread_n,
-                 ", num_threads = ",
-                 thread_tfg.num_threads,
-                 " for MKN = [",
-                 prob_m,
-                 ", ",
-                 prob_k,
-                 ", ",
-                 prob_n,
-                 "] and num_bits = ",
-                 num_bits,
-                 ", group_size = ",
-                 group_size,
-                 ", has_act_order = ",
-                 has_act_order,
-                 ", is_k_full = ",
-                 is_k_full,
-                 ", has_zp = ",
-                 has_zp,
-                 ", is_zp_float = ",
-                 is_zp_float,
-                 ", max_shared_mem = ",
-                 max_shared_mem);
+                                 max_shared_mem), "Check failed. See source for details.");
 
   auto kernel = get_marlin_kernel<scalar_t>(q_type,
                                             thread_m_blocks,
@@ -839,28 +780,7 @@ void marlin_mm(const void* A,
                                             is_zp_float);
 
   if (kernel == MarlinDefault) {
-    PADDLE_ENFORCE(false,
-                   "Unsupported shapes: MNK = [",
-                   prob_m,
-                   ", ",
-                   prob_n,
-                   ", ",
-                   prob_k,
-                   "]",
-                   ", has_act_order = ",
-                   has_act_order,
-                   ", num_groups = ",
-                   num_groups,
-                   ", group_size = ",
-                   group_size,
-                   ", thread_m_blocks = ",
-                   thread_m_blocks,
-                   ", thread_n_blocks = ",
-                   thread_n_blocks,
-                   ", thread_k_blocks = ",
-                   thread_k_blocks,
-                   ", num_bits = ",
-                   num_bits);
+    PADDLE_ENFORCE(false, "Check failed. See source for details.");
   }
 
   cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
@@ -930,52 +850,21 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
   int pack_factor = 32 / b_q_type.size_bits();
 
   if (moe_block_size != 8) {
-    PADDLE_ENFORCE(moe_block_size % 16 == 0,
-                   "unsupported moe_block_size=",
-                   moe_block_size);
-    PADDLE_ENFORCE(moe_block_size >= 16 && moe_block_size <= 64,
-                   "unsupported moe_block_size=",
-                   moe_block_size);
+    PADDLE_ENFORCE(moe_block_size % 16 == 0, "Check failed. See source for details.");
+    PADDLE_ENFORCE(moe_block_size >= 16 && moe_block_size <= 64, "Check failed. See source for details.");
   }
 
   // Verify A
-  PADDLE_ENFORCE(a.size(0) == size_m,
-                 "Shape mismatch: a.size(0) = ",
-                 a.size(0),
-                 ", size_m = ",
-                 size_m);
-  PADDLE_ENFORCE(a.size(1) == size_k,
-                 "Shape mismatch: a.size(1) = ",
-                 a.size(1),
-                 ", size_k = ",
-                 size_k);
+  PADDLE_ENFORCE(a.size(0) == size_m, "Check failed. See source for details.");
+  PADDLE_ENFORCE(a.size(1) == size_k, "Check failed. See source for details.");
 
   // Verify B
-  PADDLE_ENFORCE(size_k % MARLIN_NAMESPACE_NAME::tile_size == 0,
-                 "size_k = ",
-                 size_k,
-                 " is not divisible by tile_size = ",
-                 MARLIN_NAMESPACE_NAME::tile_size);
-  PADDLE_ENFORCE(
-      (size_k / MARLIN_NAMESPACE_NAME::tile_size) == b_q_weight.size(1),
-      "Shape mismatch: b_q_weight.size(1) = ",
-      b_q_weight.size(1),
-      ", size_k = ",
-      size_k,
-      ", tile_size = ",
-      MARLIN_NAMESPACE_NAME::tile_size);
-  PADDLE_ENFORCE(b_q_weight.size(2) % MARLIN_NAMESPACE_NAME::tile_size == 0,
-                 "b_q_weight.size(2) = ",
-                 b_q_weight.size(2),
-                 " is not divisible by tile_size = ",
-                 MARLIN_NAMESPACE_NAME::tile_size);
+  PADDLE_ENFORCE(size_k % MARLIN_NAMESPACE_NAME::tile_size == 0, "Check failed. See source for details.");
+  PADDLE_ENFORCE((size_k / MARLIN_NAMESPACE_NAME::tile_size) == b_q_weight.size(1), "Check failed. See source for details.");
+  PADDLE_ENFORCE(b_q_weight.size(2) % MARLIN_NAMESPACE_NAME::tile_size == 0, "Check failed. See source for details.");
   int actual_size_n =
       (b_q_weight.size(2) / MARLIN_NAMESPACE_NAME::tile_size) * pack_factor;
-  PADDLE_ENFORCE(size_n == actual_size_n,
-                 "size_n = ",
-                 size_n,
-                 ", actual_size_n = ",
-                 actual_size_n);
+  PADDLE_ENFORCE(size_n == actual_size_n, "Check failed. See source for details.");
 
   // Verify device and strides
   PADDLE_ENFORCE(a.is_gpu(), "A is not on GPU");
@@ -1009,16 +898,8 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
     c = c_or_none.get();
     PADDLE_ENFORCE(c.is_gpu(), "c is not on GPU");
     PADDLE_ENFORCE(c.is_contiguous(), "c is not contiguous");
-    PADDLE_ENFORCE(c.size(0) == size_m * top_k,
-                   "Shape mismatch: c.size(0) = ",
-                   c.size(0),
-                   ", size_m * topk = ",
-                   size_m * top_k);
-    PADDLE_ENFORCE(c.size(1) == size_n,
-                   "Shape mismatch: c.size(1) = ",
-                   c.size(1),
-                   ", size_n = ",
-                   size_n);
+    PADDLE_ENFORCE(c.size(0) == size_m * top_k, "Check failed. See source for details.");
+    PADDLE_ENFORCE(c.size(1) == size_n, "Check failed. See source for details.");
   } else {
     c = ConvertPaddleTensorToDetailTensor(paddle::experimental::empty(
         {size_m * top_k, size_n}, a.dtype(), phi::GPUPlace(device_id)));
@@ -1045,12 +926,8 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
   int group_size = -1;
 
   int rank = b_scales.dim();
-  PADDLE_ENFORCE(rank == 3, "b_scales rank = ", rank, " is not 3");
-  PADDLE_ENFORCE(b_scales.size(2) == size_n,
-                 "b_scales dim 2 = ",
-                 b_scales.size(2),
-                 " is not size_n = ",
-                 size_n);
+  PADDLE_ENFORCE(rank == 3, "b_scales rank must be 3");
+  PADDLE_ENFORCE(b_scales.size(2) == size_n, "Check failed. See source for details.");
   int num_groups = b_scales.size(1);
 
   bool has_act_order = false;
@@ -1066,13 +943,7 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
 
     // Verify g_idx and perm
     PADDLE_ENFORCE((g_idx.size(-1) == 0 && perm.size(-1) == 0) ||
-                       (g_idx.size(-1) == size_k && perm.size(-1) == size_k),
-                   "Unexpected g_idx.size(-1) = ",
-                   g_idx.size(-1),
-                   " and perm.size(-1) = ",
-                   perm.size(-1),
-                   ", where size_k = ",
-                   size_k);
+                       (g_idx.size(-1) == size_k && perm.size(-1) == size_k), "Check failed. See source for details.");
 
     has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
   } else {
@@ -1092,11 +963,7 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
 
     if (is_k_full) {
       PADDLE_ENFORCE(num_groups > 1, "For act_order, num_groups must be > 1");
-      PADDLE_ENFORCE(size_k % num_groups == 0,
-                     "size_k = ",
-                     size_k,
-                     ", is not divisible by num_groups = ",
-                     num_groups);
+      PADDLE_ENFORCE(size_k % num_groups == 0, "Check failed. See source for details.");
       group_size = size_k / num_groups;
     } else {
       group_size = 0;
@@ -1107,11 +974,7 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
         paddle::experimental::empty({0}, a.dtype(), phi::GPUPlace(device_id)));
 
     if (num_groups > 1) {
-      PADDLE_ENFORCE(size_k % num_groups == 0,
-                     "size_k = ",
-                     size_k,
-                     ", is not divisible by b_scales.size(1) = ",
-                     b_scales.size(1));
+      PADDLE_ENFORCE(size_k % num_groups == 0, "Check failed. See source for details.");
       group_size = size_k / num_groups;
     } else {
       group_size = -1;
@@ -1145,18 +1008,12 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
 
   if (has_zp) {
     PADDLE_ENFORCE(b_q_type == MARLIN_NAMESPACE_NAME::kU4 ||
-                       b_q_type == MARLIN_NAMESPACE_NAME::kU8,
-                   "b_q_type must be u4 or u8 when has_zp = True. Got = ",
-                   b_q_type.str());
+                       b_q_type == MARLIN_NAMESPACE_NAME::kU8, "Check failed. See source for details.");
   } else {
     PADDLE_ENFORCE(b_q_type == MARLIN_NAMESPACE_NAME::kU4B8 ||
                        b_q_type == MARLIN_NAMESPACE_NAME::kU8B128 ||
                        b_q_type == MARLIN_NAMESPACE_NAME::kFE4M3fn ||
-                       b_q_type == MARLIN_NAMESPACE_NAME::kFE2M1f,
-                   "b_q_type must be uint4b8, uint8b128, float8_e4m3fn or "
-                   "float4_e2m1f when "
-                   "has_zp = False. Got = ",
-                   b_q_type.str());
+                       b_q_type == MARLIN_NAMESPACE_NAME::kFE2M1f, "Check failed. See source for details.");
   }
 
   if (has_zp && is_zp_float) {
@@ -1169,48 +1026,24 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
   // Verify b_zeros
   if (has_zp) {
     int rank = b_zeros.dim();
-    PADDLE_ENFORCE(rank == 3, "b_zeros rank = ", rank, " is not 3");
+    PADDLE_ENFORCE(rank == 3, "b_zeros rank must be 3");
     if (is_zp_float) {
-      PADDLE_ENFORCE(b_zeros.size(2) == size_n,
-                     "b_zeros dim 2 = ",
-                     b_zeros.size(2),
-                     " is not size_n = ",
-                     size_n);
-      PADDLE_ENFORCE(num_groups == b_zeros.size(1),
-                     "b_zeros dim 1 = ",
-                     b_zeros.size(1),
-                     " is not num_groups = ",
-                     num_groups);
+      PADDLE_ENFORCE(b_zeros.size(2) == size_n, "Check failed. See source for details.");
+      PADDLE_ENFORCE(num_groups == b_zeros.size(1), "Check failed. See source for details.");
       PADDLE_ENFORCE(num_groups != -1, "num_groups must be != -1");
     } else {
-      PADDLE_ENFORCE(b_zeros.size(1) == num_groups,
-                     "b_zeros dim 1 = ",
-                     b_zeros.size(1),
-                     " is not num_groups = ",
-                     num_groups);
-      PADDLE_ENFORCE(b_zeros.size(2) == size_n / pack_factor,
-                     "b_zeros dim 2 = ",
-                     b_zeros.size(2),
-                     " is not size_n / pack_factor = ",
-                     size_n / pack_factor);
+      PADDLE_ENFORCE(b_zeros.size(1) == num_groups, "Check failed. See source for details.");
+      PADDLE_ENFORCE(b_zeros.size(2) == size_n / pack_factor, "Check failed. See source for details.");
     }
   }
 
   // Verify workspace size
-  PADDLE_ENFORCE(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
-                 "size_n = ",
-                 size_n,
-                 ", is not divisible by min_thread_n = ",
-                 MARLIN_NAMESPACE_NAME::min_thread_n);
+  PADDLE_ENFORCE(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0, "Check failed. See source for details.");
 
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
   int min_workspace_size = std::min(
       max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
-  PADDLE_ENFORCE(workspace.numel() >= min_workspace_size,
-                 "workspace.numel = ",
-                 workspace.numel(),
-                 " is below min_workspace_size = ",
-                 min_workspace_size);
+  PADDLE_ENFORCE(workspace.numel() >= min_workspace_size, "Check failed. See source for details.");
 
   if (a.dtype() == paddle::DataType::FLOAT16) {
     using DataType = phi::dtype::float16;

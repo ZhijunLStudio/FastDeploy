@@ -263,35 +263,19 @@ std::vector<paddle::Tensor> gptq_marlin_repack(paddle::Tensor& b_q_weight,
                                                int64_t size_n,
                                                int64_t num_bits) {
   // Verify compatibility with marlin tile of 16x64
-  PADDLE_ENFORCE(size_k % MARLIN_NAMESPACE_NAME::tile_k_size == 0,
-                 "size_k = ",
-                 size_k,
-                 " is not divisible by tile_k_size = ",
-                 MARLIN_NAMESPACE_NAME::tile_k_size);
+  PADDLE_ENFORCE(size_k % MARLIN_NAMESPACE_NAME::tile_k_size == 0, "Check failed. See source for details.");
 
-  PADDLE_ENFORCE(size_n % MARLIN_NAMESPACE_NAME::tile_n_size == 0,
-                 "size_n = ",
-                 size_n,
-                 " is not divisible by tile_n_size = ",
-                 MARLIN_NAMESPACE_NAME::tile_n_size);
+  PADDLE_ENFORCE(size_n % MARLIN_NAMESPACE_NAME::tile_n_size == 0, "Check failed. See source for details.");
 
-  PADDLE_ENFORCE(num_bits == 4 || num_bits == 8,
-                 "num_bits must be 4 or 8. Got = ",
-                 num_bits);
+  PADDLE_ENFORCE(num_bits == 4 || num_bits == 8, "Check failed. See source for details.");
 
   int const pack_factor = 32 / num_bits;
 
   // Verify B
   // shape checks
-  PADDLE_ENFORCE((size_k / pack_factor) == b_q_weight.dims()[0],
-                 "Shape mismatch: b_q_weight.size(0) = ",
-                 b_q_weight.dims()[0]);
+  PADDLE_ENFORCE((size_k / pack_factor) == b_q_weight.dims()[0], "Check failed. See source for details.");
 
-  PADDLE_ENFORCE(b_q_weight.dims()[1] == size_n,
-                 "Shape mismatch: b_q_weight.size(1) = ",
-                 b_q_weight.dims()[1],
-                 ", expected size_n = ",
-                 size_n);
+  PADDLE_ENFORCE(b_q_weight.dims()[1] == size_n, "Check failed. See source for details.");
 
   // Verify device and strides
   PADDLE_ENFORCE(b_q_weight.is_gpu(), "b_q_weight is not on GPU");
@@ -334,8 +318,7 @@ std::vector<paddle::Tensor> gptq_marlin_repack(paddle::Tensor& b_q_weight,
   cudaDeviceGetAttribute(
       &max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   // TORCH_CHECK(max_shared_mem > 0);
-  PADDLE_ENFORCE(
-      max_shared_mem > 0, "max_shared_mem must be > 0. Got = ", max_shared_mem);
+  PADDLE_ENFORCE(max_shared_mem > 0, "Check failed. See source for details.");
 
   if (false) {
   }
@@ -346,11 +329,7 @@ std::vector<paddle::Tensor> gptq_marlin_repack(paddle::Tensor& b_q_weight,
   else {
     // TORCH_CHECK(false, "Unsupported repack config: num_bits = ", num_bits,
     //             ", has_perm = ", has_perm);
-    PADDLE_ENFORCE(false,
-                   "Unsupported repack config: num_bits = ",
-                   num_bits,
-                   ", has_perm = ",
-                   has_perm);
+    PADDLE_ENFORCE(false, "Check failed. See source for details.");
   }
 
   return {out};
