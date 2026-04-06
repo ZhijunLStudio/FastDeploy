@@ -509,22 +509,29 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         else:
             b_q_type_str = "uint4b8"
 
-        # For FP8, size_n is different due to num_bits=8 packing
+        # For FP8, size_n and size_k are derived from actual weight shapes
+        # to handle TP-sharded vs full expert weights correctly.
         if self.weight_type == "fp8":
-            # FP8: weight shape is [E, K//16, N*4], so actual N = weight.shape[2] // 4
+            # FP8: weight shape is [E, K//16, N*4], so:
+            #   actual K = weight.shape[1] * 16
+            #   actual N = weight.shape[2] // 4
             up_gate_weight = layer.up_gate_proj_weight
+            actual_size_k_up = up_gate_weight.shape[1] * 16
             actual_size_n_up = up_gate_weight.shape[2] // 4
             down_weight = layer.down_proj_weight
+            actual_size_k_down = down_weight.shape[1] * 16
             actual_size_n_down = down_weight.shape[2] // 4
         else:
+            actual_size_k_up = hidden_size
             actual_size_n_up = moe_intermediate_size * 2
+            actual_size_k_down = moe_intermediate_size
             actual_size_n_down = hidden_size
 
         import logging
         logger = logging.getLogger(__name__)
         logger.info(f"Marlin FP8 apply: b_q_type={b_q_type_str}, "
-                     f"up_gate: size_n={actual_size_n_up}, size_k={hidden_size}, "
-                     f"down: size_n={actual_size_n_down}, size_k={moe_intermediate_size}, "
+                     f"up_gate: size_n={actual_size_n_up}, size_k={actual_size_k_up}, "
+                     f"down: size_n={actual_size_n_down}, size_k={actual_size_k_down}, "
                      f"up_gate_weight={layer.up_gate_proj_weight.shape}, "
                      f"up_gate_scale={layer.up_gate_proj_weight_scale.shape}, "
                      f"down_weight={layer.down_proj_weight.shape}, "
@@ -552,7 +559,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             b_q_type_str=b_q_type_str,
             size_m=token_num,
             size_n=actual_size_n_up,
-            size_k=hidden_size,
+            size_k=actual_size_k_up,
             is_k_full=True,
             use_atomic_add=True,
             use_fp32_reduce=True,
@@ -582,7 +589,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             b_q_type_str=b_q_type_str,
             size_m=token_num * topk,
             size_n=actual_size_n_down,
-            size_k=moe_intermediate_size,
+            size_k=actual_size_k_down,
             is_k_full=True,
             use_atomic_add=True,
             use_fp32_reduce=True,
