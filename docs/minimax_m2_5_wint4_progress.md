@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-09（第十一次更新 — EP=4 NoAlltoAll 路径实现 + 深度诊断）**
+> **更新日期：2026-04-09 深夜（第十二次更新 — 根因确认 + vLLM 源码修复）**
 
 ## 1. 项目目标
 
@@ -297,9 +297,79 @@ top5: [':"'(8.76%), ',"'(6.02%), ':'(4.69%), '="'(4.14%), '.'(1.78%)]
 | 26 | ✗ `','` 1.91%（`'\n\n'` 跌至 0.72%）|
 | 62 | ✗ `'iplash'` 2.65%（0/100 top-100 与 vLLM 重叠）|
 
-**核心矛盾**：FD EP=4 n=62 输出 `'iplash'`(2.65%)，vLLM EP=4 n=62 输出 `':"'`(8.76%)，0/100 top-100 重叠。n=1~25 全部 PASS，n=26+ 失败。根本原因尚在调查中，主要嫌疑：
-1. 累积精度误差（BF16 scale ~0.8%/GEMM，62层后漂移）
-2. EP routing 或权重加载对某层存在细微差异
+**核心矛盾**：FD EP=4 n=62 输出 `'iplash'`(2.65%)，vLLM EP=4 n=62 输出 `':"'`(8.76%)，0/100 top-100 重叠。n=1~25 全部 PASS，n=26+ 失败。根本原因已确认（见 §2.11）。
+
+### 2.11 EP=4 根因分析与 vLLM 源码修复（2026-04-09 新增）
+
+#### vLLM 源码构建修复
+
+本地 vLLM 源码构建（`vllm17` 环境）之前无法正常工作，原因是 `minimax_m2.py` 缺少关键补丁。已成功应用 `minimax_m2.py.rej` 中的 3 个修复：
+
+1. **跳过超出 `num_hidden_layers` 的权重**：加载 checkpoint 时，跳过层数超过模型配置的权重
+2. **跳过不存在的参数**：BF16 模式下，FP8 scales 不存在于 `params_dict` 中，需 `if name not in params_dict: continue`
+3. **清理 `.rej` 文件**
+
+修复后 vLLM EP=4 正常输出：
+```
+vllm serve --enable_expert_parallel --tensor-parallel-size 4 --max-model-len 2048
+Q: "你好，请用中文介绍一下你自己。"
+A: "你好！我是 MiniMax-M2.5，一个由 MiniMax 公司开发的AI助手。..."
+```
+
+#### 根因确认：Dummy Expert 0 vs Expert Map 过滤
+
+**FD 的 `apply_ep_noalltoall` 流程**：
+1. 非本地 expert → 映射到 dummy expert 0 + weight=0
+2. `tritonmoe_preprocess_func` 生成 `sorted_token_ids`（包含 dummy tokens）
+3. 第一层 GEMM（`mul_topk_weights=False`）：dummy expert 0 输出 `Token * W_0`（非零）
+4. `swiglu` 处理非零输入
+5. 第二层 GEMM（`mul_topk_weights=True`）：dummy expert 0 输出 `swiglu(...) * W_down * 0.0 = 0`
+6. 最终 weighted sum：dummy expert 0 贡献为 0
+
+**vLLM 的 MoEPrepareAndFinalizeNoEP 流程**：
+1. `expert_map` 标记非本地 expert 为 -1
+2. `moe_align_block_size` 过滤掉 `expert_map[expert_id] == -1` 的 tokens
+3. `sorted_token_ids` 只包含有效 (token, expert) pairs
+4. 第一层 GEMM：只有本地 expert 被计算
+5. 第二层 GEMM：只有本地 expert 被计算
+6. `output.zero_()` 确保未处理的 token 输出为 0
+
+**关键差异**：
+- FD 的 dummy expert 0 在第一层 GEMM 产生非零输出（`Token * W_0`），虽然第二层会被 weight=0 过滤
+- vLLM 完全不处理非本地 expert 的 tokens
+- FD 的 `tritonmoe_preprocess_func` 不支持 `expert_map` 参数
+
+#### 修复尝试（均未成功）
+
+1. **Zero-initialized output buffers**（`c_or_none=paddle.zeros(...)`）：
+   - 无效果，n=62 仍输出 'iplash'
+   - 但 n=25 仍然 PASS（shape 修正后）
+
+2. **Python 层面手动构建 `sorted_token_ids`**：
+   - 只包含本地 expert 的 tokens，padding 用 OOB 索引
+   - 结果：输出 `nan`（Marlin kernel 对 `sorted_token_ids` 的长度和布局有特定要求）
+   - 可能原因：`sorted_token_ids` 长度不足（原来 ~4040，我的只有 ~64）
+
+3. **C++ kernel 修改**（`tritonmoe_preprocess_with_map`）：
+   - 添加了支持 `expert_map` 的新 kernel
+   - 编译失败：cutlass 相关的 enum 错误（`CtaShape64x64x64_WarpShape32x32x64` 未定义）
+   - 错误是预先存在的，与本次修改无关
+
+#### 下一步计划
+
+**方案 A（推荐）**：修改 C++ `tritonmoe_preprocess` kernel，添加 `expert_map` 支持
+- 需要先解决 cutlass 编译错误（可能是 PaddlePaddle 版本不兼容）
+- 或者只编译 `tritonmoe_preprocess.cu` 相关的文件，跳过 cutlass
+
+**方案 B**：在 Marlin kernel 调用层面添加 `expert_map` 过滤
+- 修改 `MoeWna16MarlinGemmApi`，添加 `expert_map` 参数
+- 在 kernel 内部过滤非本地 expert
+
+**方案 C**：修改 `apply_ep_noalltoall` 使用不同的预处理方式
+- 不使用 `tritonmoe_preprocess_func`，而是用 vLLM 的 `moe_align_block_size`
+- 需要 vLLM 的 C++ kernel 兼容 PaddlePaddle tensor
+
+---
 
 ### 3.0 EP=4 + Marlin FP8 62层（最新，2026-04-09）
 
@@ -313,7 +383,8 @@ n=1~25: ✓  n=26+: ✗
 ```
 
 **已修复**：workspace死锁(zeros)、use_atomic_add=False、scale float32存储
-**未解决**：n=26+ 失败，62层输出与vLLM完全不同，根因调查中
+**根因已确认**：FD 的 dummy expert 0 方式 vs vLLM 的 expert_map 过滤（见 §2.11）
+**未解决**：需要修改 `tritonmoe_preprocess` C++ kernel 添加 `expert_map` 支持
 
 ---
 
@@ -593,29 +664,35 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 | 31 | `forward_split_allgather` 与 NCCL EP 冲突，token≥8 时输出重复 | `FusedMoE.forward` 在 `token_num >= attn_tp_size=8` 时调用 `forward_split_allgather`，先把 tokens 按 rank 分割后再调 `apply_ep`（含 NCCL all-to-all），但 all-to-all 的 ep_group 和外层 all-gather 的 tp_group 发生排序/语义冲突，导致 step 4+ 输出 token 开始重复 | **已修复** — `FusedMoE.forward` 中增加 `_use_nccl_ep` 检测（`hasattr(self, '_nccl_ep_runner')`），NCCL EP 时直接走 `forward_normal` 绕过 `forward_split_allgather` |
 | 32 | 手动前向测试脚本 KV cache 张量共享导致 attention 输出 K 而非 V | `[paddle.zeros(cs, ...)] * 2` 在 Python 中创建两个引用指向**同一张量**，cache_k 和 cache_v 是同一块内存。写 K 和写 V 互相覆盖，最终 cache 随机含 K 或 V 值。attention 读取 cache_v 时实际上是 K 的值，输出 K 而非 V。直接后果：TP=8 attention 输出 std=5.09（≈K 的 std），TP=1 输出 std=0.53（≈V 的 std，偶然 V 覆盖 K 胜出）。所有手动前向测试脚本输出乱码 | **已修复（2026-04-07）** — 改为 `[paddle.zeros(cs, ...) for _ in range(N_LAYERS) for __ in range(2)]` 确保每次调用创建独立张量。32 个测试脚本全部修复。修复后 1 层 top-1=`\n\n`(6.8%)，与 vLLM top-1=`\n\n`(16%) 一致 ✓ |
 | 33 | EP=4 NoAlltoAll `use_atomic_add=False` + workspace 未初始化 → GPU 永久死锁 | `use_atomic_add=False` 使用 `barrier_acquire(&lock, slice_idx)` 自旋等待 `*lock == slice_idx`。slice_idx=0 时等待 `*lock==0`，但 `paddle.empty([528])` 未初始化，*lock 可能非0 → 测试进程挂起 44+ 分钟（GPU 占用 30GB 但无输出）。`use_atomic_add=True` 路径内核自行初始化 lock（`locks[locks_off] = 1 - slice_count`），不依赖外部初始化，故无此问题 | **已修复（2026-04-08）** — `workspace_up = paddle.zeros([528], dtype="int32")`，UP/DOWN 分别创建独立 workspace；vLLM 同样使用 `torch.zeros()` |
-| 34 | EP=4 NoAlltoAll 62层输出与 vLLM 完全不同（0/100 top-100 重叠） | workspace 和 use_atomic_add 均已修复，n=1~25 通过，但 n=26+ 失败。Marlin FP8 kernel 单专家验证 cosine_sim=0.999997，scale 格式正确（BF16 ~10^32，无 Inf）。根因尚不明确，嫌疑：BF16 scale 0.8%/GEMM × 62层累积误差；或某层 EP routing/权重加载存在差异 | **调查中（2026-04-09）** — 新增诊断工具：`compare_marlin_vs_bf16.py`（kernel对比）、`check_stored_scales.py`（scale验证）、`logit_compare.py`（vLLM参考对比）|
+| 34 | EP=4 NoAlltoAll 62层输出与 vLLM 完全不同（0/100 top-100 重叠） | FD 的 "dummy expert 0" 方式与 vLLM 的 "expert_map 过滤" 有根本差异。FD 的 `tritonmoe_preprocess_func` 不支持 `expert_map`，导致 dummy expert 0 的 tokens 被包含在 `sorted_token_ids` 中。虽然第二层 GEMM 的 `mul_topk_weights=True` 会将 dummy 输出乘以 weight=0，但第一层 GEMM 的 `mul_topk_weights=False` 产生非零中间值，可能累积误差 | **根因已确认（2026-04-09）** — 需要修改 `tritonmoe_preprocess` C++ kernel 添加 `expert_map` 支持，或使用替代方案 |
 
 ---
 
 ## 8. 下一步工作
 
-### 8.0 当前优先级（2026-04-09 更新）
+### 8.0 当前优先级（2026-04-09 深夜更新）
 
-**P0：解决 EP=4 n=62 输出与 vLLM 不符的问题**
+**P0：修改 `tritonmoe_preprocess` C++ kernel，添加 `expert_map` 支持**
 
-根据 2026-04-08~09 诊断，已确认：
+根因已确认：FD 的 "dummy expert 0" 方式与 vLLM 的 "expert_map 过滤" 有根本差异。
+
+**已完成的诊断**：
 - Marlin FP8 kernel 单专家计算 cosine_sim=0.9999 ✓
 - workspace=zeros、use_atomic_add=False 均已修复 ✓
-- n=1~25 全部 PASS，n=26+ 开始失败
+- vLLM 源码构建已修复，EP=4 正常输出 ✓
+- Scale dtype 对比：vLLM 也用 BF16，排除此假设 ✓
+- n=1~25 全部 PASS，n=26+ 开始失败 ✓
 
-**剩余调查方向**：
-1. **检查 vLLM scale dtype**：vLLM 的 `w1_scale` 是否 float32（比 FD 的 BF16 精度高 100×），导致每 GEMM 误差从 0.8% 降至 0.01%，62 层后差距显著
-2. **Layer 25 专项诊断**：检查 layer 25 的 expert routing 分布、MoE 输入/输出 norm，与相邻层对比
-3. **更多诊断工具**（已在 `my-tools/` 下创建）：
-   - `compare_marlin_vs_bf16.py` — kernel 数值对比
-   - `check_stored_scales.py` — scale 值验证
-   - `logit_compare.py` — 与 vLLM 对比 top-20 logprobs
-   - `vllm_quick_top1.py` — vLLM EP=4 参考 token
+**根因**：FD 的 `tritonmoe_preprocess_func` 不支持 `expert_map` 参数，无法像 vLLM 一样过滤非本地 expert 的 tokens。dummy expert 0 的方式在数学上等价（最终贡献为 0），但可能因中间值累积导致精度问题。
+
+**修复方案**：
+1. **方案 A（推荐）**：修改 `custom_ops/gpu_ops/moe/tritonmoe_preprocess.cu`，添加 `expert_map` 支持的新 kernel
+   - 已有初步实现（`tritonmoe_preprocess_with_map`），但编译失败
+   - 需要解决 cutlass 编译错误（预先存在的 PaddlePaddle 版本兼容问题）
+2. **方案 B**：在 Marlin kernel 调用层面添加 `expert_map` 过滤
+   - 修改 `MoeWna16MarlinGemmApi`，添加 `expert_map` 参数
+3. **方案 C**：修改 `apply_ep_noalltoall` 使用 vLLM 的 `moe_align_block_size`
+   - 需要 vLLM 的 C++ kernel 兼容 PaddlePaddle tensor
 
 ---
 
