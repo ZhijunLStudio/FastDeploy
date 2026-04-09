@@ -27,7 +27,10 @@ def decide_module():
 
     # Use paddle.device.get_device_properties() instead of paddle.device.cuda.get_device_properties()
     # to support all hardware platforms (NVIDIA, ILUVATAR, HPU, etc.)
-    prop = paddle.device.get_device_properties()
+    try:
+        prop = paddle.device.get_device_properties()
+    except AttributeError:
+        prop = paddle.device.cuda.get_device_properties()
     sm_version = prop.major * 10 + prop.minor
     print(f"current sm_version={sm_version}")
 

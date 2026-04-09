@@ -758,6 +758,9 @@ class ParallelConfig:
             )
         )
         dist.collective._set_custom_gid(None)
+        # Set TP rank from global rank
+        import paddle as _paddle
+        self.tensor_parallel_rank = _paddle.distributed.get_rank() % self.tensor_parallel_size
         # same ep group id
         if self.enable_expert_parallel:
             dist.collective._set_custom_gid(self.data_parallel_size + tp_gid_offset)

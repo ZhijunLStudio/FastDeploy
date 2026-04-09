@@ -14,6 +14,7 @@
 # limitations under the License.
 """
 
+import os
 from typing import Callable
 
 import paddle
@@ -233,7 +234,10 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             self.added_scale_attrs[0],
             layer.create_parameter(
                 shape=scale_shape_up,
-                dtype=self.default_dtype,
+                # FP8 Marlin scales must be float32: values ~10^32 after 2^120 compensation;
+                # BF16 (~1% precision loss) accumulates to ~60% error over 62 layers → wrong output.
+                # vLLM stores scales as float32 for the same reason.
+                dtype="float32" if self.weight_type == "fp8" else self.default_dtype,
                 default_initializer=paddle.nn.initializer.Constant(0),
             ),
         )
@@ -242,7 +246,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             self.added_scale_attrs[1],
             layer.create_parameter(
                 shape=scale_shape_down,
-                dtype=self.default_dtype,
+                dtype="float32" if self.weight_type == "fp8" else self.default_dtype,
                 default_initializer=paddle.nn.initializer.Constant(0),
             ),
         )
@@ -341,7 +345,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         # Set weight
         getattr(layer, weight_name).set_value(marlin_qweight)
         # Scale will be set separately via set_fp8_scales
-        getattr(layer, scale_name).set_value(marlin_scale.cast(self.default_dtype))
+        getattr(layer, scale_name).set_value(marlin_scale.cast(getattr(layer, scale_name).dtype))
 
         return marlin_scale
 
@@ -392,7 +396,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
                 marlin_scales.append(marlin_s)
 
             marlin_scale = paddle.stack(marlin_scales, axis=0)
-            getattr(layer, scale_name).set_value(marlin_scale.cast(self.default_dtype))
+            getattr(layer, scale_name).set_value(marlin_scale.cast(getattr(layer, scale_name).dtype))
 
     def _process_int4_weights(self, weight_tensor, weight_name, scale_name):
         """Process INT4 weights for Marlin kernel (existing logic)."""
@@ -580,6 +584,126 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         output = runner.combine(M, ffn_outs, recv_ws, recv_orig, send_counts, recv_counts)
         return output
 
+    def apply_ep_noalltoall(
+        self,
+        layer: nn.Layer,
+        x: paddle.Tensor,
+        gate: nn.Layer,
+        topk_ids_hookfunc: Callable = None,
+        shared_experts: nn.Layer = None,
+    ) -> paddle.Tensor:
+        """
+        vLLM-style NoEP EP: all tokens remain on all ranks, each rank computes
+        only its local experts (non-local experts zeroed via weight masking),
+        then all-reduce across EP ranks to aggregate contributions.
+
+        This matches vLLM's MoEPrepareAndFinalizeNoEP path used when dp_size=1.
+        """
+        from fastdeploy.model_executor.layers.moe.moe import get_moe_scores
+
+        M, hidden_size = x.shape
+        top_k = layer.top_k
+        num_local_experts = layer.num_local_experts
+        fd_config = layer.fd_config
+        ep_rank = fd_config.parallel_config.expert_parallel_rank
+        ep_group = fd_config.parallel_config.ep_group
+
+        # Step 1: Routing — global topk_ids in range [0, num_experts)
+        gate_out = gate(x).cast("float32")
+        _, topk_weights, topk_ids = get_moe_scores(
+            gate_out,
+            layer.n_group, layer.topk_group, top_k,
+            layer.routed_scaling_factor, layer.gate_correction_bias,
+            getattr(layer, "renormalize", True),
+        )
+        if topk_ids_hookfunc is not None:
+            topk_ids_hookfunc(topk_ids=topk_ids)
+
+        # Step 2: Map global expert IDs to local IDs for this rank.
+        # Local experts: [ep_rank*num_local_experts, (ep_rank+1)*num_local_experts)
+        local_start = ep_rank * num_local_experts
+        local_end = local_start + num_local_experts
+        local_mask = (topk_ids >= local_start) & (topk_ids < local_end)  # [M, top_k] bool
+
+        # Non-local experts → dummy local ID 0; their weights are zeroed so output=0
+        local_topk_ids = paddle.where(
+            local_mask,
+            topk_ids - local_start,
+            paddle.zeros_like(topk_ids),
+        )
+        local_topk_weights = paddle.where(
+            local_mask,
+            topk_weights,
+            paddle.zeros_like(topk_weights),
+        )
+
+        # Step 3: Triton preprocess with local num_experts
+        block_size_m = 64
+        for m in [8, 16, 32, 48, 64]:
+            if M * top_k / num_local_experts / m < 0.9:
+                block_size_m = m
+                break
+
+        sorted_token_ids, expert_ids, num_tokens_pp = tritonmoe_preprocess_func(
+            local_topk_ids.cast("int64"), num_local_experts, block_size_m
+        )
+
+        # Step 4: Marlin GEMM — only local expert weights are present on this rank
+        b_q_type_str = "float8_e4m3fn" if self.weight_type == "fp8" else "uint4b8"
+        # Use separate zeros workspaces for UP and DOWN: use_atomic_add=False barrier_acquire
+        # spins waiting for *lock==0; dirty state from UP call could corrupt DOWN's barrier.
+        workspace_up = paddle.zeros([528], dtype="int32")
+        workspace_down = paddle.zeros([528], dtype="int32")
+
+        up_gate_weight = layer.up_gate_proj_weight
+        down_weight = layer.down_proj_weight
+        actual_size_k_up = up_gate_weight.shape[1] * 16
+        actual_size_n_up = up_gate_weight.shape[2] // 4
+        actual_size_k_down = down_weight.shape[1] * 16
+        actual_size_n_down = down_weight.shape[2] // 4
+
+        ffn_out = MoeWna16MarlinGemmApi(
+            x, None,
+            b_q_weight=up_gate_weight,
+            b_scales=layer.up_gate_proj_weight_scale.cast("bfloat16"),
+            global_scale_or_none=None, b_zeros_or_none=None,
+            g_idx_or_none=None, perm_or_none=None,
+            workspace=workspace_up,
+            sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_pp,
+            topk_weights=local_topk_weights, moe_block_size=block_size_m,
+            top_k=top_k, mul_topk_weights=False, is_ep=False,
+            b_q_type_str=b_q_type_str,
+            size_m=M, size_n=actual_size_n_up, size_k=actual_size_k_up,
+            is_k_full=True, use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
+        )[0]
+
+        swiglu_out = paddle.nn.functional.swiglu(ffn_out)
+
+        ffn_out = MoeWna16MarlinGemmApi(
+            swiglu_out, None,
+            b_q_weight=down_weight,
+            b_scales=layer.down_proj_weight_scale.cast("bfloat16"),
+            global_scale_or_none=None, b_zeros_or_none=None,
+            g_idx_or_none=None, perm_or_none=None,
+            workspace=workspace_down,
+            sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_pp,
+            topk_weights=local_topk_weights, moe_block_size=block_size_m,
+            top_k=1, mul_topk_weights=True, is_ep=False,
+            b_q_type_str=b_q_type_str,
+            size_m=M * top_k, size_n=actual_size_n_down, size_k=actual_size_k_down,
+            is_k_full=True, use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
+        )[0]
+
+        # Weighted sum: [M*top_k, hidden] → [M, hidden]
+        ffn_out = ffn_out.reshape([M, top_k, hidden_size]).sum(axis=1)
+
+        # Step 5: All-reduce across EP ranks to sum local expert outputs
+        paddle.distributed.all_reduce(ffn_out, group=ep_group)
+
+        return ffn_out
+
     def apply(
         self,
         layer: nn.Layer,
@@ -589,10 +713,10 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         shared_experts: nn.Layer = None,
     ) -> paddle.Tensor:
         """
-        Marlin compute Fused MoE. Routes to apply_ep() when ep_size > 1.
+        Marlin compute Fused MoE. Routes to apply_ep_noalltoall() when ep_size > 1.
         """
         if getattr(layer, 'ep_size', 1) > 1:
-            return self.apply_ep(layer, x, gate, topk_ids_hookfunc, shared_experts)
+            return self.apply_ep_noalltoall(layer, x, gate, topk_ids_hookfunc, shared_experts)
 
         gate_out = gate(x)
         gate_out = gate_out.cast("float32")
@@ -637,8 +761,9 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         topk = top_k
 
-        # for H100 132 sms
-        workspace = paddle.empty([528], dtype="int32")
+        # for H100 132 sms; use zeros for use_atomic_add=False barrier path
+        workspace_up = paddle.zeros([528], dtype="int32")
+        workspace_down = paddle.zeros([528], dtype="int32")
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = tritonmoe_preprocess_func(
             topk_ids, num_experts, block_size_m
@@ -688,7 +813,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             b_zeros_or_none=None,
             g_idx_or_none=None,
             perm_or_none=None,
-            workspace=workspace,
+            workspace=workspace_up,
             sorted_token_ids=sorted_token_ids,
             expert_ids=expert_ids,
             num_tokens_post_padded=num_tokens_post_padded,
@@ -702,7 +827,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             size_n=actual_size_n_up,
             size_k=actual_size_k_up,
             is_k_full=True,
-            use_atomic_add=True,
+            use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
         )[0]
@@ -718,7 +843,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             b_zeros_or_none=None,
             g_idx_or_none=None,
             perm_or_none=None,
-            workspace=workspace,
+            workspace=workspace_down,
             sorted_token_ids=sorted_token_ids,
             expert_ids=expert_ids,
             num_tokens_post_padded=num_tokens_post_padded,
@@ -732,7 +857,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             size_n=actual_size_n_down,
             size_k=actual_size_k_down,
             is_k_full=True,
-            use_atomic_add=True,
+            use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
         )[0]

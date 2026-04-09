@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-06（第九次更新 — EP=8 + Marlin FP8 Scale修复，62层输出语义正确，内存 27.4 GB/卡）**
+> **更新日期：2026-04-09（第十一次更新 — EP=4 NoAlltoAll 路径实现 + 深度诊断）**
 
 ## 1. 项目目标
 
@@ -185,12 +185,158 @@ text:   '-station تحسين浙江省liquidLECTIONored历练...'
 - 对比 vLLM 逐层 hidden state 验证精度
 - 优化 forward_normal 的 EP 效率（避免8倍冗余计算）
 
+### 2.9 KV Cache 共享 Bug 修复（2026-04-07 新增）
+
+**根因**：所有手动前向测试脚本中构建 KV cache 时使用了：
+```python
+# ❌ 错误：[tensor] * 2 创建两个引用指向同一张量
+caches = [p for _ in range(N_LAYERS) for p in [paddle.zeros(cs, dtype=...)] * 2]
+```
+Python 的 `[obj] * 2` 不会复制对象，只创建两个指向同一内存的引用。因此 `cache_k` 和 `cache_v` 是同一块内存：
+- 写 K 时：`cache_k[token_pos] = K_value` → 实际写入该地址
+- 写 V 时：`cache_v[token_pos] = V_value` → 写入**同一地址**，覆盖了 K
+- 读 K 时：读出的是 V 的值
+- 读 V 时：读出的是 V 的值（但 attention 会用错误的 K 计算 softmax）
+
+**修复**：
+```python
+# ✅ 正确：每次调用 paddle.zeros() 创建独立张量
+caches = [paddle.zeros(cs, dtype=...) for _ in range(N_LAYERS) for __ in range(2)]
+```
+
+**影响范围**：32 个测试脚本全部修复（`my-tools/` 目录下所有手动前向测试脚本）
+
+**验证结果**（修复后）：
+```
+# 1层 TP=8 EP=8 FP8
+Q: 'Hello'  top5: [('\n\n', 6.8%), ('\n', 1.3%), (' ', 0.56%), ...]  ✓ 与 vLLM top-1 一致
+
+# vLLM 1层 参考
+Q: 'Hello'  top1: '\n\n' (16.0%)
+
+# 1层对齐 ✓  62层仍乱码（需继续调试）
+```
+
+**注意**：这是测试基础设施的 bug，**不影响 FD 框架代码本身**（`FastDeploy/fastdeploy/` 目录无需修改）。
+
 ---
 
+### 2.10 EP=4 NoAlltoAll 路径实现与深度诊断（2026-04-08~09 新增）
 
-## 3. 当前验证状态
+**背景**：将 EP 从 TP=8/EP=8 调整为 4 卡 EP=4（每卡 64 experts），切换到更简单的 NoAlltoAll EP 策略（vLLM 风格），避免 NCCL alltoall 的开销和 TP 冲突问题。
 
-### 3.1 TP=1 验证（已通过）
+#### 关键修复
+
+**1. apply_ep_noalltoall() 实现**
+
+在 `fused_moe_marlin_backend.py` 中新增 EP NoAlltoAll 计算路径：
+- 所有 rank 共享同一份输入 x（RowParallelLinear all-reduce 保证一致性）
+- 路由选 top-k 后，非本地 expert 的 slot 替换为 dummy expert 0 + weight=0
+- 本地 expert 正常计算，非本地输出为 0（weight=0 保证）
+- `paddle.distributed.all_reduce(ffn_out, group=ep_group)` 汇总各 rank 贡献
+
+**2. workspace 死锁修复**（关键 Bug）
+
+```python
+# ❌ 错误：use_atomic_add=False 时 barrier_acquire 自旋等待 *lock==0
+#          paddle.empty([528]) 未初始化，*lock 可能非0 → GPU 永久死锁（44分钟挂起）
+workspace = paddle.empty([528], dtype="int32")
+
+# ✅ 正确：barrier_acquire 依赖 locks 初始为 0
+workspace_up = paddle.zeros([528], dtype="int32")
+workspace_down = paddle.zeros([528], dtype="int32")
+```
+
+**根因**：`use_atomic_add=False` + `use_fp32_reduce=True` 的 K-split 同步路径通过 `barrier_acquire(&lock, slice_idx)` 自旋等待 `*lock == slice_idx`。slice_idx=0 时等待 `*lock==0`，若 workspace 未初始化则永远无法满足 → 死锁。vLLM 正确使用 `torch.zeros()` 创建 workspace（见 `marlin_utils.py::marlin_make_workspace_new`）。
+
+**3. use_atomic_add 修复**
+
+```python
+# 改为与 vLLM 一致的 use_atomic_add=False（FP32 K-split 累加，精度更高）
+is_k_full=True, use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
+```
+
+**4. Scale dtype 修复（float32 存储）**
+
+```python
+# FP8 scale 改为 float32 存储（值为 ~10^32，BF16 虽不溢出但有精度损失）
+dtype="float32" if self.weight_type == "fp8" else self.default_dtype,
+# 传入 kernel 前 cast 到 bfloat16（kernel 要求 BF16）
+b_scales=layer.up_gate_proj_weight_scale.cast("bfloat16"),
+```
+
+#### 深度诊断发现
+
+**Marlin FP8 kernel 计算正确性验证**（`compare_marlin_vs_bf16.py`）：
+```
+单专家 cosine_sim = 0.999997，mean_rel_error = 0.81% ✓
+```
+Marlin FP8 kernel 本身计算正确，误差来自 FP8 weight 量化（3 bit mantissa，正常）。
+
+**Scale 实际值**（非 Inf）：
+```
+scale dtype: bfloat16，shape: [64, 24, 3072]
+min=1.89e+32, max=1.45e+33（has_inf=False）
+注：norm()=inf 是 (10^32)^2=10^64 超出 float32 范围，不代表值本身为 Inf
+```
+
+**vLLM EP=4 参考输出**（4×A800，EP=4）：
+```
+prompt="Hello" → top-1=':"' (8.76%)
+top5: [':"'(8.76%), ',"'(6.02%), ':'(4.69%), '="'(4.14%), '.'(1.78%)]
+```
+
+**二分搜索结果**（新版 apply_ep_noalltoall）：
+| n_layers | 结果 |
+|---------|------|
+| 1 | ✓ `'\n\n'` 20.73% |
+| 5 | ✓ `'\n\n'` 14.23% |
+| 10 | ✓ `'\n\n'` 5.28% |
+| 20 | ✓ `'\n\n'` 1.97% |
+| 25 | ✓ `'\n\n'` 2.02% |
+| 26 | ✗ `','` 1.91%（`'\n\n'` 跌至 0.72%）|
+| 62 | ✗ `'iplash'` 2.65%（0/100 top-100 与 vLLM 重叠）|
+
+**核心矛盾**：FD EP=4 n=62 输出 `'iplash'`(2.65%)，vLLM EP=4 n=62 输出 `':"'`(8.76%)，0/100 top-100 重叠。n=1~25 全部 PASS，n=26+ 失败。根本原因尚在调查中，主要嫌疑：
+1. 累积精度误差（BF16 scale ~0.8%/GEMM，62层后漂移）
+2. EP routing 或权重加载对某层存在细微差异
+
+### 3.0 EP=4 + Marlin FP8 62层（最新，2026-04-09）
+
+```
+# EP=4, 4×A800, prompt="Hello"
+FD EP=4:      top-1='iplash' (2.65%)  ✗
+vLLM EP=4:    top-1=':"'     (8.76%)  ✓（0/100 top-100 重叠）
+
+# 二分搜索
+n=1~25: ✓  n=26+: ✗
+```
+
+**已修复**：workspace死锁(zeros)、use_atomic_add=False、scale float32存储
+**未解决**：n=26+ 失败，62层输出与vLLM完全不同，根因调查中
+
+---
+
+### 3.1 EP=8 + Marlin FP8 62层（历史状态，2026-04-07）
+
+**KV cache 修复后（2026-04-07）**：
+```
+# 1层对比
+FD TP=8 EP=8 FP8:  top-1 = '\n\n' (6.8%)  ✓ 与 vLLM top-1 = '\n\n' (16%) 一致
+Marlin FP8 GEMM:   cos_sim = 0.999987  ✓ 数值正确
+
+# 62层仍然乱码（需继续排查）
+Q: '你好，你是谁？'  FD: ' padr calmly製造...'  vLLM: '"我是......那声音顿了顿...'
+Q: '1 + 1 ='         FD: ' Mohan下取り...'      vLLM: ' 2\n- 2 + 1 = 3...'
+token match: 0/20 (0.0%)
+```
+
+**关键诊断结论**：
+- Marlin FP8 GEMM 数值正确（cos_sim=0.9999 ✓）
+- 1层 attention 对齐（KV cache 修复后）✓
+- 62层分叉点在 1-5 层之间，可能原因：FP8 精度累积 + EP 多层非确定性
+
+
 
 **FP8 模式 - 3 层模型**：
 ```
@@ -445,12 +591,35 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 | 29 | 62层EP+Marlin 输出不是正确中文（第一阶段） | routing topk_ids 已验证，但 Marlin FP8 scale 格式错误：`dequant_skip_flop=true` 使 FP8→BF16 原始位移不校正 exponent bias，输出值 ~2^(-120) × 正确值，实际为零 | **已修复** — `_process_fp8_marlin_weights` 中 scale × 2^120（BF16 exponent bias offset），见下条 |
 | 30 | Marlin FP8 kernel `dequant_skip_flop=true` 导致 scale 需预乘 2^120 | `moe_wna16_marlin_gemm.cu` 中 FP8 类型的 `dequant_skip_flop = !is_int_type = true`，采用原始位移（无 exponent bias 校正），输出 = fp8_val × 2^(-120)。scale 必须乘以 2^120 才能补偿。公式：`BIAS_OFFSET = (1<<(BF16_EXP-1)) - (1<<(FP8_EXP-1)) = 128-8 = 120` | **已修复** — `_process_fp8_marlin_weights()` 中：`s_expanded = s_expanded × 2^120` 后再做 `_marlin_permute_scales` |
 | 31 | `forward_split_allgather` 与 NCCL EP 冲突，token≥8 时输出重复 | `FusedMoE.forward` 在 `token_num >= attn_tp_size=8` 时调用 `forward_split_allgather`，先把 tokens 按 rank 分割后再调 `apply_ep`（含 NCCL all-to-all），但 all-to-all 的 ep_group 和外层 all-gather 的 tp_group 发生排序/语义冲突，导致 step 4+ 输出 token 开始重复 | **已修复** — `FusedMoE.forward` 中增加 `_use_nccl_ep` 检测（`hasattr(self, '_nccl_ep_runner')`），NCCL EP 时直接走 `forward_normal` 绕过 `forward_split_allgather` |
+| 32 | 手动前向测试脚本 KV cache 张量共享导致 attention 输出 K 而非 V | `[paddle.zeros(cs, ...)] * 2` 在 Python 中创建两个引用指向**同一张量**，cache_k 和 cache_v 是同一块内存。写 K 和写 V 互相覆盖，最终 cache 随机含 K 或 V 值。attention 读取 cache_v 时实际上是 K 的值，输出 K 而非 V。直接后果：TP=8 attention 输出 std=5.09（≈K 的 std），TP=1 输出 std=0.53（≈V 的 std，偶然 V 覆盖 K 胜出）。所有手动前向测试脚本输出乱码 | **已修复（2026-04-07）** — 改为 `[paddle.zeros(cs, ...) for _ in range(N_LAYERS) for __ in range(2)]` 确保每次调用创建独立张量。32 个测试脚本全部修复。修复后 1 层 top-1=`\n\n`(6.8%)，与 vLLM top-1=`\n\n`(16%) 一致 ✓ |
+| 33 | EP=4 NoAlltoAll `use_atomic_add=False` + workspace 未初始化 → GPU 永久死锁 | `use_atomic_add=False` 使用 `barrier_acquire(&lock, slice_idx)` 自旋等待 `*lock == slice_idx`。slice_idx=0 时等待 `*lock==0`，但 `paddle.empty([528])` 未初始化，*lock 可能非0 → 测试进程挂起 44+ 分钟（GPU 占用 30GB 但无输出）。`use_atomic_add=True` 路径内核自行初始化 lock（`locks[locks_off] = 1 - slice_count`），不依赖外部初始化，故无此问题 | **已修复（2026-04-08）** — `workspace_up = paddle.zeros([528], dtype="int32")`，UP/DOWN 分别创建独立 workspace；vLLM 同样使用 `torch.zeros()` |
+| 34 | EP=4 NoAlltoAll 62层输出与 vLLM 完全不同（0/100 top-100 重叠） | workspace 和 use_atomic_add 均已修复，n=1~25 通过，但 n=26+ 失败。Marlin FP8 kernel 单专家验证 cosine_sim=0.999997，scale 格式正确（BF16 ~10^32，无 Inf）。根因尚不明确，嫌疑：BF16 scale 0.8%/GEMM × 62层累积误差；或某层 EP routing/权重加载存在差异 | **调查中（2026-04-09）** — 新增诊断工具：`compare_marlin_vs_bf16.py`（kernel对比）、`check_stored_scales.py`（scale验证）、`logit_compare.py`（vLLM参考对比）|
 
 ---
 
 ## 8. 下一步工作
 
-### 8.1 目标：Marlin FP8 + EP=8 实现（对齐 vLLM）
+### 8.0 当前优先级（2026-04-09 更新）
+
+**P0：解决 EP=4 n=62 输出与 vLLM 不符的问题**
+
+根据 2026-04-08~09 诊断，已确认：
+- Marlin FP8 kernel 单专家计算 cosine_sim=0.9999 ✓
+- workspace=zeros、use_atomic_add=False 均已修复 ✓
+- n=1~25 全部 PASS，n=26+ 开始失败
+
+**剩余调查方向**：
+1. **检查 vLLM scale dtype**：vLLM 的 `w1_scale` 是否 float32（比 FD 的 BF16 精度高 100×），导致每 GEMM 误差从 0.8% 降至 0.01%，62 层后差距显著
+2. **Layer 25 专项诊断**：检查 layer 25 的 expert routing 分布、MoE 输入/输出 norm，与相邻层对比
+3. **更多诊断工具**（已在 `my-tools/` 下创建）：
+   - `compare_marlin_vs_bf16.py` — kernel 数值对比
+   - `check_stored_scales.py` — scale 值验证
+   - `logit_compare.py` — 与 vLLM 对比 top-20 logprobs
+   - `vllm_quick_top1.py` — vLLM EP=4 参考 token
+
+---
+
+### 8.1 目标：Marlin FP8 + EP=8 实现（对齐 vLLM，历史）
 
 **目标**：在 FD 中复现 vLLM 的 `--enable_expert_parallel --tensor-parallel-size 8` 模式，使 62 层全量模型在 8×A800 上输出正确中文 token。
 
@@ -738,17 +907,50 @@ FD_WINT4_QUANTIZE=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,
 CUDA_VISIBLE_DEVICES=0 python my-tools/test_wint4_sm80_unit.py
 ```
 
-### 9.4 FP8 Marlin TP=8 推理（已验证通过，3 层）
+### 9.4 FP8 Marlin EP=8 推理（主要测试路径）
 ```bash
-# FP8 Marlin 模式，3 层（所有 8 个 rank 通过）
-FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 my-tools/test_tp8_marlin.py --n_layers 3
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate paddle
 
-# FP8 Marlin 调试（per-rank stderr 日志到 /tmp/marlin_debug_rank{}.log）
-FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 my-tools/test_marlin_debug.py
+# 62 层全量（标准测试）
+FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 \
+    my-tools/test_tp8_manual_forward.py --mode fp8 --n_layers 62 --n_tokens 20
 
-# 62 层（当前 OOM，待解决内存问题）
-FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 my-tools/test_tp8_marlin.py --n_layers 62
+# 中文 prompt 对比（需先运行 vLLM 获取参考结果）
+FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 \
+    my-tools/run_fd_chinese_compare.py --n_layers 62 --n_tokens 20
+
+# 1层精度验证（验证 KV cache 修复）
+FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 \
+    my-tools/nexttoken_compare.py --backend fd --n_layers 1
 ```
+
+### 9.5 vLLM 参考输出
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate vllm17
+
+# vLLM 62 层中文对比
+SAFETENSORS_FAST_GPU=1 python my-tools/run_vllm_chinese_compare.py --n_tokens 20
+
+# vLLM 1层对比（参考）
+python my-tools/nexttoken_compare.py --backend vllm --n_layers 1
+```
+
+### 9.6 精度诊断工具
+```bash
+# Marlin GEMM 数值验证（单专家，cos_sim 应≥0.999）
+FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 \
+    my-tools/test_marlin_numerical.py
+
+# FD vs vLLM top5 对比（62层）
+FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 \
+    my-tools/compare_top5.py --backend fd
+python my-tools/compare_top5.py --backend compare
+
+# 逐层 hidden state 诊断
+FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 \
+    my-tools/layerwise_diag.py --backend fd --n_layers 5
+```
+
 
 ---
 
