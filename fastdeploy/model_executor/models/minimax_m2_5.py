@@ -148,12 +148,12 @@ def _process_fp8_marlin_weights(moe_layer, up_gate_fp8, up_gate_scale,
                 [s.shape[0], n_blocks_n, block_size]
             ).reshape([s.shape[0], n_blocks_n * block_size])
             s_expanded = s_expanded[:, :N]
-            # Marlin FP8 kernel uses dequant<true> which gives raw BF16 bit-shifted
-            # values (factor 2^(-120) smaller than actual FP8 value for BF16 compute).
-            # Compensate by multiplying scales by 2^120 = 2^(BF16_bias - FP8_bias).
-            # BIAS_OFFSET = (1<<(8-1)) - (1<<(4-1)) = 128 - 8 = 120
-            s_expanded = s_expanded.cast("float32") * (2.0 ** 120)
+            # 1. First permute scales for Marlin layout (match vLLM order)
             marlin_s = _marlin_permute_scales(s_expanded.cast(s.dtype), K, N, group_size)
+            # 2. Then apply 2^120 exponent bias (vLLM does bias AFTER permute_scales)
+            # BIAS_OFFSET = (1<<(8-1)) - (1<<(4-1)) = 128 - 8 = 120
+            marlin_s = marlin_s.cast("float32") * (2.0 ** 120)
+            marlin_s = marlin_s.cast(s.dtype)
             marlin_scales.append(marlin_s)
 
         marlin_qweight = paddle.stack(marlin_qweights, axis=0).contiguous()
