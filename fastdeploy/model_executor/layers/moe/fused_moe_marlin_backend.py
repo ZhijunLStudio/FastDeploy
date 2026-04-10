@@ -768,10 +768,11 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         import os, numpy as np
         DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+        li = getattr(layer, 'layer_idx', 0)
         if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_topk_ids.npy", topk_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_topk_weights.npy", topk_weights.cast("float32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_gate_out.npy", gate_out.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_topk_ids.npy", topk_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_topk_weights.npy", topk_weights.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_gate_out.npy", gate_out.cast("float32").numpy())
 
         block_size_m = 64
 
@@ -791,8 +792,8 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         )
 
         if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_expert_ids.npy", expert_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_expert_ids.npy", expert_ids.cast("int32").numpy())
 
         # Determine b_q_type_str based on weight type
         if self.weight_type == "fp8":
@@ -833,16 +834,16 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         DUMP_DIR = os.environ.get("FD_DUMP_DIR")
 
         if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_expert_ids.npy", expert_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_expert_ids.npy", expert_ids.cast("int32").numpy())
             # Dump first token's Marlin weight packed format sample
             # up_gate_weight: [E, K//16, N*4] for FP8
             up_w = layer.up_gate_proj_weight
-            np.save(f"{DUMP_DIR}/fd_moe_up_gate_weight_e0.npy",
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_up_gate_weight_e0.npy",
                     up_w[0].cast("int32").numpy())  # expert 0's packed weight
             # Dump scales
             up_sc = layer.up_gate_proj_weight_scale.cast("bfloat16")
-            np.save(f"{DUMP_DIR}/fd_moe_up_gate_scale_e0.npy",
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_up_gate_scale_e0.npy",
                     up_sc[0].cast("float32").numpy())  # expert 0's scale
 
         ffn_out = MoeWna16MarlinGemmApi(
@@ -876,8 +877,8 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         swiglu_out = paddle.nn.functional.swiglu(ffn_out)
 
         if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_up_gate.npy", ffn_out.cast("float32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_swiglu.npy", swiglu_out.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_up_gate.npy", ffn_out.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_swiglu.npy", swiglu_out.cast("float32").numpy())
 
         ffn_out = MoeWna16MarlinGemmApi(
             swiglu_out,
@@ -908,7 +909,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         )[0]
 
         if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_down.npy", ffn_out.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_l{li}_down.npy", ffn_out.cast("float32").numpy())
 
         ffn_out.reshape_([token_num, -1, hidden_size])
         ffn_out = ffn_out.sum(axis=1)

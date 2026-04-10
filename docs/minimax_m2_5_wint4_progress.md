@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-10（第十四次更新 — 单卡逐层细粒度精度对齐 + Marlin kernel 验证 + EP=4 验证）**
+> **更新日期：2026-04-10（第十五次更新 — 单卡 Marlin FP8 MoE 精度对齐：发现 scale permutation 差异）**
 
 > **⚠️ 重要原则：修改代码必须考虑兼容性，不能影响其他模型的正常运行。**
 
@@ -1189,7 +1189,73 @@ FD_MARLIN_FP8=1 python -m paddle.distributed.launch --devices 0,1,2,3,4,5,6,7 \
 
 ---
 
-## 10. 环境信息
+## 10. 单卡 Marlin FP8 MoE 精度对齐（2026-04-10 新增）
+
+### 10.1 测试方法
+
+单卡 TP=1，3 层模型，跳过 attention — 向 FD 和 vLLM 的 MoE 层输入相同的 hidden states（`np.random.seed(42)` 生成），对比 gate output 和 MoE 子步骤输出。
+
+**工具脚本**: `my-tools/test_moe_align.py`
+```bash
+# FD 端 (GPU 5)
+CUDA_VISIBLE_DEVICES=5 python my-tools/test_moe_align.py --backend fd
+
+# vLLM 端 (GPU 6)
+CUDA_VISIBLE_DEVICES=6 python my-tools/test_moe_align.py --backend vllm
+
+# 对比
+python my-tools/test_moe_align.py --backend compare
+```
+
+### 10.2 测试结果
+
+```
+============================================================
+MoE Kernel Comparison: FD vs vLLM (layer 0)
+============================================================
+  Gate output                    FD=(5, 256) vLLM=(5, 256) cos_mean=1.000000 [OK]
+  MoE output (final)             FD=(5, 3072) vLLM=(5, 3072) cos_mean=0.000000 [FAIL]
+  1st GEMM (up_gate)             FD=(40, 3072) vLLM=(40, 3072) cos_mean=0.000000 [FAIL]
+    vLLM: mean=nan (all NaN due to wrong scales)
+  SwiGLU                         FD=(40, 1536) vLLM=(40, 1536) cos_mean=0.000000 [FAIL]
+  2nd GEMM (down)                FD=(40, 3072) vLLM=(40, 3072) cos_mean=0.000000 [FAIL]
+  sorted_token_ids               FD=(1832,) vLLM=(320,) match=False (FD has extra padding)
+  expert_ids                     FD=(229,) vLLM=(40,) match=False (same reason)
+  TopK weights: FD=(5, 8) vLLM=(5, 8) match=True
+  TopK IDs (pre-align): match=True (identical routing decisions)
+```
+
+### 10.3 关键发现
+
+#### Gate routing 完全对齐
+- cos_mean = **1.000000**, max_diff = 1.78e-7
+- 给定相同输入，FD 和 vLLM 的 gate 输出完全一致
+- 证明 attention、layer norm、gate 全部正确
+
+#### Marlin packed weights 完全一致
+- Expert 0 的 int32 packed weights 完全匹配 (max_diff=0)
+- FD 和 vLLM 的 weight packing 逻辑一致
+
+#### Scales 是发散点（根因）
+- **88.9% 的 scale 元素不同**（值接近但不完全相等）
+- 两者都应用 `2^120` exponent bias，但 **处理顺序不同**：
+  - **FD** (`minimax_m2_5.py:155`): 先 `2^120` bias → 再 `_marlin_permute_scales`
+  - **vLLM** (`marlin_utils_fp8.py:317`): 先 `marlin_permute_scales` → 再 `2^120` bias
+- 错误的 scales 导致 vLLM MoE 输出 NaN
+
+### 10.4 vLLM 侧修复
+
+**`marlin_utils_fp8.py`**: `fp8_fused_exponent_bias_into_scales()` 添加 `float32` dtype 支持（原只支持 `half` 和 `bfloat16`，但 vLLM 的 scale 参数 dtype 为 `float32`，导致 `target_exponent` 未赋值）。
+
+### 10.5 下一步
+
+1. **修复 scale permutation 顺序不一致** — 统一 FD 和 vLLM 的 scale 处理流程
+2. 单卡 MoE 对齐后 → 3 层全路径对比 → 62 层验证
+3. EP=4 问题在单卡 MoE 对齐后再处理
+
+---
+
+## 11. 环境信息
 
 - **GPU**: 8 × A100 80GB (SM 8.0)
 - **FD 环境**: conda activate `paddle` (Python 3.10, PaddlePaddle 3.3.0)
