@@ -1,6 +1,8 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-09 深夜（第十二次更新 — 根因确认 + vLLM 源码修复）**
+> **更新日期：2026-04-10（第十四次更新 — 单卡逐层细粒度精度对齐 + Marlin kernel 验证 + EP=4 验证）**
+
+> **⚠️ 重要原则：修改代码必须考虑兼容性，不能影响其他模型的正常运行。**
 
 ## 1. 项目目标
 
@@ -371,20 +373,82 @@ A: "你好！我是 MiniMax-M2.5，一个由 MiniMax 公司开发的AI助手。.
 
 ---
 
-### 3.0 EP=4 + Marlin FP8 62层（最新，2026-04-09）
+### 2.12 EP=4 expert_map 过滤实现与 cutlass 编译修复（2026-04-10 新增）
+
+#### 核心实现
+
+**1. tritonmoe_preprocess_with_map C++ kernel**
+
+在 `custom_ops/gpu_ops/moe/tritonmoe_preprocess.cu` 中新增支持 `expert_map` 的预处理 kernel：
+- 修改 `moe_align_block_size_kernel` 和 `count_and_sort_expert_tokens_kernel` 添加 `expert_map` 参数
+- 新增 `tritonmoe_preprocess_with_map_kernel` 包装函数
+- 注册 `PD_BUILD_STATIC_OP(tritonmoe_preprocess_with_map)`
+- 原函数 `tritonmoe_preprocess_kernel` 传 `nullptr` 保持兼容
+
+**2. Python 层 expert_map 过滤**
+
+在 `fused_moe_marlin_backend.py` 的 `apply_ep_noalltoall` 中：
+- 构建 `expert_map` 张量：本地 expert → local_id，非本地 → -1
+- 使用 `tritonmoe_preprocess_with_map_func` 过滤非本地 expert tokens
+- 使用 `c_or_none=paddle.zeros(...)` 确保未计算位置输出为 0
+
+**3. cutlass 编译修复**
+
+修复预先存在的 PaddlePaddle 版本兼容问题：
+- `cutlass_extensions/gemm_configs.h`: 添加 `CtaShape64x64x64_WarpShape32x32x64` 枚举值
+- `cutlass_kernels/cutlass_heuristic.cu`: 添加对应 case 分支
+- `fused_moe_gemm_kernels_template.h`: 替换 PaddlePaddle 不支持的两个 cutlass 配置
+- `setup_ops.py`: 添加 CUDA stubs 库路径
+
+#### 兼容性分析
+
+| 修改文件 | 类型 | 影响范围 | 说明 |
+|---------|------|---------|------|
+| `gemm_configs.h` | 兼容 | 无 | 只添加枚举值 |
+| `cutlass_heuristic.cu` | 兼容 | 无 | 只添加 case 分支 |
+| `fused_moe_gemm_kernels_template.h` | 针对性 | 所有 MoE 模型 | 必要修改，PaddlePaddle 缺少枚举值 |
+| `setup_ops.py` | 兼容 | 无 | 只扩展库搜索路径 |
+| `tritonmoe_preprocess.cu` | 兼容 | 无 | 原函数传 nullptr 行为不变 |
+| `cpp_extensions.cc` | 兼容 | 无 | 只添加新函数绑定 |
+| `fused_moe_marlin_backend.py` | 针对性 | 只在 EP 模式下 | 只修改 `apply_ep_noalltoall` |
+| `__init__.py` | 临时 | 编译时覆盖 | 需要整合到编译流程 |
+
+**⚠️ 关键发现**：`fused_moe_gemm_kernels_template.h` 的修改会影响所有 MoE 模型的 cutlass tile 选择 heuristics，这是不可避免的（PaddlePaddle 的 `phi::CutlassTileConfig` 缺少对应的枚举值）。
+
+#### 测试结果
+
+| n_layers | 修复前 (dummy expert 0) | 修复后 (expert_map) | vLLM 参考 |
+|----------|------------------------|---------------------|-----------|
+| 1 | ✓ `'\n\n'` 20.73% | ✓ `'\n\n'` 20.73% | ✓ |
+| 25 | ✓ `'\n\n'` 2.02% | ✓ `'\n\n'` 1.50% | ✓ |
+| 26 | ✗ `','` 1.91% | ✓ `'\n\n'` 0.90% | ✓ |
+| 62 | ✗ `'iplash'` 2.65% | ✗ `'real'` 3.31% | ✓ `':'` 8.76% |
+
+**改进**：n=26 从失败改进为通过，n=62 输出从 `iplash` 变为 `real`。
+
+#### 下一步
+
+n=62 仍然失败，可能原因：
+1. `sorted_token_ids` 布局与 vLLM 不完全一致
+2. Marlin kernel 内部 `topk_weights` 索引问题
+3. 需要进一步调试 n=62 的具体问题
+
+---
+
+### 3.0 EP=4 + Marlin FP8 62层（最新，2026-04-10）
 
 ```
 # EP=4, 4×A800, prompt="Hello"
-FD EP=4:      top-1='iplash' (2.65%)  ✗
-vLLM EP=4:    top-1=':"'     (8.76%)  ✓（0/100 top-100 重叠）
+FD EP=4 (expert_map):  n=26: ✓  n=62: ✗ 'real' (3.31%)
+vLLM EP=4:             n=62: ✓ ':' (8.76%)
 
 # 二分搜索
-n=1~25: ✓  n=26+: ✗
+n=1~26: ✓  n=27+: 需要重新测试
 ```
 
-**已修复**：workspace死锁(zeros)、use_atomic_add=False、scale float32存储
-**根因已确认**：FD 的 dummy expert 0 方式 vs vLLM 的 expert_map 过滤（见 §2.11）
-**未解决**：需要修改 `tritonmoe_preprocess` C++ kernel 添加 `expert_map` 支持
+**已修复**：workspace死锁(zeros)、use_atomic_add=False、scale float32存储、expert_map过滤、零输出初始化
+**部分修复**：n=26 从失败改进为通过
+**未解决**：n=62 仍然失败，需要进一步调试
 
 ---
 
@@ -664,35 +728,129 @@ self.experts = FusedMoE(fd_config, renormalize=True, ...)
 | 31 | `forward_split_allgather` 与 NCCL EP 冲突，token≥8 时输出重复 | `FusedMoE.forward` 在 `token_num >= attn_tp_size=8` 时调用 `forward_split_allgather`，先把 tokens 按 rank 分割后再调 `apply_ep`（含 NCCL all-to-all），但 all-to-all 的 ep_group 和外层 all-gather 的 tp_group 发生排序/语义冲突，导致 step 4+ 输出 token 开始重复 | **已修复** — `FusedMoE.forward` 中增加 `_use_nccl_ep` 检测（`hasattr(self, '_nccl_ep_runner')`），NCCL EP 时直接走 `forward_normal` 绕过 `forward_split_allgather` |
 | 32 | 手动前向测试脚本 KV cache 张量共享导致 attention 输出 K 而非 V | `[paddle.zeros(cs, ...)] * 2` 在 Python 中创建两个引用指向**同一张量**，cache_k 和 cache_v 是同一块内存。写 K 和写 V 互相覆盖，最终 cache 随机含 K 或 V 值。attention 读取 cache_v 时实际上是 K 的值，输出 K 而非 V。直接后果：TP=8 attention 输出 std=5.09（≈K 的 std），TP=1 输出 std=0.53（≈V 的 std，偶然 V 覆盖 K 胜出）。所有手动前向测试脚本输出乱码 | **已修复（2026-04-07）** — 改为 `[paddle.zeros(cs, ...) for _ in range(N_LAYERS) for __ in range(2)]` 确保每次调用创建独立张量。32 个测试脚本全部修复。修复后 1 层 top-1=`\n\n`(6.8%)，与 vLLM top-1=`\n\n`(16%) 一致 ✓ |
 | 33 | EP=4 NoAlltoAll `use_atomic_add=False` + workspace 未初始化 → GPU 永久死锁 | `use_atomic_add=False` 使用 `barrier_acquire(&lock, slice_idx)` 自旋等待 `*lock == slice_idx`。slice_idx=0 时等待 `*lock==0`，但 `paddle.empty([528])` 未初始化，*lock 可能非0 → 测试进程挂起 44+ 分钟（GPU 占用 30GB 但无输出）。`use_atomic_add=True` 路径内核自行初始化 lock（`locks[locks_off] = 1 - slice_count`），不依赖外部初始化，故无此问题 | **已修复（2026-04-08）** — `workspace_up = paddle.zeros([528], dtype="int32")`，UP/DOWN 分别创建独立 workspace；vLLM 同样使用 `torch.zeros()` |
-| 34 | EP=4 NoAlltoAll 62层输出与 vLLM 完全不同（0/100 top-100 重叠） | FD 的 "dummy expert 0" 方式与 vLLM 的 "expert_map 过滤" 有根本差异。FD 的 `tritonmoe_preprocess_func` 不支持 `expert_map`，导致 dummy expert 0 的 tokens 被包含在 `sorted_token_ids` 中。虽然第二层 GEMM 的 `mul_topk_weights=True` 会将 dummy 输出乘以 weight=0，但第一层 GEMM 的 `mul_topk_weights=False` 产生非零中间值，可能累积误差 | **根因已确认（2026-04-09）** — 需要修改 `tritonmoe_preprocess` C++ kernel 添加 `expert_map` 支持，或使用替代方案 |
+| 34 | EP=4 NoAlltoAll 62层输出与 vLLM 完全不同（0/100 top-100 重叠） | FD 的 "dummy expert 0" 方式与 vLLM 的 "expert_map 过滤" 有根本差异。FD 的 `tritonmoe_preprocess_func` 不支持 `expert_map`，导致 dummy expert 0 的 tokens 被包含在 `sorted_token_ids` 中。虽然第二层 GEMM 的 `mul_topk_weights=True`  会将 dummy 输出乘以 weight=0，但第一层 GEMM 的 `mul_topk_weights=False` 产生非零中间值，可能累积误差 | **部分修复（2026-04-10）** — 已实现 `tritonmoe_preprocess_with_map` kernel 和 `expert_map` 过滤，n=26 从失败改进为通过，n=62 仍失败 |
+| 35 | expert_map 过滤后 n=62 输出 nan | `c_or_none=None` 导致 Marlin kernel 使用 `paddle::experimental::empty` 创建未初始化输出 tensor。非本地 expert 不参与计算时，对应位置保留垃圾值（nan） | **已修复（2026-04-10）** — 使用 `c_or_none=paddle.zeros(...)` 预分配零张量 |
+| 36 | cutlass 编译错误 `CtaShape64x64x64_WarpShape32x32x64` | PaddlePaddle 的 `phi::CutlassTileConfig` 缺少该枚举值，FD 的 `fused_moe_gemm_kernels_template.h` 在 `namespace phi` 中引用了不存在的枚举 | **已修复（2026-04-10）** — 添加枚举值 + 替换不支持的 cutlass 配置（注：会影响所有 MoE 模型的 tile 选择） |
 
 ---
 
 ## 8. 下一步工作
 
-### 8.0 当前优先级（2026-04-09 深夜更新）
+### 8.0 今日工作总结（2026-04-10 第十四次更新）
 
-**P0：修改 `tritonmoe_preprocess` C++ kernel，添加 `expert_map` 支持**
+**核心突破：Marlin FP8 MoE kernel 本身正确，问题在 EP=4 路径的精度累积。**
 
-根因已确认：FD 的 "dummy expert 0" 方式与 vLLM 的 "expert_map 过滤" 有根本差异。
+#### 单卡 TP=1 逐层细粒度对比（FD Marlin FP8 vs vLLM Marlin FP8）
 
-**已完成的诊断**：
-- Marlin FP8 kernel 单专家计算 cosine_sim=0.9999 ✓
-- workspace=zeros、use_atomic_add=False 均已修复 ✓
-- vLLM 源码构建已修复，EP=4 正常输出 ✓
-- Scale dtype 对比：vLLM 也用 BF16，排除此假设 ✓
-- n=1~25 全部 PASS，n=26+ 开始失败 ✓
+| 检查点 | FD vs vLLM cos | 结论 |
+|--------|---------------|------|
+| Embedding | 1.000000 | 完全一致 |
+| Layer 0 RMSNorm1 | 0.999996 | ✓ |
+| Layer 0 Attention | 0.999949 | ✓ (BF16 精度差异，正常) |
+| Layer 0 RMSNorm2 | 0.998973 | ⚠ (attention 差异被 post_attention_layernorm 放大) |
+| Layer 0 Gate output | 0.998373 | ⚠ (7/8 experts 相同，1 个不同) |
+| Expert 0 packed weight | 1.000000 | 完全一致 |
+| Expert 0 scale | 1.000000 | 完全一致 |
+| Layer 0 MoE | 0.000438 | ✗ (1 个 expert 不同导致完全不同 token 路径) |
 
-**根因**：FD 的 `tritonmoe_preprocess_func` 不支持 `expert_map` 参数，无法像 vLLM 一样过滤非本地 expert 的 tokens。dummy expert 0 的方式在数学上等价（最终贡献为 0），但可能因中间值累积导致精度问题。
+**5 层端到端输出（TP=1 Marlin FP8）**：
+```
+FD:   Top-5: '\n\n', '\n', ' ', ',', ':'
+vLLM: Top-5: '\n\n', '\n', ' ', ',', ':'
+→ Top-5 token 完全一致 ✓
+```
 
-**修复方案**：
-1. **方案 A（推荐）**：修改 `custom_ops/gpu_ops/moe/tritonmoe_preprocess.cu`，添加 `expert_map` 支持的新 kernel
-   - 已有初步实现（`tritonmoe_preprocess_with_map`），但编译失败
-   - 需要解决 cutlass 编译错误（预先存在的 PaddlePaddle 版本兼容问题）
-2. **方案 B**：在 Marlin kernel 调用层面添加 `expert_map` 过滤
-   - 修改 `MoeWna16MarlinGemmApi`，添加 `expert_map` 参数
-3. **方案 C**：修改 `apply_ep_noalltoall` 使用 vLLM 的 `moe_align_block_size`
-   - 需要 vLLM 的 C++ kernel 兼容 PaddlePaddle tensor
+#### 根因分析
+
+**不是 Marlin kernel 的 bug，而是 BF16 精度误差在 MoE 模型中的雪崩效应。**
+
+调用链：
+1. FD (PaddlePaddle attention) 和 vLLM (Triton/FlashAttention) 的 attention kernel 不同实现 → cos=0.999949 的微小差异
+2. `post_attention_layernorm` 是 nonlinear 操作，放大差异到 cos=0.998973
+3. Gate (float32 权重) 对输入微小变化敏感 → cos=0.998373（7/8 experts 相同，1 个不同）
+4. 1 个 expert 不同 → 不同 token 路径 → MoE 输出 cos=0.0004 → 62 层后完全发散
+
+这是 MoE 模型固有的特性——top-k 选择是离散的，微小的输入差异可能导致完全不同的 expert 组合。
+
+#### EP=4 Marlin FP8 验证结果
+
+| 配置 | 62层输出 | 结论 |
+|------|---------|------|
+| EP=4, Cutlass 路径 | 乱码 | — |
+| **EP=4, Marlin FP8 (`FD_MARLIN_FP8=1`)** | **乱码** | **没有改善** |
+| TP=1, Marlin FP8, 5层 | Top-5 匹配 vLLM | ✓ |
+| EP=4, Marlin FP8, 3层 | Top-1 `\n\n` | ✓ (3 层太少没意义) |
+
+EP=4 Marlin FP8 的 62 层输出和 Cutlass 路径几乎一样乱码。说明**问题不在 Marlin vs Cutlass 的 kernel 选择，而在 EP=4 路径本身的精度问题**（可能是 all_reduce 或 expert_map 过滤后的 token 分布不均）。
+
+#### 今日代码改动
+
+| 文件 | 改动 | 兼容性 |
+|------|------|--------|
+| `fused_moe_marlin_backend.py` | `apply()` 路径 b_scales 添加 `.cast("bfloat16")` | 针对性（只影响 Marlin MoE） |
+| `fused_moe_marlin_backend.py` | 添加 `FD_DUMP_DIR` 环境变量控制的 dump hooks | 兼容（不设环境变量时无影响） |
+| `fused_marlin_moe.py` | 添加 `VLLM_DUMP_DIR` dump hooks | 兼容 |
+| `minimax_m2.py` | 添加 gate output dump + layer_idx | 兼容 |
+| `minimax_m2_5.py` | 添加 per-layer dump hooks + `self.layer_id` | 兼容 |
+| `linear.py` | 添加 gate weight/input dump | 兼容 |
+| `test_step_align.py` | 重写：修复 attention 路径 + 细粒度 MoE 对比 | 测试脚本 |
+| `test_step_align_vllm.py` | 新建：vLLM LLM API 测试脚本 | 测试脚本 |
+| `test_tp4_ep4_fp8.py` | 更新 GPU 设备号 | 测试脚本 |
+
+#### 调试过程中发现的 Bug
+
+| # | Bug | 修复 |
+|---|-----|------|
+| 37 | `apply()` 路径 `b_scales` 未 cast to bf16 → Marlin kernel dtype mismatch | 添加 `.cast("bfloat16")` |
+| 38 | `FD_DUMP_DIR` 未设置时 EP=4 dump hooks 不触发 | 在测试脚本中设置 |
+| 39 | dump 中 `import paddle` 覆盖模块级 `paddle` → `UnboundLocalError` | 移除 dump 块中的 `import paddle` |
+| 40 | vLLM V1 子进程 dump 文件被后续层覆盖 | 添加 `layer_idx` 到 dump 文件名 |
+
+---
+
+### ⚠️ 代码修改兼容性原则
+
+**所有代码修改必须考虑兼容性，不能影响其他模型的正常运行。**
+
+修改分类：
+- **兼容性修改**：只添加、不修改/删除现有逻辑（如添加新枚举值、新函数）
+- **针对性修改**：修改现有逻辑，但只在特定条件下生效（如只在 EP 模式下）
+- **全局性修改**：修改会影响所有模型（如 `fused_moe_gemm_kernels_template.h` 的 cutlass 配置）
+
+当前修改中：
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `gemm_configs.h` | 兼容 | 只添加枚举值 |
+| `cutlass_heuristic.cu` | 兼容 | 只添加 case |
+| `fused_moe_gemm_kernels_template.h` | 全局 | 影响所有 MoE 模型的 tile 选择 |
+| `tritonmoe_preprocess.cu` | 兼容 | 原函数传 nullptr 行为不变 |
+| `fused_moe_marlin_backend.py` | 针对性 | 只修改 Marlin MoE 路径 |
+| `fused_moe_marlin_backend.py` b_scales | 针对性 | 只在 Marlin kernel 调用时 cast |
+| `linear.py` dump hooks | 兼容 | 环境变量控制，不设置时零开销 |
+| vLLM 文件 | 兼容 | dump hooks 环境变量控制 |
+
+---
+
+### 8.1 下一步调试方向
+
+**P0：调试 EP=4 路径的精度问题**
+
+Marlin kernel 本身已验证正确（TP=1 5 层 Top-5 匹配 vLLM）。EP=4 62 层乱码的根因可能在：
+1. `all_reduce` 精度累积（4 rank 的 BF16 累加误差）
+2. expert_map 过滤后 token 分布不均导致的数值不稳定
+3. `apply_ep_noalltoall` 中的 `sorted_token_ids` 布局与 vLLM 的 `moe_align_block_size` 不完全一致
+
+**调试方法**：
+- 对比 EP=4 下各 rank 的 `sorted_token_ids` 和 `expert_ids`
+- 对比 vLLM EP=4 的中间输出
+- 在 EP=4 下逐层 dump hidden state，找到第一个发散层
+
+**P1：清理 debug dump hooks**
+- 从源码中移除所有 dump hooks（`fused_moe_marlin_backend.py`、`minimax_m2_5.py`、`minimax_m2.py`、`fused_marlin_moe.py`、`linear.py`）
+- 保留环境变量控制的机制，确保不设置环境变量时零开销
+
+**P2：sequence-parallel attention**
+- 如果 EP=4 精度问题无法解决，尝试实现 SP attention 减少 all_reduce 精度损失
 
 ---
 

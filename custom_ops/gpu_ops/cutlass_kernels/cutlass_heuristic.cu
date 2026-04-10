@@ -51,6 +51,8 @@ TileShape get_cta_shape_for_config(CutlassTileConfig tile_config) {
       return TileShape{16, 256};
     case CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
       return TileShape{32, 128};
+    case CutlassTileConfig::CtaShape64x64x64_WarpShape32x32x64:
+      return TileShape{64, 64};
     case CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
       return TileShape{64, 64};
     case CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:

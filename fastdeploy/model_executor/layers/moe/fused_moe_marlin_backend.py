@@ -24,6 +24,7 @@ import fastdeploy
 from fastdeploy.model_executor.ops.gpu import (
     MoeWna16MarlinGemmApi,
     tritonmoe_preprocess_func,
+    tritonmoe_preprocess_with_map_func,
 )
 
 from ..quantization.quant_base import QuantMethodBase
@@ -594,16 +595,19 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
     ) -> paddle.Tensor:
         """
         vLLM-style NoEP EP: all tokens remain on all ranks, each rank computes
-        only its local experts (non-local experts zeroed via weight masking),
+        only its local experts (non-local experts filtered via expert_map),
         then all-reduce across EP ranks to aggregate contributions.
 
         This matches vLLM's MoEPrepareAndFinalizeNoEP path used when dp_size=1.
+        Uses expert_map to filter non-local experts from sorted_token_ids,
+        ensuring only local expert tokens participate in GEMM computation.
         """
         from fastdeploy.model_executor.layers.moe.moe import get_moe_scores
 
         M, hidden_size = x.shape
         top_k = layer.top_k
         num_local_experts = layer.num_local_experts
+        num_experts = layer.num_experts
         fd_config = layer.fd_config
         ep_rank = fd_config.parallel_config.expert_parallel_rank
         ep_group = fd_config.parallel_config.ep_group
@@ -619,34 +623,42 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         if topk_ids_hookfunc is not None:
             topk_ids_hookfunc(topk_ids=topk_ids)
 
-        # Step 2: Map global expert IDs to local IDs for this rank.
-        # Local experts: [ep_rank*num_local_experts, (ep_rank+1)*num_local_experts)
+        # Step 2: Build expert_map — maps global expert ID to local expert ID
+        # local experts: [ep_rank*num_local_experts, (ep_rank+1)*num_local_experts)
+        # non-local experts: mapped to -1 (filtered out by preprocess kernel)
         local_start = ep_rank * num_local_experts
-        local_end = local_start + num_local_experts
-        local_mask = (topk_ids >= local_start) & (topk_ids < local_end)  # [M, top_k] bool
+        expert_map_list = [-1] * num_experts
+        for i in range(num_local_experts):
+            expert_map_list[local_start + i] = i
+        expert_map = paddle.to_tensor(expert_map_list, dtype="int32")
 
-        # Non-local experts → dummy local ID 0; their weights are zeroed so output=0
-        local_topk_ids = paddle.where(
-            local_mask,
-            topk_ids - local_start,
-            paddle.zeros_like(topk_ids),
-        )
-        local_topk_weights = paddle.where(
-            local_mask,
-            topk_weights,
-            paddle.zeros_like(topk_weights),
-        )
-
-        # Step 3: Triton preprocess with local num_experts
+        # Step 3: Triton preprocess with expert_map filtering
+        # Only local expert tokens will be included in sorted_token_ids
         block_size_m = 64
         for m in [8, 16, 32, 48, 64]:
             if M * top_k / num_local_experts / m < 0.9:
                 block_size_m = m
                 break
 
-        sorted_token_ids, expert_ids, num_tokens_pp = tritonmoe_preprocess_func(
-            local_topk_ids.cast("int64"), num_local_experts, block_size_m
+        sorted_token_ids, expert_ids, num_tokens_pp = tritonmoe_preprocess_with_map_func(
+            topk_ids.cast("int64"), expert_map, num_local_experts, block_size_m
         )
+
+        import os
+        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+        if DUMP_DIR and layer.layer_idx <= 2:
+            import numpy as np
+            rk = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_sorted_token_ids.npy",
+                    sorted_token_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_expert_ids.npy",
+                    expert_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_topk_ids.npy",
+                    topk_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_gate_out.npy",
+                    gate_out.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_num_tokens_pp.npy",
+                    np.array([num_tokens_pp.numpy()[0]]))
 
         # Step 4: Marlin GEMM — only local expert weights are present on this rank
         b_q_type_str = "float8_e4m3fn" if self.weight_type == "fp8" else "uint4b8"
@@ -662,8 +674,9 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         actual_size_k_down = down_weight.shape[1] * 16
         actual_size_n_down = down_weight.shape[2] // 4
 
+        ffn_out_up = paddle.zeros([M * top_k, actual_size_n_up], dtype=x.dtype)
         ffn_out = MoeWna16MarlinGemmApi(
-            x, None,
+            x, ffn_out_up,
             b_q_weight=up_gate_weight,
             b_scales=layer.up_gate_proj_weight_scale.cast("bfloat16"),
             global_scale_or_none=None, b_zeros_or_none=None,
@@ -671,7 +684,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             workspace=workspace_up,
             sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
             num_tokens_post_padded=num_tokens_pp,
-            topk_weights=local_topk_weights, moe_block_size=block_size_m,
+            topk_weights=topk_weights, moe_block_size=block_size_m,
             top_k=top_k, mul_topk_weights=False, is_ep=False,
             b_q_type_str=b_q_type_str,
             size_m=M, size_n=actual_size_n_up, size_k=actual_size_k_up,
@@ -680,8 +693,9 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         swiglu_out = paddle.nn.functional.swiglu(ffn_out)
 
+        ffn_out_down = paddle.zeros([M * top_k, actual_size_n_down], dtype=x.dtype)
         ffn_out = MoeWna16MarlinGemmApi(
-            swiglu_out, None,
+            swiglu_out, ffn_out_down,
             b_q_weight=down_weight,
             b_scales=layer.down_proj_weight_scale.cast("bfloat16"),
             global_scale_or_none=None, b_zeros_or_none=None,
@@ -689,7 +703,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             workspace=workspace_down,
             sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
             num_tokens_post_padded=num_tokens_pp,
-            topk_weights=local_topk_weights, moe_block_size=block_size_m,
+            topk_weights=topk_weights, moe_block_size=block_size_m,
             top_k=1, mul_topk_weights=True, is_ep=False,
             b_q_type_str=b_q_type_str,
             size_m=M * top_k, size_n=actual_size_n_down, size_k=actual_size_k_down,
@@ -752,6 +766,13 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         if topk_ids_hookfunc is not None:
             topk_ids_hookfunc(topk_ids=topk_ids)
 
+        import os, numpy as np
+        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+        if DUMP_DIR:
+            np.save(f"{DUMP_DIR}/fd_moe_topk_ids.npy", topk_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_topk_weights.npy", topk_weights.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_gate_out.npy", gate_out.cast("float32").numpy())
+
         block_size_m = 64
 
         for m in [8, 16, 32, 48, 64]:
@@ -768,6 +789,10 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         sorted_token_ids, expert_ids, num_tokens_post_padded = tritonmoe_preprocess_func(
             topk_ids, num_experts, block_size_m
         )
+
+        if DUMP_DIR:
+            np.save(f"{DUMP_DIR}/fd_moe_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_expert_ids.npy", expert_ids.cast("int32").numpy())
 
         # Determine b_q_type_str based on weight type
         if self.weight_type == "fp8":
@@ -804,11 +829,27 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
                      f"down_scale={layer.down_proj_weight_scale.shape}, "
                      f"x={x.shape}, token_num={token_num}")
 
+        import os, numpy as np
+        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+
+        if DUMP_DIR:
+            np.save(f"{DUMP_DIR}/fd_moe_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_expert_ids.npy", expert_ids.cast("int32").numpy())
+            # Dump first token's Marlin weight packed format sample
+            # up_gate_weight: [E, K//16, N*4] for FP8
+            up_w = layer.up_gate_proj_weight
+            np.save(f"{DUMP_DIR}/fd_moe_up_gate_weight_e0.npy",
+                    up_w[0].cast("int32").numpy())  # expert 0's packed weight
+            # Dump scales
+            up_sc = layer.up_gate_proj_weight_scale.cast("bfloat16")
+            np.save(f"{DUMP_DIR}/fd_moe_up_gate_scale_e0.npy",
+                    up_sc[0].cast("float32").numpy())  # expert 0's scale
+
         ffn_out = MoeWna16MarlinGemmApi(
             x,
             c_or_none=None,
             b_q_weight=layer.up_gate_proj_weight,
-            b_scales=layer.up_gate_proj_weight_scale,
+            b_scales=layer.up_gate_proj_weight_scale.cast("bfloat16"),
             global_scale_or_none=None,
             b_zeros_or_none=None,
             g_idx_or_none=None,
@@ -834,11 +875,15 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         swiglu_out = paddle.nn.functional.swiglu(ffn_out)
 
+        if DUMP_DIR:
+            np.save(f"{DUMP_DIR}/fd_moe_up_gate.npy", ffn_out.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_moe_swiglu.npy", swiglu_out.cast("float32").numpy())
+
         ffn_out = MoeWna16MarlinGemmApi(
             swiglu_out,
             c_or_none=None,
             b_q_weight=layer.down_proj_weight,
-            b_scales=layer.down_proj_weight_scale,
+            b_scales=layer.down_proj_weight_scale.cast("bfloat16"),
             global_scale_or_none=None,
             b_zeros_or_none=None,
             g_idx_or_none=None,
@@ -861,6 +906,9 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             use_fp32_reduce=True,
             is_zp_float=False,
         )[0]
+
+        if DUMP_DIR:
+            np.save(f"{DUMP_DIR}/fd_moe_down.npy", ffn_out.cast("float32").numpy())
 
         ffn_out.reshape_([token_num, -1, hidden_size])
         ffn_out = ffn_out.sum(axis=1)

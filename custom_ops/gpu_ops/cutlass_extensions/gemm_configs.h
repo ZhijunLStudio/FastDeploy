@@ -42,6 +42,7 @@ enum class CutlassTileConfig {
   CtaShape32x128x64_WarpShape32x32x64,
 
   // Warp configs for M=64
+  CtaShape64x64x64_WarpShape32x32x64,
   CtaShape64x128x64_WarpShape32x64x64,
   CtaShape64x64x128_WarpShape32x64x64,
   CtaShape64x128x64_WarpShape64x32x64,

@@ -82,9 +82,18 @@ class UnquantizedLinearMethod(QuantMethodBase):
         layer.weight.set_value(weights)
 
     def apply(self, layer: nn.Layer, x: paddle.Tensor) -> paddle.Tensor:
+        import os
+        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+        if DUMP_DIR and hasattr(layer, '_dump_gate'):
+            import numpy as np
+            li = getattr(layer, '_gate_layer_idx', 'unknown')
+            np.save(f"{DUMP_DIR}/fd_l{li}_gate_input.npy", x.cast("float32").numpy())
+            np.save(f"{DUMP_DIR}/fd_l{li}_gate_weight.npy", layer.weight.cast("float32").numpy())
         linear_out = paddle.matmul(x, layer.weight)
         if layer.with_bias:
             linear_out = paddle.add(linear_out, layer.bias)
+        if DUMP_DIR and hasattr(layer, '_dump_gate'):
+            np.save(f"{DUMP_DIR}/fd_l{li}_gate_out.npy", linear_out.cast("float32").numpy())
         return linear_out
 
 

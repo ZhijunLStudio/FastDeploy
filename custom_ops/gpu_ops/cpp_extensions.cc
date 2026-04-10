@@ -628,6 +628,12 @@ std::vector<paddle::Tensor> tritonmoe_preprocess_kernel(
     int64_t num_experts,
     int64_t GEMM_BLOCK_SIZE_M);
 
+std::vector<paddle::Tensor> tritonmoe_preprocess_with_map_kernel(
+    const paddle::Tensor& topk_ids,
+    const paddle::Tensor& expert_map,
+    int64_t num_experts,
+    int64_t GEMM_BLOCK_SIZE_M);
+
 std::vector<paddle::Tensor> MoeWna16MarlinGemmApi(
     const paddle::Tensor& a,
     const paddle::optional<paddle::Tensor>& c_or_none,
@@ -1601,6 +1607,8 @@ PYBIND11_MODULE(fastdeploy_ops, m) {
   m.def("count_tokens_per_expert_func", &count_tokens_per_expert_func);
 
   m.def("tritonmoe_preprocess_func", &tritonmoe_preprocess_kernel);
+
+  m.def("tritonmoe_preprocess_with_map_func", &tritonmoe_preprocess_with_map_kernel);
 
   m.def("MoeWna16MarlinGemmApi",
         &MoeWna16MarlinGemmApi,

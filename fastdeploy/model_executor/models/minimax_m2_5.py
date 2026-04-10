@@ -397,6 +397,8 @@ class MiniMaxM2_5MoE(nn.Layer):
             skip_quant=True,
             weight_dtype="float32",
         )
+        self.gate._dump_gate = True
+        self.gate._gate_layer_idx = layer_id
 
         # MiniMax has e_score_correction_bias for routing bias correction
         # (used by noaux_tc routing: topk by score+bias, weight by score)
@@ -445,6 +447,7 @@ class MiniMaxM2_5DecoderLayer(nn.Layer):
         super().__init__()
 
         layer_id = int(prefix.split(".")[-1])
+        self.layer_id = layer_id
 
         self.self_attn = MiniMaxM2_5Attention(
             fd_config=fd_config,
@@ -486,18 +489,34 @@ class MiniMaxM2_5DecoderLayer(nn.Layer):
         hidden_states: paddle.Tensor,
         residual: paddle.Tensor = None,
     ):
+        import os
+        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+        li = self.layer_id
+
         hidden_states, residual = self.input_layernorm(
             hidden_states, residual_input=residual, forward_meta=forward_meta
         )
+        if DUMP_DIR:
+            import numpy as np
+            np.save(f"{DUMP_DIR}/fd_l{li}_post_norm1.npy", hidden_states.cast("float32").numpy())
 
         hidden_states = self.self_attn(
             forward_meta=forward_meta,
             hidden_states=hidden_states,
         )
+        if DUMP_DIR:
+            import numpy as np
+            np.save(f"{DUMP_DIR}/fd_l{li}_post_attn.npy", hidden_states.cast("float32").numpy())
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if DUMP_DIR:
+            import numpy as np
+            np.save(f"{DUMP_DIR}/fd_l{li}_post_norm2.npy", hidden_states.cast("float32").numpy())
 
         hidden_states = self.mlp(hidden_states, forward_meta)
+        if DUMP_DIR:
+            import numpy as np
+            np.save(f"{DUMP_DIR}/fd_l{li}_post_moe.npy", hidden_states.cast("float32").numpy())
 
         return hidden_states, residual
 
@@ -1242,6 +1261,16 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 continue
             param = params_dict[model_param_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
+
+            # Debug: dump gate weight at load time
+            if "mlp.gate.weight" in model_param_name and "experts" not in model_param_name:
+                import numpy as np
+                logger.info(f"LOAD_DEBUG: {loaded_weight_name} -> {model_param_name}, "
+                           f"loaded_shape={loaded_weight.shape}, loaded_dtype={loaded_weight.dtype}")
+                if hasattr(loaded_weight, 'numpy'):
+                    np.save(f"/tmp/align_v4/debug_gate_weight_loaded.npy",
+                            loaded_weight.float().numpy() if hasattr(loaded_weight, 'float') else loaded_weight.numpy())
+
             weight_loader(param, loaded_weight)
 
             model_sublayer_name = re.sub(
@@ -1326,6 +1355,7 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         # here so that direct callers (e.g. run_fd_gen.py) work. process_final_after_loading
         # is aware and will skip re-transposing via a guard.
         if self.fd_config.model_config.model_format == "torch":
+            import numpy as np
             from fastdeploy.model_executor.utils import process_weight_transpose
             from fastdeploy.model_executor.layers.linear import (
                 ColumnParallelLinear, RowParallelLinear, ReplicatedLinear,
@@ -1337,7 +1367,14 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                     if hasattr(sublayer, "weight") and sublayer.weight is not None:
                         if sublayer.weight.ndim == 2:
                             logger.info(f"Transposing {name} weight {sublayer.weight.shape}")
+                            # Debug: dump gate weight before/after transpose
+                            if "gate" in name and "experts" not in name:
+                                np.save(f"/tmp/align_v4/debug_gate_before_transpose.npy",
+                                        sublayer.weight.cast("float32").numpy())
                             process_weight_transpose(sublayer, "weight")
+                            if "gate" in name and "experts" not in name:
+                                np.save(f"/tmp/align_v4/debug_gate_after_transpose.npy",
+                                        sublayer.weight.cast("float32").numpy())
                             sublayer._torch_weight_transposed = True
 
     @paddle.no_grad()
