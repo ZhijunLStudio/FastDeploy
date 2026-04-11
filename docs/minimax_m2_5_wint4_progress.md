@@ -1,6 +1,6 @@
 # MiniMax-M2.5 WINT4 推理复现报告
 
-> **更新日期：2026-04-10（第十五次更新 — 单卡 Marlin FP8 MoE 精度对齐：发现 scale permutation 差异）**
+> **更新日期：2026-04-11（第十六次更新 — EP=4 Marlin FP8 精度问题定位：FD Marlin kernel 与 vLLM 有 2216 行差异）**
 
 > **⚠️ 重要原则：修改代码必须考虑兼容性，不能影响其他模型的正常运行。**
 
@@ -1256,13 +1256,103 @@ MoE Kernel Comparison: FD vs vLLM (layer 0)
 
 ### 10.5 下一步
 
-1. **修复 scale permutation 顺序不一致** — 统一 FD 和 vLLM 的 scale 处理流程
-2. 单卡 MoE 对齐后 → 3 层全路径对比 → 62 层验证
-3. EP=4 问题在单卡 MoE 对齐后再处理
+1. ~~修复 scale permutation 顺序不一致~~ ✅ **已完成**（2026-04-11，commit f0accda78）
+   - FD `_process_fp8_marlin_weights` 改为先 permute 再 bias
+   - 修复后 scales 与 vLLM 100% 一致（max_diff=0）
+   - packed weights byte-identical
 
 ---
 
-## 11. 环境信息
+## 11. EP=4 Marlin FP8 精度问题（2026-04-11 新增）
+
+### 11.1 Scale 修复验证
+
+Scale permutation 修复后（commit f0accda78），FD 和 vLLM 的以下数据完全一致：
+- ✅ Marlin packed weights: byte-identical（max_diff=0）
+- ✅ Scales: 100% 一致（max_diff=0）
+- ✅ Gate routing: cos=1.000000
+- ✅ Expert mapping: 所有 rank 正确
+- ✅ sorted_token_ids: 正确的 flat index（token_idx * top_k + slot_idx）
+- ✅ AllReduce: 正确求和（误差 ~1e-3，bf16 精度范围）
+
+### 11.2 EP=4 输出质量 bisect 结果
+
+| n_layers | top-1 token | 状态 |
+|----------|------------|------|
+| 5 | `'\n\n'` | ✓ 正确 |
+| 10 | `'\n\n'` | ✓ 正确 |
+| 15 | `'\n\n'` | ✓ 正确 |
+| 20 | `'\xa0'` | ✗ 退化 |
+| 22 | `'/'` | ✗ |
+| 24 | `' '` | ✗ |
+| 25 | `'\xa0'` | ✗ |
+| 26 | `'meier'` | ✗ |
+| 27 | `'两'` | ✗ |
+| 62 | `'斯基'` | ✗ 严重退化 |
+
+**结论**：n≤15 层输出正确，n≥20 层开始退化。误差在层间累积。
+
+### 11.3 详细调试排除
+
+通过大量调试，排除了以下可能原因：
+
+| 排除项 | 验证方法 | 结果 |
+|--------|---------|------|
+| Scale permutation | 对比 FD vs vLLM scales | max_diff=0 ✓ |
+| Weight packing | 对比 packed int32 weights | byte-identical ✓ |
+| Expert routing | 对比 gate output | cos=1.0 ✓ |
+| Expert mapping | 检查 expert_map 逻辑 | 正确 ✓ |
+| sorted_token_ids | 检查 flat index encoding | 正确 ✓ |
+| AllReduce | dump pre/post AllReduce | 正确求和 ✓ |
+| is_ep flag | 改为 is_ep=True | 无效果 ✗ |
+| 重新编译 ops | 重新编译 fastdeploy_ops_pd_.so | 无效果 ✗ |
+| NaN/Inf | 检查 hidden states | 无异常 ✓ |
+
+### 11.4 根因定位
+
+**FD 的 Marlin kernel 与 vLLM 的版本有 2216 行差异。**
+
+文件对比：
+- FD: `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin_template.h`
+- vLLM: `vllm/csrc/moe/marlin_moe_wna16/marlin_template.h`
+
+关键差异包括：
+1. FD 有 `is_ep` 参数，vLLM 没有
+2. FD 的 `read_moe_block_data` 使用 `tid4 = threadIdx.x / 4` + 循环，vLLM 直接用 `threadIdx.x`
+3. FD 的 `write` 函数签名不同
+4. FD 的 `dequant_data` 实现不同
+5. FD 的 `permute_cols_kernel` 不同
+6. FD 的 `determine_exec_config` 逻辑不同
+
+这些差异导致浮点计算结果有微小差异，在 15-20 层后累积到足以改变 top-1 token。
+
+### 11.5 修复方案（待实施）
+
+**方案 A（推荐）：同步 FD Marlin kernel 到 vLLM 最新版本**
+- 将 vLLM 的 `marlin_template.h` 移植到 FD 的 PaddlePaddle 框架
+- 工作量：2216 行差异，需要仔细测试
+- 预期效果：解决 EP=4 精度问题
+
+**方案 B：用 vLLM 的 moe_align_block_size 替换 FD 的 tritonmoe_preprocess**
+- 将 vLLM 的排序 kernel 移植为 PaddlePaddle custom op
+- 可能改善 sorted_token_ids 的确定性，但不一定解决精度问题
+
+**方案 C：在 Marlin kernel 中使用 FP32 累积**
+- 修改 kernel 的中间计算使用 float32 而非 bfloat16
+- 可能减少累积误差，但需要修改 CUDA 代码
+
+### 11.6 已验证正确的组件
+
+以下组件已通过详细验证，**不需要修改**：
+- `tritonmoe_preprocess_with_map_func` — 产生正确的 sorted_token_ids
+- `get_moe_scores` (noaux_tc) — 正确的 routing
+- `apply_ep_noalltoall` 的逻辑 — 正确的 EP 数据流
+- AllReduce — 正确的跨 rank 求和
+- Scale 和 weight 加载 — 与 vLLM 完全一致
+
+---
+
+## 12. 环境信息
 
 - **GPU**: 8 × A100 80GB (SM 8.0)
 - **FD 环境**: conda activate `paddle` (Python 3.10, PaddlePaddle 3.3.0)
