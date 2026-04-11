@@ -435,20 +435,27 @@ n=62 仍然失败，可能原因：
 
 ---
 
-### 3.0 EP=4 + Marlin FP8 62层（最新，2026-04-10）
+### 3.0 EP=4 + Marlin FP8 62层（最新，2026-04-11）
 
 ```
 # EP=4, 4×A800, prompt="Hello"
-FD EP=4 (expert_map):  n=26: ✓  n=62: ✗ 'real' (3.31%)
-vLLM EP=4:             n=62: ✓ ':' (8.76%)
+FD EP=4 (expert_map):  n=26: ✓ '\u202f'  n=27: ✗ '两'  n=62: ✗ garbage
+vLLM EP=4 62层:        n=62: ✓ " Dr. John Smith..." (完整英文)
 
-# 二分搜索
-n=1~26: ✓  n=27+: 需要重新测试
+# 验证：scales 100% 对齐（max_diff=0），weights byte-identical
+# 根因：tritonmoe_preprocess_with_map_func 的 sorted_token_ids 布局在 n=27+ 时开始偏离
 ```
 
-**已修复**：workspace死锁(zeros)、use_atomic_add=False、scale float32存储、expert_map过滤、零输出初始化
-**部分修复**：n=26 从失败改进为通过
-**未解决**：n=62 仍然失败，需要进一步调试
+**已修复（2026-04-11）**：
+- scale permutation order: 先 `_marlin_permute_scales` 再 `* 2^120`（之前顺序错误）
+- scales 100% identical between FD and vLLM（max_diff=0 for all experts）
+
+**部分修复**：n≤26 正确，n=27 开始偏离（已确认 n=27 时 top-1='两' 而非预期值）
+
+**未解决**：n=27+ 失败。可能原因：
+1. `top_k=1, mul_topk_weights=True` DOWN GEMM 的 topk_weights 索引方式与 vLLM 不同
+2. AllReduce 精度累积（BF16 跨4卡）
+3. sorted_token_ids 布局在多层累积误差
 
 ---
 
