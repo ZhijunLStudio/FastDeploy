@@ -489,34 +489,18 @@ class MiniMaxM2_5DecoderLayer(nn.Layer):
         hidden_states: paddle.Tensor,
         residual: paddle.Tensor = None,
     ):
-        import os
-        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
-        li = self.layer_id
-
         hidden_states, residual = self.input_layernorm(
             hidden_states, residual_input=residual, forward_meta=forward_meta
         )
-        if DUMP_DIR:
-            import numpy as np
-            np.save(f"{DUMP_DIR}/fd_l{li}_post_norm1.npy", hidden_states.cast("float32").numpy())
 
         hidden_states = self.self_attn(
             forward_meta=forward_meta,
             hidden_states=hidden_states,
         )
-        if DUMP_DIR:
-            import numpy as np
-            np.save(f"{DUMP_DIR}/fd_l{li}_post_attn.npy", hidden_states.cast("float32").numpy())
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if DUMP_DIR:
-            import numpy as np
-            np.save(f"{DUMP_DIR}/fd_l{li}_post_norm2.npy", hidden_states.cast("float32").numpy())
 
         hidden_states = self.mlp(hidden_states, forward_meta)
-        if DUMP_DIR:
-            import numpy as np
-            np.save(f"{DUMP_DIR}/fd_l{li}_post_moe.npy", hidden_states.cast("float32").numpy())
 
         return hidden_states, residual
 
@@ -851,7 +835,7 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                               params_dict: dict, stacked_params_mapping: list,
                               expert_params_mapping: list,
                               process_weights_after_loading_fn, block_size: int,
-                              enable_wint4: bool):
+                              enable_wint4: bool, sm80_keep_fp8: bool = False):
         """Dequantize a set of FP8 weights and load them into model parameters.
 
         If enable_wint4 is True and the weight is a MoE expert weight,
@@ -859,6 +843,10 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
         If enable_marlin_fp8 is True, skip expert weight dequant (they stay FP8
         and are passed to the Marlin backend).
+
+        If sm80_keep_fp8 is True, load FP8 weights directly without dequanting.
+        Also loads weight_scale_inv onto the layer for on-the-fly dequant in
+        BlockWiseFP8LinearMethod.apply(). This saves ~4x memory per layer on SM80.
 
         NOTE: process_weights_after_loading_fn is called ONCE per unique sublayer
         AFTER all weights are loaded, to avoid repeated transpose/re-quantize
@@ -886,6 +874,73 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
             scale_name = wname.replace(".weight", ".weight_scale_inv")
             scale = fp8_scales.get(scale_name)
+
+            if sm80_keep_fp8:
+                # SM80: load FP8 weight directly, skip dequant.
+                # BlockWiseFP8LinearMethod.apply() handles on-the-fly dequant.
+                wt_tensor = get_tensor(wt)
+                sc_tensor = get_tensor(scale) if scale is not None else None
+                matched = False
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in wname or "mlp.experts" in wname:
+                        continue
+                    model_param_name = wname.replace(weight_name, param_name)
+                    if model_param_name not in params_dict:
+                        continue
+                    param = params_dict[model_param_name]
+                    # Load FP8 weight via weight_loader (handles stacking + TP shard)
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader(self.fd_config))
+                    weight_loader(param, wt_tensor, shard_id)
+                    # Load scale_inv: find the parent sublayer and set directly.
+                    # NOTE: weight_loader transposes the weight from [out,in] to [in,out],
+                    # but the scale_inv stays in torch layout [n_blocks_out,n_blocks_in].
+                    # We'll fix the layout after all shards are loaded.
+                    if sc_tensor is not None:
+                        sublayer_name = model_param_name.rsplit(".", 1)[0]
+                        sublayers_dict = dict(self.named_sublayers())
+                        if sublayer_name in sublayers_dict:
+                            parent = sublayers_dict[sublayer_name]
+                            if hasattr(parent, "weight_scale_inv") and parent.weight_scale_inv is not None:
+                                si = parent.weight_scale_inv
+                                # For stacked params (qkv), the scale_inv param has stacked
+                                # shape but we load one shard at a time. Use direct copy
+                                # into the right slice.
+                                if shard_id is not None and si.shape[0] > sc_tensor.shape[0]:
+                                    # Compute offset: weight uses head_dim=128, scale uses block_size=128
+                                    # So scale offset = weight_offset // 128
+                                    num_q_blocks = getattr(parent, 'num_heads_per_rank', 0) * 128 // 128  # = num_heads_per_rank
+                                    num_kv_blocks = getattr(parent, 'kv_num_heads_per_rank', 0) * 128 // 128  # = kv_num_heads_per_rank
+                                    if shard_id == "q":
+                                        si_slice = si[:num_q_blocks]
+                                    elif shard_id == "k":
+                                        si_slice = si[num_q_blocks:num_q_blocks + num_kv_blocks]
+                                    else:  # "v"
+                                        si_slice = si[num_q_blocks + num_kv_blocks:num_q_blocks + 2 * num_kv_blocks]
+                                    si_slice.copy_(sc_tensor, False)
+                                else:
+                                    si.copy_(sc_tensor, False)
+                    msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
+                                 "", model_param_name)
+                    pending_process.add(msn)
+                    matched = True
+                    break
+                if not matched and wname in params_dict:
+                    param = params_dict[wname]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader(self.fd_config))
+                    weight_loader(param, wt_tensor)
+                    if sc_tensor is not None:
+                        sublayer_name = wname.rsplit(".", 1)[0]
+                        sublayers_dict = dict(self.named_sublayers())
+                        if sublayer_name in sublayers_dict:
+                            parent = sublayers_dict[sublayer_name]
+                            if hasattr(parent, "weight_scale_inv") and parent.weight_scale_inv is not None:
+                                parent.weight_scale_inv.copy_(sc_tensor, False)
+                    msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
+                                 "", wname)
+                    pending_process.add(msn)
+                continue  # skip the normal dequant path
 
             if scale is None:
                 logger.warning(f"No scale for {wname}, loading raw fp8 as bf16")
@@ -1065,23 +1120,23 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         down_scale_list = [expert_down_scales[i] for i in range(num_experts)]
         down_scale_tensor = paddle.stack(down_scale_list, axis=0)
 
-        logger.info(f"Marlin FP8: Loading layer {layer_idx} experts, "
-                     f"up_gate={up_gate_tensor.shape} {up_gate_tensor.dtype}, "
-                     f"down={down_tensor.shape} {down_tensor.dtype}, "
-                     f"up_gate_scale={up_gate_scale_tensor.shape}, "
-                     f"down_scale={down_scale_tensor.shape}")
-
-        # NOTE: Marlin FP8 kernel requires full N dimension (N=3072 for up_gate, N=3072 for down).
-        # TP sharding of N is NOT supported (N=384 per TP=8 rank triggers kernel assertion).
-        # To fit 62-layer Marlin in 80GB, use EP=8 instead of TP: each GPU gets 32 experts
-        # with full N=3072 per expert (total ~28 GB Marlin weights vs 224 GB with 256 experts).
-        # TP-sharding of Marlin weights is NOT done here; EP routing distributes experts.
-
-        # Process through Marlin backend
-        _process_fp8_marlin_weights(
-            moe_layer, up_gate_tensor, up_gate_scale_tensor,
-            down_tensor, down_scale_tensor, block_size,
-        )
+        # Process through Marlin backend (SM90+ only; SM80 uses raw FP8 + BF16 dequant)
+        from fastdeploy.model_executor.utils import get_sm_version
+        from fastdeploy.platforms import current_platform
+        if get_sm_version() < 90 and current_platform.is_cuda():
+            # SM80: skip Marlin packing (saves ~1.6 GB/layer), use raw FP8 in _apply_ep_sm80_bf16
+            # Store on CPU to save GPU memory; copy to GPU on-the-fly during forward
+            moe_layer._sm80_fp8_up_gate = up_gate_tensor.cpu()
+            moe_layer._sm80_fp8_up_gate_scale = up_gate_scale_tensor.cpu()
+            moe_layer._sm80_fp8_down = down_tensor.cpu()
+            moe_layer._sm80_fp8_down_scale = down_scale_tensor.cpu()
+            del up_gate_tensor, up_gate_scale_tensor, down_tensor, down_scale_tensor
+            paddle.device.cuda.empty_cache()
+        else:
+            _process_fp8_marlin_weights(
+                moe_layer, up_gate_tensor, up_gate_scale_tensor,
+                down_tensor, down_scale_tensor, block_size,
+            )
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
@@ -1262,15 +1317,6 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             param = params_dict[model_param_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader(self.fd_config))
 
-            # Debug: dump gate weight at load time
-            if "mlp.gate.weight" in model_param_name and "experts" not in model_param_name:
-                import numpy as np
-                logger.info(f"LOAD_DEBUG: {loaded_weight_name} -> {model_param_name}, "
-                           f"loaded_shape={loaded_weight.shape}, loaded_dtype={loaded_weight.dtype}")
-                if hasattr(loaded_weight, 'numpy'):
-                    np.save(f"/tmp/align_v4/debug_gate_weight_loaded.npy",
-                            loaded_weight.float().numpy() if hasattr(loaded_weight, 'float') else loaded_weight.numpy())
-
             weight_loader(param, loaded_weight)
 
             model_sublayer_name = re.sub(
@@ -1299,6 +1345,9 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
 
         # Process each decoder layer's FP8 weights (layer-by-layer streaming)
         _enable_marlin_fp8 = os.environ.get("FD_MARLIN_FP8", "0") == "1"
+        from fastdeploy.model_executor.utils import get_sm_version
+        from fastdeploy.platforms import current_platform
+        _is_sm80 = _enable_marlin_fp8 and get_sm_version() < 90 and current_platform.is_cuda()
         layer_indices = sorted(k for k in fp8_by_layer.keys() if k >= 0)
         for li in layer_indices:
             n_wts = len(fp8_by_layer[li])
@@ -1312,17 +1361,28 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                     li, fp8_by_layer[li], scales_by_layer.get(li, {}),
                     params_dict, expert_params_mapping, BLOCK_SIZE,
                 )
-                # Still dequantize non-expert FP8 weights (attention, etc.)
+                # Non-expert FP8 weights (attention qkv/o_proj)
                 non_expert_fp8 = {k: v for k, v in fp8_by_layer[li].items()
                                   if "mlp.experts" not in k}
                 non_expert_scales = {k: v for k, v in scales_by_layer.get(li, {}).items()
                                      if "mlp.experts" not in k}
                 if non_expert_fp8:
-                    self._dequant_fp8_weights(
-                        non_expert_fp8, non_expert_scales,
-                        params_dict, stacked_params_mapping, expert_params_mapping,
-                        process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
-                    )
+                    if _is_sm80:
+                        # SM80: load FP8 weights directly, dequant on-the-fly in
+                        # BlockWiseFP8LinearMethod.apply() to save ~4x memory per layer
+                        self._dequant_fp8_weights(
+                            non_expert_fp8, non_expert_scales,
+                            params_dict, stacked_params_mapping, expert_params_mapping,
+                            process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
+                            sm80_keep_fp8=True,
+                        )
+                    else:
+                        # SM90+: dequant non-expert weights to BF16 at load time
+                        self._dequant_fp8_weights(
+                            non_expert_fp8, non_expert_scales,
+                            params_dict, stacked_params_mapping, expert_params_mapping,
+                            process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
+                        )
             else:
                 self._dequant_fp8_weights(
                     fp8_by_layer[li], scales_by_layer.get(li, {}),
@@ -1366,15 +1426,7 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                         continue  # Already handled (e.g. WINT4 quantized layers)
                     if hasattr(sublayer, "weight") and sublayer.weight is not None:
                         if sublayer.weight.ndim == 2:
-                            logger.info(f"Transposing {name} weight {sublayer.weight.shape}")
-                            # Debug: dump gate weight before/after transpose
-                            if "gate" in name and "experts" not in name:
-                                np.save(f"/tmp/align_v4/debug_gate_before_transpose.npy",
-                                        sublayer.weight.cast("float32").numpy())
                             process_weight_transpose(sublayer, "weight")
-                            if "gate" in name and "experts" not in name:
-                                np.save(f"/tmp/align_v4/debug_gate_after_transpose.npy",
-                                        sublayer.weight.cast("float32").numpy())
                             sublayer._torch_weight_transposed = True
 
     @paddle.no_grad()

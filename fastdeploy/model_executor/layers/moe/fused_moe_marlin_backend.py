@@ -448,16 +448,11 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         return weight_scale
 
     def init_ep(self, layer):
-        """Initialize NCCL-based EP runner for SM80 (no deep_ep required)."""
-        from .nccl_ep_runner import NCCLEPPrefillRunner
-        fd_config = layer.fd_config
-        ep_size = layer.ep_size
-        ep_rank = fd_config.parallel_config.expert_parallel_rank
-        ep_group = fd_config.parallel_config.ep_group
-        num_local_experts = layer.num_local_experts
-        layer._nccl_ep_runner = NCCLEPPrefillRunner(
-            ep_size, ep_rank, ep_group, num_local_experts
-        )
+        """Initialize EP - use no-all-to-all approach for SM80 compatibility."""
+        # Don't set _nccl_ep_runner so that forward_normal is used instead of
+        # forward_split_allgather, which calls apply_ep (NCCL all-to-all).
+        # Instead, forward_normal -> apply -> apply_ep_noalltoall (SM80 safe).
+        pass
 
     def apply_ep(
         self,
@@ -644,26 +639,21 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             topk_ids.cast("int64"), expert_map, num_local_experts, block_size_m
         )
 
-        import os
-        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
-        if DUMP_DIR and layer.layer_idx <= 2:
-            import numpy as np
-            rk = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
-            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_sorted_token_ids.npy",
-                    sorted_token_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_expert_ids.npy",
-                    expert_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_topk_ids.npy",
-                    topk_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_gate_out.npy",
-                    gate_out.cast("float32").numpy())
-            np.save(f"{DUMP_DIR}/fd_ep_r{rk}_l{layer.layer_idx}_num_tokens_pp.npy",
-                    np.array([num_tokens_pp.numpy()[0]]))
+        # Step 4: Compute MoE FFN
+        # On SM80 (A100): use BF16 dequant + batched GEMM (Marlin kernel has precision issues)
+        # On SM90+ (Hopper): use Marlin FP8 kernel
+        from fastdeploy.model_executor.utils import get_sm_version
+        from fastdeploy.platforms import current_platform
 
-        # Step 4: Marlin GEMM — only local expert weights are present on this rank
+        if self.weight_type == "fp8" and get_sm_version() < 90 and current_platform.is_cuda():
+            if hasattr(layer, '_sm80_fp8_up_gate'):
+                return self._apply_ep_sm80_bf16(
+                    layer, x, topk_weights, topk_ids,
+                    M, hidden_size, top_k, ep_group,
+                )
+
+        # SM90+: use Marlin FP8 kernel
         b_q_type_str = "float8_e4m3fn" if self.weight_type == "fp8" else "uint4b8"
-        # Use separate zeros workspaces for UP and DOWN: use_atomic_add=False barrier_acquire
-        # spins waiting for *lock==0; dirty state from UP call could corrupt DOWN's barrier.
         workspace_up = paddle.zeros([528], dtype="int32")
         workspace_down = paddle.zeros([528], dtype="int32")
 
@@ -718,6 +708,120 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         return ffn_out
 
+    def _apply_ep_sm80_bf16(
+        self,
+        layer: nn.Layer,
+        x: paddle.Tensor,
+        topk_weights: paddle.Tensor,
+        topk_ids: paddle.Tensor,
+        M: int,
+        hidden_size: int,
+        top_k: int,
+        ep_group,
+    ) -> paddle.Tensor:
+        """
+        SM80 (A100) fallback: per-layer dequant FP8→BF16 + cuBLAS GEMM.
+        Avoids Marlin kernel precision issues on SM80.
+        Dequants on-the-fly to avoid OOM from storing all layers' BF16 weights.
+        """
+        import numpy as np
+
+        BLOCK = 128
+
+        def dequant_to_bf16(fp8_weight, scale):
+            """Dequant FP8 weight to BF16 using block-wise scale."""
+            N, K = fp8_weight.shape
+            n_blocks_r = (N + BLOCK - 1) // BLOCK
+            n_blocks_c = (K + BLOCK - 1) // BLOCK
+            wt_f32 = fp8_weight.cast("float32").numpy()
+            sc = scale.numpy()
+            pad_r = n_blocks_r * BLOCK - N
+            pad_c = n_blocks_c * BLOCK - K
+            if pad_r > 0 or pad_c > 0:
+                wt_f32 = np.pad(wt_f32, ((0, pad_r), (0, pad_c)))
+            wt_blocked = wt_f32.reshape([n_blocks_r, BLOCK, n_blocks_c, BLOCK])
+            sc_expanded = sc.reshape([n_blocks_r, n_blocks_c])[:, np.newaxis, :, np.newaxis]
+            wt_dequant = (wt_blocked * sc_expanded).reshape(
+                [n_blocks_r * BLOCK, n_blocks_c * BLOCK]
+            )[:N, :K]
+            return paddle.to_tensor(wt_dequant, dtype="bfloat16")
+
+        # Dequant this layer's experts to BF16 on-the-fly
+        # (weights may be on CPU to save GPU memory; copy to GPU for dequant)
+        fp8_up_gate = layer._sm80_fp8_up_gate.cuda()     # [E, N*2, K]
+        fp8_up_gate_scale = layer._sm80_fp8_up_gate_scale.cuda()
+        fp8_down = layer._sm80_fp8_down.cuda()            # [E, N, K]
+        fp8_down_scale = layer._sm80_fp8_down_scale.cuda()
+
+        N_half = fp8_up_gate.shape[1] // 2
+        num_local = fp8_up_gate.shape[0]
+        local_start = layer.expert_id_offset
+
+        # Dequant all local experts to BF16 on-the-fly (~2.25 GB per layer)
+        gate_list, up_list, down_list = [], [], []
+        for i in range(num_local):
+            ug = dequant_to_bf16(fp8_up_gate[i], fp8_up_gate_scale[i])
+            gate_list.append(ug[:N_half])
+            up_list.append(ug[N_half:])
+            down_list.append(dequant_to_bf16(fp8_down[i], fp8_down_scale[i]))
+
+        all_gate = paddle.stack(gate_list, axis=0)  # [num_local, N, K] bf16
+        all_up = paddle.stack(up_list, axis=0)
+        all_down = paddle.stack(down_list, axis=0)
+
+        # Process each local expert: gather its tokens, compute, scatter
+        topk_ids_np = topk_ids.numpy()
+        topk_weights_np = topk_weights.numpy()
+
+        ffn_out = paddle.zeros([M, hidden_size], dtype="bfloat16")
+        x_bf16 = x.cast("bfloat16")
+
+        for local_expert_id in range(num_local):
+            global_expert_id = local_start + local_expert_id
+
+            mask = topk_ids_np == global_expert_id
+            if not mask.any():
+                continue
+
+            token_indices = np.where(mask)[0]
+            weights = topk_weights_np[mask]
+
+            token_x = x_bf16[token_indices]
+
+            gate_w = all_gate[local_expert_id]
+            up_w = all_up[local_expert_id]
+            down_w = all_down[local_expert_id]
+
+            gate_out = paddle.nn.functional.linear(token_x, gate_w.T)
+            up_out = paddle.nn.functional.linear(token_x, up_w.T)
+            swiglu_out = paddle.nn.functional.swiglu(
+                paddle.concat([gate_out, up_out], axis=-1)
+            )
+            expert_out = paddle.nn.functional.linear(swiglu_out, down_w.T)
+
+            w_tensor = paddle.to_tensor(weights[:, np.newaxis].astype("float32"), dtype="bfloat16")
+            weighted_out = expert_out * w_tensor
+
+            # Scatter-add to ffn_out
+            # Note: .numpy() on bf16 tensor returns uint16, so cast to float32 first
+            ffn_out_np = ffn_out.cast("float32").numpy()
+            weighted_out_np = weighted_out.cast("float32").numpy()
+            for idx, tidx in enumerate(token_indices):
+                ffn_out_np[tidx] += weighted_out_np[idx]
+            ffn_out = paddle.to_tensor(ffn_out_np, dtype="bfloat16")
+
+        # All-reduce across EP ranks
+        # Use float32 for allreduce to avoid NCCL bf16 precision issues
+        ffn_out_f32 = ffn_out.cast("float32")
+        paddle.distributed.all_reduce(ffn_out_f32, group=ep_group)
+        ffn_out = ffn_out_f32.cast("bfloat16")
+
+        # Free GPU copies of FP8 weights (originals stay on CPU)
+        del fp8_up_gate, fp8_up_gate_scale, fp8_down, fp8_down_scale
+        del all_gate, all_up, all_down
+
+        return ffn_out
+
     def apply(
         self,
         layer: nn.Layer,
@@ -766,14 +870,6 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         if topk_ids_hookfunc is not None:
             topk_ids_hookfunc(topk_ids=topk_ids)
 
-        import os, numpy as np
-        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
-        li = getattr(layer, 'layer_idx', 0)
-        if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_topk_ids.npy", topk_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_topk_weights.npy", topk_weights.cast("float32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_gate_out.npy", gate_out.cast("float32").numpy())
-
         block_size_m = 64
 
         for m in [8, 16, 32, 48, 64]:
@@ -790,10 +886,6 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         sorted_token_ids, expert_ids, num_tokens_post_padded = tritonmoe_preprocess_func(
             topk_ids, num_experts, block_size_m
         )
-
-        if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_expert_ids.npy", expert_ids.cast("int32").numpy())
 
         # Determine b_q_type_str based on weight type
         if self.weight_type == "fp8":
@@ -818,33 +910,6 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             actual_size_n_up = moe_intermediate_size * 2
             actual_size_k_down = moe_intermediate_size
             actual_size_n_down = hidden_size
-
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info(f"Marlin FP8 apply: b_q_type={b_q_type_str}, "
-                     f"up_gate: size_n={actual_size_n_up}, size_k={actual_size_k_up}, "
-                     f"down: size_n={actual_size_n_down}, size_k={actual_size_k_down}, "
-                     f"up_gate_weight={layer.up_gate_proj_weight.shape}, "
-                     f"up_gate_scale={layer.up_gate_proj_weight_scale.shape}, "
-                     f"down_weight={layer.down_proj_weight.shape}, "
-                     f"down_scale={layer.down_proj_weight_scale.shape}, "
-                     f"x={x.shape}, token_num={token_num}")
-
-        import os, numpy as np
-        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
-
-        if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_sorted_token_ids.npy", sorted_token_ids.cast("int32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_expert_ids.npy", expert_ids.cast("int32").numpy())
-            # Dump first token's Marlin weight packed format sample
-            # up_gate_weight: [E, K//16, N*4] for FP8
-            up_w = layer.up_gate_proj_weight
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_up_gate_weight_e0.npy",
-                    up_w[0].cast("int32").numpy())  # expert 0's packed weight
-            # Dump scales
-            up_sc = layer.up_gate_proj_weight_scale.cast("bfloat16")
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_up_gate_scale_e0.npy",
-                    up_sc[0].cast("float32").numpy())  # expert 0's scale
 
         ffn_out = MoeWna16MarlinGemmApi(
             x,
@@ -876,10 +941,6 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         swiglu_out = paddle.nn.functional.swiglu(ffn_out)
 
-        if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_up_gate.npy", ffn_out.cast("float32").numpy())
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_swiglu.npy", swiglu_out.cast("float32").numpy())
-
         ffn_out = MoeWna16MarlinGemmApi(
             swiglu_out,
             c_or_none=None,
@@ -907,9 +968,6 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             use_fp32_reduce=True,
             is_zp_float=False,
         )[0]
-
-        if DUMP_DIR:
-            np.save(f"{DUMP_DIR}/fd_moe_l{li}_down.npy", ffn_out.cast("float32").numpy())
 
         ffn_out.reshape_([token_num, -1, hidden_size])
         ffn_out = ffn_out.sum(axis=1)

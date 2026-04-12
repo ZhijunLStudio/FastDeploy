@@ -366,8 +366,18 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                         BLOCK = self.quant_config.weight_block_size[0]
                         weight_f32 = layer.weight.cast("float32")
                         out_d, in_d = weight_f32.shape
+                        # Scale layout: torch format [n_blocks_out, n_blocks_in],
+                        # but weight may be transposed to [in, out] (PaddlePaddle format).
+                        # Detect mismatch: if scale.shape[0]*BLOCK != out_d, transpose scale.
+                        if scale.shape[0] * BLOCK != out_d and scale.shape[1] * BLOCK == out_d:
+                            scale = scale.transpose([1, 0])
+                        # Expand scale from [n_blocks_out, n_blocks_in] to
+                        # [n_blocks_out*BLOCK, n_blocks_in*BLOCK].
+                        # Must permute to [n_blocks_out, BLOCK, n_blocks_in, BLOCK]
+                        # before reshape, otherwise PaddlePaddle reshape gives wrong layout.
                         sc_exp = scale.unsqueeze(2).unsqueeze(3)
                         sc_exp = paddle.expand(sc_exp, [scale.shape[0], scale.shape[1], BLOCK, BLOCK])
+                        sc_exp = sc_exp.transpose([0, 2, 1, 3])
                         sc_exp = sc_exp.reshape([scale.shape[0] * BLOCK, scale.shape[1] * BLOCK])[:out_d, :in_d]
                         weight_bf16 = (weight_f32 * sc_exp).cast("bfloat16")
                         linear_out = F.linear(x.cast("bfloat16"), weight_bf16)
