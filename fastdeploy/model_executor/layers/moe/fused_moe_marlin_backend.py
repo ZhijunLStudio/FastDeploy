@@ -773,7 +773,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         topk_ids_np = topk_ids.numpy()
         topk_weights_np = topk_weights.numpy()
 
-        ffn_out = paddle.zeros([M, hidden_size], dtype="bfloat16")
+        ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
         x_bf16 = x.cast("bfloat16")
 
         for local_expert_id in range(num_local):
@@ -799,22 +799,18 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             )
             expert_out = paddle.nn.functional.linear(swiglu_out, down_w.T)
 
-            w_tensor = paddle.to_tensor(weights[:, np.newaxis].astype("float32"), dtype="bfloat16")
-            weighted_out = expert_out * w_tensor
+            weighted_expert_out = expert_out.cast("float32") * weights[:, np.newaxis].astype("float32")
 
-            # Scatter-add to ffn_out
-            # Note: .numpy() on bf16 tensor returns uint16, so cast to float32 first
-            ffn_out_np = ffn_out.cast("float32").numpy()
-            weighted_out_np = weighted_out.cast("float32").numpy()
+            # Scatter-add to ffn_out (float32 accumulation, no BF16 round-trip)
+            ffn_out_np = ffn_out.numpy()
+            weighted_np = weighted_expert_out.numpy()
             for idx, tidx in enumerate(token_indices):
-                ffn_out_np[tidx] += weighted_out_np[idx]
-            ffn_out = paddle.to_tensor(ffn_out_np, dtype="bfloat16")
+                ffn_out_np[tidx] += weighted_np[idx]
+            ffn_out = paddle.to_tensor(ffn_out_np, dtype="float32")
 
-        # All-reduce across EP ranks
-        # Use float32 for allreduce to avoid NCCL bf16 precision issues
-        ffn_out_f32 = ffn_out.cast("float32")
-        paddle.distributed.all_reduce(ffn_out_f32, group=ep_group)
-        ffn_out = ffn_out_f32.cast("bfloat16")
+        # All-reduce across EP ranks (ffn_out is already float32)
+        paddle.distributed.all_reduce(ffn_out, group=ep_group)
+        ffn_out = ffn_out.cast("bfloat16")
 
         # Free GPU copies of FP8 weights (originals stay on CPU)
         del fp8_up_gate, fp8_up_gate_scale, fp8_down, fp8_down_scale

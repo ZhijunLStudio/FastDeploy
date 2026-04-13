@@ -1435,8 +1435,10 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         self.lm_head.load_state_dict(state_dict)
 
     def compute_logits(self, hidden_states: paddle.Tensor, forward_meta: ForwardMeta = None):
-        logits = self.lm_head(hidden_states)
-        logits = logits.astype(paddle.float32)
+        # Cast to float32 before lm_head to avoid BF16 precision issues
+        hidden_states_f32 = hidden_states.cast("float32")
+        lm_head_w_f32 = self.lm_head.linear.weight.cast("float32")
+        logits = paddle.matmul(hidden_states_f32, lm_head_w_f32)
         logits[:, self.ori_vocab_size :] = -float("inf")
         return logits
 

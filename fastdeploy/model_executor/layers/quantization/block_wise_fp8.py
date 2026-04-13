@@ -246,6 +246,7 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                     shape=weight_scale_inv_shape,
                     dtype="float32",
                     is_bias=False,
+                    default_initializer=paddle.nn.initializer.Constant(0),
                 )
             else:
                 layer.weight_scale_inv = layer.create_parameter(
