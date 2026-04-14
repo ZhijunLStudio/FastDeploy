@@ -453,7 +453,7 @@ elif paddle.is_compiled_with_cuda():
         sources += find_end_files("gpu_ops/speculate_decoding", ".cc")
         nvcc_compile_args += ["-DENABLE_BF16"]
         # moe
-        os.system("python gpu_ops/moe/moe_wna16_marlin_utils/generate_kernels.py")
+        os.system(f"python gpu_ops/moe/moe_wna16_marlin_utils/generate_kernels.py {cc}.0")
         os.system(
             "python utils/auto_gen_template_instantiation.py --config gpu_ops/moe/template_config.json --output gpu_ops/moe/template_instantiation/autogen"
         )

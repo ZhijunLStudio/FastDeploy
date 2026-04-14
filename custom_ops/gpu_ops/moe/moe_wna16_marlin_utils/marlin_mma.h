@@ -1,5 +1,5 @@
 
-#include "marlin_dtypes.cuh"
+#include "moe/moe_wna16_marlin_utils/marlin_dtypes.cuh"
 
 namespace MARLIN_NAMESPACE_NAME {
 

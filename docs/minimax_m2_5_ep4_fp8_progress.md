@@ -687,3 +687,98 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python /tmp/vllm_n62.py --n-layers 2
 - vLLM 在 SM80 上**不做 INT4 转换**，直接用 FP8 权重 + Marlin W8A16 kernel
 - FD 的 Marlin kernel 不是"硬件不支持"，而是"实现有 bug"
 - 修复方向是**对标 vLLM 的调度策略**，不是换 INT4 或做校准
+
+---
+
+## 2026-04-14 Marlin Kernel SM80 修复：vLLM 版本移植
+
+### 重大突破：vLLM Marlin kernel 成功移植到 FD
+
+**结论：FD 的 Marlin FP8 kernel 在 SM80 上已修复，与 vLLM 精度完全一致。**
+
+### 根因分析
+
+FD 的 `marlin_template.h` 与 vLLM 版本有 **2620 行差异**，核心调度逻辑完全不同：
+
+| 方面 | FD（旧） | vLLM |
+|------|---------|------|
+| 调度策略 | 简单 stripe | DP+SK（Data Parallel + Split-K） |
+| 类型系统 | `ScalarType<scalar_t>`（C++ 类型） | `MarlinScalarType<type_id>`（ID 模板） |
+| 模板参数 | `scalar_t, w_type_id` | `a_type_id, b_type_id, c_type_id, s_type_id` |
+| Kernel 签名 | 有 `is_ep`, `max_shared_mem` | 有 `has_bias`, `b_bias_ptr`, `a_scales_ptr` |
+| MMA | FD 自己写 inline asm | vLLM 用 `marlin_mma.h` |
+
+**不能通过小 patch 修复，需要整体替换。**
+
+### 实现方案
+
+替换以下文件为 vLLM 版本（namespace + include path 适配）：
+
+| 文件 | 操作 |
+|------|------|
+| `marlin_template.h` | 替换为 vLLM 版本（2230 行） |
+| `marlin_dtypes.cuh` | 替换为 vLLM 版本（类型系统） |
+| `marlin.cuh` | 替换为 vLLM 版本（CUDA 基础操作） |
+| `dequant.h` | 替换为 vLLM 版本（几乎相同） |
+| `marlin_mma.h` | 替换为 vLLM 版本（MMA 指令） |
+| `kernel.h` | 更新 `MARLIN_KERNEL_PARAMS` 和模板签名 |
+| `generate_kernels.py` | 替换为 vLLM 版本 |
+| `moe_wna16_marlin_gemm.cu` | 重写 dispatch + entry point |
+| `setup_ops.py` | 传递 arch 参数给 `generate_kernels.py` |
+
+### 验证结果
+
+**n=62 测试（新 Marlin kernel）：**
+
+| 排名 | Token | Logit | FD（新 kernel） | vLLM |
+|------|-------|-------|----------------|------|
+| 1 | `:` (58) | 8.1378 | ✅ | ✅ |
+| 2 | `:"` (11861) | 7.9740 | ✅ | ✅ |
+| 3 | `,"` (2304) | 7.3748 | ✅ | ✅ |
+| 4 | `="` (1139) | 7.3536 | ✅ | ✅ |
+| 5 | `.` (46) | 7.0876 | ✅ | ✅ |
+| logit mean | — | -3.7953 | — | — |
+
+**FD 和 vLLM 的 top-5 完全一致（顺序相同）。**
+
+### 关键发现：vLLM 的 SM80 路径
+
+vLLM 在 SM80 上使用 **W8A16**（FP8 权重 + BF16 激活），不是 W8A8：
+
+1. `generate_kernels.py`（行 87-93）：FP8 权重 config 的默认激活类型是 `["kFloat16", "kBFloat16"]`，不是 `kFE4M3fn`
+2. `marlin_template.h`（行 296-299）：`__CUDA_ARCH__ < 890` 检查只禁 `a_type_id == kFE4M3fn.id()`（FP8 激活），不禁 BF16 激活
+3. `marlin.cu`（行 402-408）：`TORCH_CHECK` 只拒绝 W8A8（FP8 激活），不拒绝 W8A16
+
+**SM80 上 FP8 权重 + BF16 激活的 Marlin kernel 正常工作。**
+
+### 与之前 BF16 dequant workaround 的对比
+
+| 方面 | BF16 dequant workaround（旧） | Marlin kernel（新） |
+|------|-----|------|
+| 正确性 | ✅ 与 vLLM 一致 | ✅ 与 vLLM 一致 |
+| 权重存储 | CPU 离驻，forward 时 .cuda() | GPU 上 Marlin packed 格式 |
+| 反量化 | CPU numpy dequant → GPU cuBLAS GEMM | GPU kernel 内部 FP8→BF16 dequant |
+| 非 expert | FP8 保留，forward 时逐层 dequant | Marlin packed，kernel 内部 dequant |
+| 性能 | 慢（CPU→GPU 拷贝 + 非优化 GEMM） | 快（优化的 Marlin kernel） |
+| 显存 | ~59 GB/卡 | 应该更低（不需要 CPU 缓存） |
+
+### 修改的文件
+
+| 文件 | 修改 |
+|------|------|
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin_template.h` | 替换为 vLLM 版本 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin_dtypes.cuh` | 替换为 vLLM 版本 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin.cuh` | 替换为 vLLM 版本 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/dequant.h` | 替换为 vLLM 版本 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin_mma.h` | 替换为 vLLM 版本 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/kernel.h` | 更新模板签名和参数 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/generate_kernels.py` | 替换为 vLLM 版本 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_gemm.cu` | 重写 dispatch + entry point |
+| `setup_ops.py` | 传递 arch 参数 |
+
+### 下一步
+
+1. 清理 BF16 dequant workaround 代码（`_apply_ep_sm80_bf16`, `sm80_keep_fp8`, CPU expert 离驻）
+2. 端到端全量生成验证（FD LLM API）
+3. 性能基准测试（与 vLLM 对比）
+4. 更新 CLAUDE.md

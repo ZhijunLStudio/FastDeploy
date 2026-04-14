@@ -26,7 +26,7 @@
 #include "paddle/phi/api/include/api.h"
 
 #include "moe/moe_wna16_marlin_utils/kernel.h"
-#include "moe/moe_wna16_marlin_utils/types.h"
+#include "moe/moe_wna16_marlin_utils/core/scalar_type.hpp"
 #include "moe/moe_wna16_marlin_gemm.h"
 #include "helper.h"
 
@@ -35,64 +35,11 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 
-#define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
-  static_assert(std::is_same<scalar_t, half>::value ||          \
-                    std::is_same<scalar_t, nv_bfloat16>::value, \
-                "only float16 and bfloat16 is supported");
-
 namespace MARLIN_NAMESPACE_NAME {
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-
-template <int moe_block_size>
-__global__ void permute_cols_kernel(
-    int4 const* __restrict__ a_int4_ptr,
-    int const* __restrict__ perm_int_ptr,
-    int4* __restrict__ out_int4_ptr,
-    const int32_t* __restrict__ sorted_token_ids_ptr,
-    const int32_t* __restrict__ expert_ids_ptr,
-    const int32_t* __restrict__ num_tokens_past_padded_ptr,
-    int size_m,
-    int size_k,
-    int top_k){};
-
-}  // namespace marlin
-
-MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
-    MARLIN_NAMESPACE_NAME::Tensor& a,
-    paddle::optional<MARLIN_NAMESPACE_NAME::Tensor> const& c_or_none,
-    MARLIN_NAMESPACE_NAME::Tensor& b_q_weight,
-    MARLIN_NAMESPACE_NAME::Tensor& b_scales,
-    paddle::optional<MARLIN_NAMESPACE_NAME::Tensor> const& b_zeros_or_none,
-    paddle::optional<MARLIN_NAMESPACE_NAME::Tensor> const& g_idx_or_none,
-    paddle::optional<MARLIN_NAMESPACE_NAME::Tensor> const& perm_or_none,
-    MARLIN_NAMESPACE_NAME::Tensor& workspace,
-    MARLIN_NAMESPACE_NAME::Tensor& sorted_token_ids,
-    MARLIN_NAMESPACE_NAME::Tensor& expert_ids,
-    MARLIN_NAMESPACE_NAME::Tensor& num_tokens_past_padded,
-    MARLIN_NAMESPACE_NAME::Tensor& topk_weights,
-    int64_t moe_block_size,
-    int64_t top_k,
-    bool mul_topk_weights,
-    bool is_ep,
-    MARLIN_NAMESPACE_NAME::ScalarTypeId const& b_q_type_id,
-    int64_t size_m,
-    int64_t size_n,
-    int64_t size_k,
-    bool is_k_full,
-    bool use_atomic_add,
-    bool use_fp32_reduce,
-    bool is_zp_float) {
-  // TORCH_CHECK_NOT_IMPLEMENTED(false,
-  //                             "marlin_gemm(..) requires CUDA_ARCH >= 8.0");
-  return torch::empty({1, 1});
-}
-
-#else
 
 // For a given "a" of size [M,K] performs a permutation of the K columns based
 // on the given "perm" indices.
@@ -186,7 +133,8 @@ thread_config_t small_batch_thread_configs[] = {
 
     // thread_k, thread_n, num_threads
     {128, 128, 256},
-    {64, 128, 128}};
+    {64, 128, 128},
+    {128, 64, 128}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
@@ -200,14 +148,9 @@ typedef struct {
   thread_config_t tb_cfg;
 } exec_config_t;
 
-int get_scales_cache_size(thread_config_t const& th_config,
-                          int prob_m,
-                          int prob_n,
-                          int prob_k,
-                          int num_bits,
-                          int group_size,
-                          bool has_act_order,
-                          bool is_k_full) {
+int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
+                          int prob_n, int prob_k, int num_bits, int group_size,
+                          bool has_act_order, bool is_k_full, int stages) {
   bool cache_scales_chunk = has_act_order && !is_k_full;
 
   int tb_n = th_config.thread_n;
@@ -225,51 +168,43 @@ int get_scales_cache_size(thread_config_t const& th_config,
 
   if (cache_scales_chunk) {
     int load_groups =
-        tb_groups * pipe_stages * 2;  // Chunk size is 2x pipeline over dim K
-    load_groups =
-        std::max(load_groups, 32);  // We load at least 32 scale groups
+        tb_groups * stages * 2;          // Chunk size is 2x pipeline over dim K
+    load_groups = max(load_groups, 32);  // We load at least 32 scale groups
     return load_groups * tb_n * 2;
   } else {
     int tb_scales = tb_groups * tb_n * 2;
 
-    return tb_scales * pipe_stages;
+    return tb_scales * stages;
   }
 }
 
-int get_kernel_cache_size(thread_config_t const& th_config,
-                          bool m_block_size_8,
-                          int thread_m_blocks,
-                          int prob_m,
-                          int prob_n,
-                          int prob_k,
-                          int num_bits,
-                          int group_size,
-                          bool has_act_order,
-                          bool is_k_full,
-                          int has_zp,
-                          int is_zp_float) {
+int get_kernel_cache_size(thread_config_t const& th_config, bool m_block_size_8,
+                          int thread_m_blocks, int prob_m, int prob_n,
+                          int prob_k, int num_bits, int group_size,
+                          bool has_act_order, bool is_k_full, int has_zp,
+                          int is_zp_float, bool is_a_8bit, int stages) {
   int pack_factor = 32 / num_bits;
 
   // Get B size
   int tb_k = th_config.thread_k;
   int tb_n = th_config.thread_n;
-  int tb_m = thread_m_blocks * (m_block_size_8 ? 8 : 16);
+  int tb_m = thread_m_blocks * 16;
 
   // shm size for block_sorted_ids/rd_block_sorted_ids/block_topk_weights
   // both of them requires tb_m * 4 bytes (tb_m * int32 or tb_m * float32)
-  int sh_block_meta_size = tb_m * 4;
-  int sh_a_size = pipe_stages * (tb_m * tb_k) * 2;
-  int sh_b_size = pipe_stages * (tb_k * tb_n / pack_factor) * 4;
+  int sh_block_meta_size = tb_m * 16;
+  int sh_a_size = stages * (tb_m * tb_k) * (is_a_8bit ? 1 : 2);
+  int sh_b_size = stages * (tb_k * tb_n / pack_factor) * 4;
   int sh_red_size = tb_m * (tb_n + 8) * 2;
-  int sh_s_size = get_scales_cache_size(th_config,
-                                        prob_m,
-                                        prob_n,
-                                        prob_k,
-                                        num_bits,
-                                        group_size,
-                                        has_act_order,
-                                        is_k_full);
-  int sh_g_idx_size = has_act_order && !is_k_full ? pipe_stages * tb_k / 4 : 0;
+  int sh_bias_size = tb_n * 2;
+  int tmp_size =
+      (sh_b_size > sh_red_size ? sh_red_size : sh_b_size) + sh_bias_size;
+  tmp_size = max(max(sh_b_size, sh_red_size), tmp_size);
+
+  int sh_s_size =
+      get_scales_cache_size(th_config, prob_m, prob_n, prob_k, num_bits,
+                            group_size, has_act_order, is_k_full, stages);
+  int sh_g_idx_size = has_act_order && !is_k_full ? stages * tb_k / 4 : 0;
   int sh_zp_size = 0;
   if (has_zp) {
     if (is_zp_float)
@@ -280,25 +215,17 @@ int get_kernel_cache_size(thread_config_t const& th_config,
       sh_zp_size = sh_s_size / 2;
   }
 
-  int total_size = std::max(sh_b_size, sh_red_size) + sh_a_size + sh_s_size +
-                   sh_zp_size + sh_g_idx_size + sh_block_meta_size;
+  int total_size = tmp_size + sh_a_size + sh_s_size + sh_zp_size +
+                   sh_g_idx_size + sh_block_meta_size;
 
   return total_size;
 }
 
-bool is_valid_config(thread_config_t const& th_config,
-                     bool m_block_size_8,
-                     int thread_m_blocks,
-                     int prob_m,
-                     int prob_n,
-                     int prob_k,
-                     int num_bits,
-                     int group_size,
-                     bool has_act_order,
-                     bool is_k_full,
-                     int has_zp,
-                     int is_zp_float,
-                     int max_shared_mem) {
+bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
+                     int thread_m_blocks, int prob_m, int prob_n, int prob_k,
+                     int num_bits, int group_size, bool has_act_order,
+                     bool is_k_full, int has_zp, int is_zp_float,
+                     bool is_a_8bit, int stages, int max_shared_mem) {
   // Sanity
   if (th_config.thread_k == -1 || th_config.thread_n == -1 ||
       th_config.num_threads == -1) {
@@ -321,197 +248,40 @@ bool is_valid_config(thread_config_t const& th_config,
   }
 
   // Check that pipeline fits into cache
-  int cache_size = get_kernel_cache_size(th_config,
-                                         m_block_size_8,
-                                         thread_m_blocks,
-                                         prob_m,
-                                         prob_n,
-                                         prob_k,
-                                         num_bits,
-                                         group_size,
-                                         has_act_order,
-                                         is_k_full,
-                                         has_zp,
-                                         is_zp_float);
+  int cache_size =
+      get_kernel_cache_size(th_config, m_block_size_8, thread_m_blocks, prob_m,
+                            prob_n, prob_k, num_bits, group_size, has_act_order,
+                            is_k_full, has_zp, is_zp_float, is_a_8bit, stages);
   return cache_size <= max_shared_mem;
 }
 
-#define _GET_IF(W_TYPE,                                                        \
-                THREAD_M_BLOCKS,                                               \
-                THREAD_N_BLOCKS,                                               \
-                THREAD_K_BLOCKS,                                               \
-                M_BLOCK_SIZE_8,                                                \
-                GROUP_BLOCKS,                                                  \
-                NUM_THREADS,                                                   \
-                IS_ZP_FLOAT)                                                   \
-  else if (q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS &&           \
-           thread_n_blocks == THREAD_N_BLOCKS &&                               \
-           thread_k_blocks == THREAD_K_BLOCKS &&                               \
-           m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS && \
-           num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {         \
-    kernel = Marlin<scalar_t,                                                  \
-                    W_TYPE.id(),                                               \
-                    NUM_THREADS,                                               \
-                    THREAD_M_BLOCKS,                                           \
-                    THREAD_N_BLOCKS,                                           \
-                    THREAD_K_BLOCKS,                                           \
-                    M_BLOCK_SIZE_8,                                            \
-                    pipe_stages,                                               \
-                    GROUP_BLOCKS,                                              \
-                    IS_ZP_FLOAT>;                                              \
-  }
-
-// COMMON: cases for (group_blocks in [-1, 2, 4, 8] and is_zp_float == false)
-//         this is the most common cases
-// BIGGROUP: cases for big group size (group_blocks in [-1, 8])
-// FZP: cases for float-zero-point (is_zp_float = true)
-// ACT: cases for act order case (group_blocks == 0)
-// FP4: cases for nvfp4(e2m1) (group_blocks == 1)
-#define COMMON_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false)   \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 4, NUM_THREADS, false)   \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 8, NUM_THREADS, false)   \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)
-
-#define COMMON_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)  \
-                                                                        \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)  \
-                                                                        \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)
-
-#define COMMON_GET_IF(W_TYPE)            \
-  COMMON_GET_IF_M1(W_TYPE, 8, 8, 256)    \
-  COMMON_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-  COMMON_GET_IF_M234(W_TYPE, 16, 4, 256) \
-  COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)
-
-#define BIGGROUP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 8, NUM_THREADS, false)   \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)
-
-#define BIGGROUP_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)   \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)  \
-                                                                        \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)
-
-#define FP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)        \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
-
-#define FP4_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
-
-#define FP4_GET_IF(W_TYPE)            \
-  FP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
-  FP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-  FP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
-  FP4_GET_IF_M234(W_TYPE, 8, 4, 128)
-
-#define BIGGROUP_GET_IF(W_TYPE)            \
-  BIGGROUP_GET_IF_M1(W_TYPE, 8, 8, 256)    \
-  BIGGROUP_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-  BIGGROUP_GET_IF_M234(W_TYPE, 16, 4, 256) \
-  BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)
-
-// We currently have 4-bit models only with group_blocks == 4
-#define FZP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 4, NUM_THREADS, true) \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true)
-
-#define FZP_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true) \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true) \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, true)
-
-#define FZP_GET_IF(W_TYPE)            \
-  FZP_GET_IF_M1(W_TYPE, 8, 8, 256)    \
-  FZP_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-  FZP_GET_IF_M234(W_TYPE, 16, 4, 256) \
-  FZP_GET_IF_M234(W_TYPE, 8, 4, 128)
-
-// We currently have 4-bit models only with group_blocks == 4
-#define ACT_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)        \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 0, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 0, NUM_THREADS, false)
-
-#define ACT_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
-  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 0, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 0, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 0, NUM_THREADS, false)
-
-#define ACT_GET_IF(W_TYPE)            \
-  ACT_GET_IF_M1(W_TYPE, 8, 8, 256)    \
-  ACT_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-  ACT_GET_IF_M234(W_TYPE, 16, 4, 256) \
-  ACT_GET_IF_M234(W_TYPE, 8, 4, 128)
-
-template <typename scalar_t>
-MarlinFuncPtr get_marlin_kernel(const MARLIN_NAMESPACE_NAME::ScalarType q_type,
-                                int thread_m_blocks,
-                                int thread_n_blocks,
-                                int thread_k_blocks,
-                                bool m_block_size_8,
-                                bool has_act_order,
-                                bool has_zp,
-                                int group_blocks,
-                                int num_threads,
-                                bool is_zp_float) {
-  int num_bits = q_type.size_bits();
+MarlinFuncPtr get_marlin_kernel(
+    const vllm::ScalarType a_type, const vllm::ScalarType b_type,
+    const vllm::ScalarType c_type, const vllm::ScalarType s_type,
+    int thread_m_blocks, int thread_n_blocks, int thread_k_blocks,
+    bool m_block_size_8, bool has_act_order, bool has_zp, int group_blocks,
+    int threads, bool is_zp_float, int stages) {
+  int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
-  if (false) {
-  }
 
-  COMMON_GET_IF(MARLIN_NAMESPACE_NAME::kU4)
-  COMMON_GET_IF(MARLIN_NAMESPACE_NAME::kU4B8)
-  // COMMON_GET_IF(MARLIN_NAMESPACE_NAME::kU8B128)
+  // Extract type ids for kernel_selector.h dispatch
+  auto a_type_id = a_type.id();
+  auto b_type_id = b_type.id();
+  auto c_type_id = c_type.id();
+  auto s_type_id = s_type.id();
 
-  BIGGROUP_GET_IF(MARLIN_NAMESPACE_NAME::kFE4M3fn)
-
-  // FP4_GET_IF(MARLIN_NAMESPACE_NAME::kFE2M1f)
-
-  // ACT_GET_IF(MARLIN_NAMESPACE_NAME::kU4B8)
-  // ACT_GET_IF(MARLIN_NAMESPACE_NAME::kU8B128)
+#include "moe/moe_wna16_marlin_utils/kernel_selector.h"
 
   return kernel;
 }
 
-template <typename scalar_t>
 exec_config_t determine_exec_config(
-    const MARLIN_NAMESPACE_NAME::ScalarType& q_type,
-    int prob_m,
-    int prob_n,
-    int prob_k,
-    int thread_m_blocks,
-    bool m_block_size_8,
-    int num_bits,
-    int group_size,
-    bool has_act_order,
-    bool is_k_full,
-    bool has_zp,
-    bool is_zp_float,
-    int max_shared_mem) {
+    const vllm::ScalarType& a_type, const vllm::ScalarType& b_type,
+    const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
+    int prob_n, int prob_k, int num_experts, int top_k, int thread_m_blocks,
+    bool m_block_size_8, int num_bits, int group_size, bool has_act_order,
+    bool is_k_full, bool has_zp, bool is_zp_float, bool is_a_8bit, int stages,
+    int max_shared_mem, int sms) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
@@ -526,131 +296,82 @@ exec_config_t determine_exec_config(
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
 
-    if (!is_valid_config(th_config,
-                         m_block_size_8,
-                         thread_m_blocks,
-                         prob_m,
-                         prob_n,
-                         prob_k,
-                         num_bits,
-                         group_size,
-                         has_act_order,
-                         is_k_full,
-                         has_zp,
-                         is_zp_float,
-                         max_shared_mem)) {
+    if (!is_valid_config(th_config, m_block_size_8, thread_m_blocks, prob_m,
+                         prob_n, prob_k, num_bits, group_size, has_act_order,
+                         is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
+                         max_shared_mem - 512)) {
       continue;
     }
 
-    int cache_size = get_kernel_cache_size(th_config,
-                                           m_block_size_8,
-                                           thread_m_blocks,
-                                           prob_m,
-                                           prob_n,
-                                           prob_k,
-                                           num_bits,
-                                           group_size,
-                                           has_act_order,
-                                           is_k_full,
-                                           has_zp,
-                                           is_zp_float);
+    int cache_size = get_kernel_cache_size(
+        th_config, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
+        num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float,
+        is_a_8bit, stages);
 
     int group_blocks = 0;
     if (!has_act_order) {
       group_blocks = group_size == -1 ? -1 : (group_size / 16);
     }
 
-    auto kernel = get_marlin_kernel<scalar_t>(q_type,
-                                              thread_m_blocks,
-                                              th_config.thread_n / 16,
-                                              th_config.thread_k / 16,
-                                              m_block_size_8,
-                                              has_act_order,
-                                              has_zp,
-                                              group_blocks,
-                                              th_config.num_threads,
-                                              is_zp_float);
+    auto kernel =
+        get_marlin_kernel(a_type, b_type, c_type, s_type, thread_m_blocks,
+                          th_config.thread_n / 16, th_config.thread_k / 16,
+                          m_block_size_8, has_act_order, has_zp, group_blocks,
+                          th_config.num_threads, is_zp_float, stages);
 
     if (kernel == MarlinDefault) continue;
 
-    if (thread_m_blocks > 1) {
-      exec_cfg = {1, th_config};
-      break;
-    } else {
-      cudaFuncAttributes attr;
-      cudaFuncGetAttributes(&attr, reinterpret_cast<const void*>(kernel));
-      int reg_size = std::max(attr.numRegs, 1) * th_config.num_threads * 4;
-      int allow_count = std::min(device_max_reg_size / reg_size,
-                                 max_shared_mem / (cache_size + 1024));
-      allow_count = std::max(std::min(allow_count, 4), 1);
-      if (allow_count > count) {
-        count = allow_count;
-        exec_cfg = {count, th_config};
-      };
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, kernel);
+    int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
+    int allow_count = min(device_max_reg_size / reg_size,
+                          max_shared_mem / (cache_size + 1536));
+    if (thread_m_blocks == 1)
+      allow_count = max(min(allow_count, 4), 1);
+    else
+      allow_count = max(min(allow_count, 2), 1);
+
+    if (prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
+      allow_count =
+          max(prob_n / th_config.thread_n * prob_m * top_k * 4 / sms, 1);
     }
+
+    if (allow_count > count) {
+      count = allow_count;
+      exec_cfg = {count, th_config};
+    };
   }
 
   return exec_cfg;
 }
 
-template <typename scalar_t>
-void marlin_mm(const void* A,
-               const void* B,
-               void* C,
-               void* C_tmp,
-               void* s,
-               void* s2,
-               void* zp,
-               void* g_idx,
-               void* perm,
-               void* a_tmp,
-               void* sorted_token_ids,
-               void* expert_ids,
-               void* num_tokens_past_padded,
-               void* topk_weights,
-               int moe_block_size,
-               int top_k,
-               bool mul_topk_weights,
-               bool is_ep,
-               int prob_m,
-               int prob_n,
-               int prob_k,
-               void* workspace,
-               MARLIN_NAMESPACE_NAME::ScalarType const& q_type,
-               bool has_act_order,
-               bool is_k_full,
-               bool has_zp,
-               int num_groups,
-               int group_size,
-               int dev,
-               cudaStream_t stream,
-               int thread_k,
-               int thread_n,
-               int sms,
-               bool use_atomic_add,
-               bool use_fp32_reduce,
-               bool is_zp_float) {
+void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+               void* a_s, void* b_s, void* g_s, void* zp, void* g_idx,
+               void* perm, void* a_tmp, void* sorted_token_ids,
+               void* expert_ids, void* num_tokens_past_padded,
+               void* topk_weights, int moe_block_size, int num_experts,
+               int top_k, bool mul_topk_weights, int prob_m, int prob_n,
+               int prob_k, void* workspace, vllm::ScalarType const& a_type,
+               vllm::ScalarType const& b_type, vllm::ScalarType const& c_type,
+               vllm::ScalarType const& s_type, bool has_bias,
+               bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
+               int group_size, int dev, cudaStream_t stream, int thread_k,
+               int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+               bool use_fp32_reduce, bool is_zp_float) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
+  bool is_a_8bit = a_type.size_bits() == 8;
 
-  if (has_zp) {
-    PADDLE_ENFORCE(q_type == MARLIN_NAMESPACE_NAME::kU4 ||
-                       q_type == MARLIN_NAMESPACE_NAME::kU8, "Check failed. See source for details.");
-  } else {
-    PADDLE_ENFORCE(q_type == MARLIN_NAMESPACE_NAME::kU4B8 ||
-            q_type == MARLIN_NAMESPACE_NAME::kU8B128 ||
-            q_type == MARLIN_NAMESPACE_NAME::kFE4M3fn ||
-            q_type == MARLIN_NAMESPACE_NAME::kFE2M1f, "Check failed. See source for details.");
-  }
-
-  PADDLE_ENFORCE(prob_m > 0 && prob_n > 0 && prob_k > 0, "Check failed. See source for details.");
+  PADDLE_ENFORCE(prob_m > 0 && prob_n > 0 && prob_k > 0,
+                 "Invalid MNK = [", prob_m, ", ", prob_n, ", ", prob_k, "]");
 
   int group_blocks = 0;
   if (has_act_order) {
     if (is_k_full) {
       PADDLE_ENFORCE(group_size != -1, "group_size must != -1");
       group_blocks = group_size / 16;
-      PADDLE_ENFORCE(prob_k % group_blocks == 0, "Check failed. See source for details.");
+      PADDLE_ENFORCE(prob_k % group_blocks == 0, "prob_k = ", prob_k,
+                     " is not divisible by group_blocks = ", group_blocks);
     } else {
       PADDLE_ENFORCE(group_size == 0, "group_size must == 0");
       group_blocks = 0;
@@ -660,17 +381,20 @@ void marlin_mm(const void* A,
       group_blocks = -1;
     } else {
       group_blocks = group_size / 16;
-      PADDLE_ENFORCE(prob_k % group_blocks == 0, "Check failed. See source for details.");
+      PADDLE_ENFORCE(prob_k % group_blocks == 0, "prob_k = ", prob_k,
+                     " is not divisible by group_blocks = ", group_blocks);
     }
   }
 
-  int num_bits = q_type.size_bits();
+  int num_bits = b_type.size_bits();
   const int4* A_ptr = (const int4*)A;
   const int4* B_ptr = (const int4*)B;
   int4* C_ptr = (int4*)C;
   int4* C_tmp_ptr = (int4*)C_tmp;
-  const int4* s_ptr = (const int4*)s;
-  const uint16_t* s2_ptr = (const uint16_t*)s2;
+  const int4* bias_ptr = (const int4*)b_bias;
+  const float* a_s_ptr = (const float*)a_s;
+  const int4* b_s_ptr = (const int4*)b_s;
+  const uint16_t* g_s_ptr = (const uint16_t*)g_s;
   const int4* zp_ptr = (const int4*)zp;
   const int* g_idx_ptr = (const int*)g_idx;
   const int* perm_ptr = (const int*)perm;
@@ -695,7 +419,7 @@ void marlin_mm(const void* A,
     else if (moe_block_size == 64)
       kernel = permute_cols_kernel<64>;
     else
-      PADDLE_ENFORCE(false, "unsupported moe_block_size");
+      PADDLE_ENFORCE(false, "unsupported moe_block_size ", moe_block_size);
 
     // avoid ">>>" being formatted to "> > >"
     // clang-format off
@@ -714,33 +438,51 @@ void marlin_mm(const void* A,
   }
 
   int max_shared_mem = 0;
-  cudaDeviceGetAttribute(
-      &max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  PADDLE_ENFORCE(max_shared_mem > 0, "Check failed. See source for details.");
+  cudaDeviceGetAttribute(&max_shared_mem,
+                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  PADDLE_ENFORCE(max_shared_mem > 0, "max_shared_mem must > 0");
+
+  int major_capability, minor_capability;
+  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
+                         dev);
+  cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
+                         dev);
+  PADDLE_ENFORCE(major_capability * 10 + minor_capability >= 75,
+                 "marlin kernel only support Turing or newer GPUs.");
+  int stages = 4;
+  if (major_capability == 7 && minor_capability == 5) {
+    stages = 2;
+    PADDLE_ENFORCE(a_type == vllm::kFloat16 || a_type == vllm::kS8,
+                   "Turing only support FP16 or INT8 activation.");
+  }
+  if (a_type == vllm::kFE4M3fn) {
+    PADDLE_ENFORCE(major_capability * 10 + minor_capability >= 89,
+                   "FP8 only support Ada Lovelace or newer GPUs.");
+    PADDLE_ENFORCE(
+        major_capability * 10 + minor_capability == 89 ||
+            major_capability * 10 + minor_capability == 120,
+        "Marlin W4A8-FP8 only support SM89 or SM120 device (It is slower than "
+        "Marlin W4A16 on other devices).");
+  }
 
   // Set thread config
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
   if (thread_k != -1 && thread_n != -1) {
-    thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
-    exec_cfg = exec_config_t{1, thread_tfg};
-    PADDLE_ENFORCE(prob_n % thread_n == 0, "Check failed. See source for details.");
-    PADDLE_ENFORCE(prob_k % thread_k == 0, "Check failed. See source for details.");
+    thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
+    if (blocks_per_sm == -1) blocks_per_sm = 1;
+    exec_cfg = exec_config_t{blocks_per_sm, thread_tfg};
+    PADDLE_ENFORCE(prob_n % thread_n == 0, "prob_n = ", prob_n,
+                   " is not divisible by thread_n = ", thread_n);
+    PADDLE_ENFORCE(prob_k % thread_k == 0, "prob_k = ", prob_k,
+                   " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
-    exec_cfg = determine_exec_config<scalar_t>(q_type,
-                                               prob_m,
-                                               prob_n,
-                                               prob_k,
-                                               thread_m_blocks,
-                                               m_block_size_8,
-                                               num_bits,
-                                               group_size,
-                                               has_act_order,
-                                               is_k_full,
-                                               has_zp,
-                                               is_zp_float,
-                                               max_shared_mem);
+    exec_cfg = determine_exec_config(
+        a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
+        top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
+        has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
+        max_shared_mem, sms);
     thread_tfg = exec_cfg.tb_cfg;
   }
 
@@ -754,33 +496,40 @@ void marlin_mm(const void* A,
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
 
-  PADDLE_ENFORCE(is_valid_config(thread_tfg,
-                                 m_block_size_8,
-                                 thread_m_blocks,
-                                 prob_m,
-                                 prob_n,
-                                 prob_k,
-                                 num_bits,
-                                 group_size,
-                                 has_act_order,
-                                 is_k_full,
-                                 has_zp,
-                                 is_zp_float,
-                                 max_shared_mem), "Check failed. See source for details.");
+  PADDLE_ENFORCE(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
+                                 prob_m, prob_n, prob_k, num_bits, group_size,
+                                 has_act_order, is_k_full, has_zp, is_zp_float,
+                                 is_a_8bit, stages, max_shared_mem),
+                 "Invalid thread config: thread_m_blocks = ", thread_m_blocks,
+                 ", thread_k = ", thread_tfg.thread_k,
+                 ", thread_n = ", thread_tfg.thread_n,
+                 ", num_threads = ", thread_tfg.num_threads, " for MKN = [",
+                 prob_m, ", ", prob_k, ", ", prob_n,
+                 "] and num_bits = ", num_bits, ", group_size = ", group_size,
+                 ", has_act_order = ", has_act_order,
+                 ", is_k_full = ", is_k_full, ", has_zp = ", has_zp,
+                 ", is_zp_float = ", is_zp_float,
+                 ", max_shared_mem = ", max_shared_mem);
 
-  auto kernel = get_marlin_kernel<scalar_t>(q_type,
-                                            thread_m_blocks,
-                                            thread_n_blocks,
-                                            thread_k_blocks,
-                                            m_block_size_8,
-                                            has_act_order,
-                                            has_zp,
-                                            group_blocks,
-                                            num_threads,
-                                            is_zp_float);
+  int sh_cache_size =
+      get_kernel_cache_size(thread_tfg, m_block_size_8, thread_m_blocks, prob_m,
+                            prob_n, prob_k, num_bits, group_size, has_act_order,
+                            is_k_full, has_zp, is_zp_float, is_a_8bit, stages);
+
+  auto kernel = get_marlin_kernel(
+      a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks,
+      thread_k_blocks, m_block_size_8, has_act_order, has_zp, group_blocks,
+      num_threads, is_zp_float, stages);
 
   if (kernel == MarlinDefault) {
-    PADDLE_ENFORCE(false, "Check failed. See source for details.");
+    PADDLE_ENFORCE(false, "Unsupported shapes: MNK = [", prob_m, ", ", prob_n,
+                   ", ", prob_k, "]", ", has_act_order = ", has_act_order,
+                   ", num_groups = ", num_groups,
+                   ", group_size = ", group_size,
+                   ", thread_m_blocks = ", thread_m_blocks,
+                   ", thread_n_blocks = ", thread_n_blocks,
+                   ", thread_k_blocks = ", thread_k_blocks,
+                   ", num_bits = ", num_bits);
   }
 
   cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
@@ -789,10 +538,10 @@ void marlin_mm(const void* A,
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
-      A_ptr, B_ptr, C_ptr, C_tmp_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
-      topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
-      prob_n, prob_k, locks, use_atomic_add, use_fp32_reduce, max_shared_mem);
+      topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
   // clang-format on
 }
 
@@ -845,26 +594,96 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
     bool use_atomic_add,
     bool use_fp32_reduce,
     bool is_zp_float) {
-  MARLIN_NAMESPACE_NAME::ScalarType const b_q_type =
-      MARLIN_NAMESPACE_NAME::ScalarType::from_id(b_q_type_id);
-  int pack_factor = 32 / b_q_type.size_bits();
+  // Determine a_type, c_type, s_type from input tensor dtypes (matching vLLM)
+  vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
+
+  if (a.dtype() == paddle::DataType::FLOAT16) {
+    a_type_id = vllm::kFloat16.id();
+    c_type_id = vllm::kFloat16.id();
+  } else if (a.dtype() == MARLIN_NAMESPACE_NAME::kBFloat16) {
+    a_type_id = vllm::kBFloat16.id();
+    c_type_id = vllm::kBFloat16.id();
+  } else {
+    // W4A8 or W8A8 activation (INT8 or FP8)
+    if (b_scales.dtype() == paddle::DataType::FLOAT16) {
+      c_type_id = vllm::kFloat16.id();
+    } else if (b_scales.dtype() == MARLIN_NAMESPACE_NAME::kBFloat16) {
+      c_type_id = vllm::kBFloat16.id();
+    } else {
+      c_type_id = vllm::kBFloat16.id();
+
+      PADDLE_ENFORCE(c_or_none, "c must be passed for W4A8-FP4");
+      MARLIN_NAMESPACE_NAME::Tensor c_check = c_or_none.get();
+      if (c_check.dtype() == paddle::DataType::FLOAT16) {
+        c_type_id = vllm::kFloat16.id();
+      } else if (c_check.dtype() == MARLIN_NAMESPACE_NAME::kBFloat16) {
+        c_type_id = vllm::kBFloat16.id();
+      } else {
+        PADDLE_ENFORCE(false, "unsupported c dtype");
+      }
+    }
+
+    if (a.dtype() == paddle::DataType::FLOAT8_E4M3FN) {
+      a_type_id = vllm::kFE4M3fn.id();
+    } else if (a.dtype() == paddle::DataType::INT8) {
+      a_type_id = vllm::kS8.id();
+    } else {
+      PADDLE_ENFORCE(false, "unsupported a scalar_type");
+    }
+  }
+
+  s_type_id = c_type_id;
+  // FP4 (e2m1) scale type override - not currently used in FD but kept for
+  // completeness
+  vllm::ScalarType b_type_check = vllm::ScalarType::from_id(b_q_type_id);
+  if (b_type_check == vllm::kFE2M1f) {
+    if (b_scales.dtype() == paddle::DataType::FLOAT8_E4M3FN) {
+      s_type_id = vllm::kFE4M3fn.id();
+    } else {
+      PADDLE_ENFORCE(false,
+                     "When b_type = float4_e2m1f, b_scale scalar type must be "
+                     "float8_e4m3fn (for NVFP4).");
+    }
+  }
+
+  vllm::ScalarType a_type = vllm::ScalarType::from_id(a_type_id);
+  vllm::ScalarType b_type = vllm::ScalarType::from_id(b_q_type_id);
+  vllm::ScalarType c_type = vllm::ScalarType::from_id(c_type_id);
+  vllm::ScalarType s_type = vllm::ScalarType::from_id(s_type_id);
+
+  int pack_factor = 32 / b_type.size_bits();
+  int num_experts = b_q_weight.size(0);
 
   if (moe_block_size != 8) {
-    PADDLE_ENFORCE(moe_block_size % 16 == 0, "Check failed. See source for details.");
-    PADDLE_ENFORCE(moe_block_size >= 16 && moe_block_size <= 64, "Check failed. See source for details.");
+    PADDLE_ENFORCE(moe_block_size % 16 == 0,
+                   "unsupported moe_block_size=", moe_block_size);
+    PADDLE_ENFORCE(moe_block_size >= 16 && moe_block_size <= 64,
+                   "unsupported moe_block_size=", moe_block_size);
   }
 
   // Verify A
-  PADDLE_ENFORCE(a.size(0) == size_m, "Check failed. See source for details.");
-  PADDLE_ENFORCE(a.size(1) == size_k, "Check failed. See source for details.");
+  PADDLE_ENFORCE(a.size(0) == size_m, "Shape mismatch: a.size(0) = ", a.size(0),
+                 ", size_m = ", size_m);
+  PADDLE_ENFORCE(a.size(1) == size_k, "Shape mismatch: a.size(1) = ", a.size(1),
+                 ", size_k = ", size_k);
 
   // Verify B
-  PADDLE_ENFORCE(size_k % MARLIN_NAMESPACE_NAME::tile_size == 0, "Check failed. See source for details.");
-  PADDLE_ENFORCE((size_k / MARLIN_NAMESPACE_NAME::tile_size) == b_q_weight.size(1), "Check failed. See source for details.");
-  PADDLE_ENFORCE(b_q_weight.size(2) % MARLIN_NAMESPACE_NAME::tile_size == 0, "Check failed. See source for details.");
+  PADDLE_ENFORCE(size_k % MARLIN_NAMESPACE_NAME::tile_size == 0,
+                 "size_k = ", size_k,
+                 " is not divisible by tile_size = ",
+                 MARLIN_NAMESPACE_NAME::tile_size);
+  PADDLE_ENFORCE(
+      (size_k / MARLIN_NAMESPACE_NAME::tile_size) == b_q_weight.size(1),
+      "Shape mismatch: b_q_weight.size(1) = ", b_q_weight.size(1),
+      ", size_k = ", size_k, ", tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
+  PADDLE_ENFORCE(b_q_weight.size(2) % MARLIN_NAMESPACE_NAME::tile_size == 0,
+                 "b_q_weight.size(2) = ", b_q_weight.size(2),
+                 " is not divisible by tile_size = ",
+                 MARLIN_NAMESPACE_NAME::tile_size);
   int actual_size_n =
       (b_q_weight.size(2) / MARLIN_NAMESPACE_NAME::tile_size) * pack_factor;
-  PADDLE_ENFORCE(size_n == actual_size_n, "Check failed. See source for details.");
+  PADDLE_ENFORCE(size_n == actual_size_n, "size_n = ", size_n,
+                 ", actual_size_n = ", actual_size_n);
 
   // Verify device and strides
   PADDLE_ENFORCE(a.is_gpu(), "A is not on GPU");
@@ -876,34 +695,33 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
   PADDLE_ENFORCE(b_scales.is_gpu(), "b_scales is not on GPU");
   PADDLE_ENFORCE(b_scales.is_contiguous(), "b_scales is not contiguous");
 
-  // thread_k: `k` size of a thread_tile in `weights` (can usually be left as
-  // auto -1)
-  int thread_k = -1;
-  // thread_n: `n` size of a thread_tile in `weights` (can usually be left as
-  // auto -1)
-  int thread_n = -1;
-  // sms: number of SMs to use for the kernel
-  int sms = -1;
-
   int device_id = a.place().GetDeviceId();
 
+  // sms: number of SMs to use for the kernel
+  int sms = -1;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_id);
 
   // Alloc buffers
   phi::GPUPlace gpu_place(device_id);
-  // const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
-  // auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
   MARLIN_NAMESPACE_NAME::Tensor c;
   if (c_or_none) {
     c = c_or_none.get();
     PADDLE_ENFORCE(c.is_gpu(), "c is not on GPU");
     PADDLE_ENFORCE(c.is_contiguous(), "c is not contiguous");
-    PADDLE_ENFORCE(c.size(0) == size_m * top_k, "Check failed. See source for details.");
-    PADDLE_ENFORCE(c.size(1) == size_n, "Check failed. See source for details.");
+    PADDLE_ENFORCE(c.size(0) == size_m * top_k,
+                   "Shape mismatch: c.size(0) = ", c.size(0),
+                   ", size_m * topk = ", size_m * top_k);
+    PADDLE_ENFORCE(c.size(1) == size_n, "Shape mismatch: c.size(1) = ", c.size(1),
+                   ", size_n = ", size_n);
   } else {
     c = ConvertPaddleTensorToDetailTensor(paddle::experimental::empty(
         {size_m * top_k, size_n}, a.dtype(), phi::GPUPlace(device_id)));
   }
+
+  // Create dummy a_scales tensor (PaddlePaddle API does not pass a_scales yet)
+  MARLIN_NAMESPACE_NAME::Tensor a_scales =
+      ConvertPaddleTensorToDetailTensor(paddle::experimental::empty(
+          {0}, paddle::DataType::FLOAT32, phi::GPUPlace(device_id)));
 
   // Alloc C tmp buffer that is going to be used for the global reduce
   MARLIN_NAMESPACE_NAME::Tensor c_tmp;
@@ -927,7 +745,9 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
 
   int rank = b_scales.dim();
   PADDLE_ENFORCE(rank == 3, "b_scales rank must be 3");
-  PADDLE_ENFORCE(b_scales.size(2) == size_n, "Check failed. See source for details.");
+  PADDLE_ENFORCE(b_scales.size(2) == size_n,
+                 "b_scales dim 2 = ", b_scales.size(2),
+                 " is not size_n = ", size_n);
   int num_groups = b_scales.size(1);
 
   bool has_act_order = false;
@@ -943,7 +763,10 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
 
     // Verify g_idx and perm
     PADDLE_ENFORCE((g_idx.size(-1) == 0 && perm.size(-1) == 0) ||
-                       (g_idx.size(-1) == size_k && perm.size(-1) == size_k), "Check failed. See source for details.");
+                       (g_idx.size(-1) == size_k && perm.size(-1) == size_k),
+                   "Unexpected g_idx.size(-1) = ", g_idx.size(-1),
+                   " and perm.size(-1) = ", perm.size(-1),
+                   ", where size_k = ", size_k);
 
     has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
   } else {
@@ -963,7 +786,8 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
 
     if (is_k_full) {
       PADDLE_ENFORCE(num_groups > 1, "For act_order, num_groups must be > 1");
-      PADDLE_ENFORCE(size_k % num_groups == 0, "Check failed. See source for details.");
+      PADDLE_ENFORCE(size_k % num_groups == 0, "size_k = ", size_k,
+                     ", is not divisible by num_groups = ", num_groups);
       group_size = size_k / num_groups;
     } else {
       group_size = 0;
@@ -974,7 +798,9 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
         paddle::experimental::empty({0}, a.dtype(), phi::GPUPlace(device_id)));
 
     if (num_groups > 1) {
-      PADDLE_ENFORCE(size_k % num_groups == 0, "Check failed. See source for details.");
+      PADDLE_ENFORCE(size_k % num_groups == 0, "size_k = ", size_k,
+                     ", is not divisible by b_scales.size(1) = ",
+                     b_scales.size(1));
       group_size = size_k / num_groups;
     } else {
       group_size = -1;
@@ -984,16 +810,21 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
   MARLIN_NAMESPACE_NAME::Tensor global_scale;
   if (global_scale_or_none) {
     global_scale = global_scale_or_none.get();
-    PADDLE_ENFORCE(b_q_type == MARLIN_NAMESPACE_NAME::kFE2M1f,
-                   "global_scale can only be used for float4_e2m1f.");
+    PADDLE_ENFORCE(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
+                   "global_scale can only be used for nvfp4 format.");
   } else {
     global_scale = ConvertPaddleTensorToDetailTensor(
         paddle::experimental::empty({0}, a.dtype(), phi::GPUPlace(device_id)));
 
-    PADDLE_ENFORCE(
-        !(b_q_type == MARLIN_NAMESPACE_NAME::kFE2M1f),
-        "the global_scale parameter must be passed for float4_e2m1f.");
+    PADDLE_ENFORCE(!(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
+                   "the global_scale parameter must be passed for nvfp4 format.");
   }
+
+  // Create dummy b_bias (PaddlePaddle API does not pass b_bias yet)
+  bool has_bias = false;
+  MARLIN_NAMESPACE_NAME::Tensor b_bias =
+      ConvertPaddleTensorToDetailTensor(paddle::experimental::empty(
+          {0}, a.dtype(), phi::GPUPlace(device_id)));
 
   MARLIN_NAMESPACE_NAME::Tensor b_zeros;
   if (b_zeros_or_none) {
@@ -1007,13 +838,16 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
   bool has_zp = b_zeros.numel() > 0;
 
   if (has_zp) {
-    PADDLE_ENFORCE(b_q_type == MARLIN_NAMESPACE_NAME::kU4 ||
-                       b_q_type == MARLIN_NAMESPACE_NAME::kU8, "Check failed. See source for details.");
+    PADDLE_ENFORCE(b_type == vllm::kU4 || b_type == vllm::kU8,
+                   "b_type must be u4 or u8 when has_zp = True. Got = ",
+                   b_type.str());
   } else {
-    PADDLE_ENFORCE(b_q_type == MARLIN_NAMESPACE_NAME::kU4B8 ||
-                       b_q_type == MARLIN_NAMESPACE_NAME::kU8B128 ||
-                       b_q_type == MARLIN_NAMESPACE_NAME::kFE4M3fn ||
-                       b_q_type == MARLIN_NAMESPACE_NAME::kFE2M1f, "Check failed. See source for details.");
+    PADDLE_ENFORCE(b_type == vllm::kU4B8 || b_type == vllm::kU8B128 ||
+                       b_type == vllm::kS4 || b_type == vllm::kS8 ||
+                       b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
+                   "b_type must be uint4b8, uint8b128, int4, int8, "
+                   "float8_e4m3fn or float4_e2m1f when has_zp = False. Got = ",
+                   b_type.str());
   }
 
   if (has_zp && is_zp_float) {
@@ -1028,120 +862,55 @@ MARLIN_NAMESPACE_NAME::Tensor moe_wna16_marlin_gemm(
     int rank = b_zeros.dim();
     PADDLE_ENFORCE(rank == 3, "b_zeros rank must be 3");
     if (is_zp_float) {
-      PADDLE_ENFORCE(b_zeros.size(2) == size_n, "Check failed. See source for details.");
-      PADDLE_ENFORCE(num_groups == b_zeros.size(1), "Check failed. See source for details.");
+      PADDLE_ENFORCE(b_zeros.size(2) == size_n,
+                     "b_zeros dim 2 = ", b_zeros.size(2),
+                     " is not size_n = ", size_n);
+      PADDLE_ENFORCE(num_groups == b_zeros.size(1),
+                     "b_zeros dim 1 = ", b_zeros.size(1),
+                     " is not num_groups = ", num_groups);
       PADDLE_ENFORCE(num_groups != -1, "num_groups must be != -1");
     } else {
-      PADDLE_ENFORCE(b_zeros.size(1) == num_groups, "Check failed. See source for details.");
-      PADDLE_ENFORCE(b_zeros.size(2) == size_n / pack_factor, "Check failed. See source for details.");
+      PADDLE_ENFORCE(b_zeros.size(1) == num_groups,
+                     "b_zeros dim 1 = ", b_zeros.size(1),
+                     " is not num_groups = ", num_groups);
+      PADDLE_ENFORCE(b_zeros.size(2) == size_n / pack_factor,
+                     "b_zeros dim 2 = ", b_zeros.size(2),
+                     " is not size_n / pack_factor = ", size_n / pack_factor);
     }
   }
 
   // Verify workspace size
-  PADDLE_ENFORCE(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0, "Check failed. See source for details.");
+  PADDLE_ENFORCE(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
+                 "size_n = ", size_n, ", is not divisible by min_thread_n = ",
+                 MARLIN_NAMESPACE_NAME::min_thread_n);
 
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
   int min_workspace_size = std::min(
       max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
-  PADDLE_ENFORCE(workspace.numel() >= min_workspace_size, "Check failed. See source for details.");
+  PADDLE_ENFORCE(workspace.numel() >= min_workspace_size,
+                 "workspace.numel = ", workspace.numel(),
+                 " is below min_workspace_size = ", min_workspace_size);
 
-  if (a.dtype() == paddle::DataType::FLOAT16) {
-    using DataType = phi::dtype::float16;
+  PADDLE_ENFORCE(a_scales.dtype() == paddle::DataType::FLOAT32,
+                 "scalar type of a_scales must be float");
 
-    void* scales_ptr;
-    if (b_q_type == MARLIN_NAMESPACE_NAME::kFE2M1f) {
-      scales_ptr = b_scales.data_ptr<phi::dtype::float8_e4m3fn>();
-    } else {
-      scales_ptr = b_scales.data_ptr<DataType>();  // half
-    }
-
-    MARLIN_NAMESPACE_NAME::marlin_mm<half>(a.data_ptr<DataType>(),
-                                           b_q_weight.data_ptr(),
-                                           c.data_ptr<DataType>(),
-                                           c_tmp.data_ptr<float>(),
-                                           scales_ptr,
-                                           global_scale.data_ptr<DataType>(),
-                                           b_zeros.data_ptr(),
-                                           g_idx.data_ptr(),
-                                           perm.data_ptr(),
-                                           a_tmp.data_ptr<DataType>(),
-                                           sorted_token_ids.data_ptr(),
-                                           expert_ids.data_ptr(),
-                                           num_tokens_past_padded.data_ptr(),
-                                           topk_weights.data_ptr(),
-                                           moe_block_size,
-                                           top_k,
-                                           mul_topk_weights,
-                                           is_ep,
-                                           size_m,
-                                           size_n,
-                                           size_k,
-                                           workspace.data_ptr(),
-                                           b_q_type,
-                                           has_act_order,
-                                           is_k_full,
-                                           has_zp,
-                                           num_groups,
-                                           group_size,
-                                           device_id,
-                                           a.raw_tensor_.stream(),
-                                           thread_k,
-                                           thread_n,
-                                           sms,
-                                           use_atomic_add,
-                                           use_fp32_reduce,
-                                           is_zp_float);
-  } else if (a.dtype() == MARLIN_NAMESPACE_NAME::kBFloat16) {
-    using DataType = phi::dtype::bfloat16;
-
-    void* scales_ptr;
-    if (b_q_type == MARLIN_NAMESPACE_NAME::kFE2M1f) {
-      scales_ptr = b_scales.data_ptr<phi::dtype::float8_e4m3fn>();
-    } else {
-      scales_ptr = b_scales.data_ptr<DataType>();
-    }
-
-    MARLIN_NAMESPACE_NAME::marlin_mm<nv_bfloat16>(
-        a.data_ptr<DataType>(),
-        b_q_weight.data_ptr(),
-        c.data_ptr<DataType>(),
-        c_tmp.data_ptr<float>(),
-        scales_ptr,
-        global_scale.data_ptr<DataType>(),
-        b_zeros.data_ptr(),
-        g_idx.data_ptr(),
-        perm.data_ptr(),
-        a_tmp.data_ptr<DataType>(),
-        sorted_token_ids.data_ptr(),
-        expert_ids.data_ptr(),
-        num_tokens_past_padded.data_ptr(),
-        topk_weights.data_ptr(),
-        moe_block_size,
-        top_k,
-        mul_topk_weights,
-        is_ep,
-        size_m,
-        size_n,
-        size_k,
-        workspace.data_ptr(),
-        b_q_type,
-        has_act_order,
-        is_k_full,
-        has_zp,
-        num_groups,
-        group_size,
-        device_id,
-        a.raw_tensor_.stream(),
-        thread_k,
-        thread_n,
-        sms,
-        use_atomic_add,
-        use_fp32_reduce,
-        is_zp_float);
-  } else {
-    PADDLE_ENFORCE(false,
-                   "moe_wna16_marlin_gemm only supports bfloat16 and float16");
+  if (a_type.size_bits() == 16) {
+    PADDLE_ENFORCE(a.dtype() == c.dtype(),
+                   "scalar type of a must be the same with c for 16 bit activation");
   }
+
+  // Call marlin_mm without scalar_t template - use runtime type dispatch
+  MARLIN_NAMESPACE_NAME::marlin_mm(
+      a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
+      b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
+      global_scale.data_ptr(), b_zeros.data_ptr(), g_idx.data_ptr(),
+      perm.data_ptr(), a_tmp.data_ptr(), sorted_token_ids.data_ptr(),
+      expert_ids.data_ptr(), num_tokens_past_padded.data_ptr(),
+      topk_weights.data_ptr(), moe_block_size, num_experts, top_k,
+      mul_topk_weights, size_m, size_n, size_k, workspace.data_ptr(), a_type,
+      b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
+      num_groups, group_size, device_id, a.raw_tensor_.stream(), -1, -1, sms,
+      -1, use_atomic_add, use_fp32_reduce, is_zp_float);
 
   return c;
 }
@@ -1309,5 +1078,3 @@ PD_BUILD_STATIC_OP(moe_wna16_marlin_gemm)
     .SetKernelFn(PD_KERNEL(MoeWna16MarlinGemmApi))
     .SetInferShapeFn(PD_INFER_SHAPE(MoeWna16MarlinGemmInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(MoeWna16MarlinGemmInferDtype));
-
-#endif
