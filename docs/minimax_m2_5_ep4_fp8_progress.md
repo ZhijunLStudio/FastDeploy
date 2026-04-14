@@ -442,7 +442,7 @@ FD_MARLIN_FP8=1 CUDA_VISIBLE_DEVICES=4,5,6,7 python /tmp/fd_full_gen.py
 注意：FD `LLM` 类自己管理 worker 进程（内部调用 `paddle.distributed.launch`），
 **不应**再用外部 `paddle.distributed.launch` 包装。
 
-`/tmp/fd_full_gen.py` 示例：
+`/tmp/fd_llm_gen.py` 示例：
 ```python
 import os
 os.environ['FD_MARLIN_FP8'] = '1'
@@ -466,3 +466,119 @@ outputs = llm.generate(['Hello', 'What is the capital of France?'], sampling_par
 for out in outputs:
     print(f"[FD] {out.prompt} → {out.outputs[0].text}")
 ```
+
+---
+
+## 2026-04-14 工作评估与下一步计划
+
+### 评估总结：整体正确，方法论优秀
+
+对 2026-04-12/13 的所有工作进行了系统性评估。
+
+**已验证正确的工作：**
+- ✅ Scale expansion bug 修复 (`transpose([0,2,1,3])`)：dequant error=0.00，根因分析准确
+- ✅ numpy uint16 bug 修复 (`.cast("float32")` 前置)：n=2~40 正确，PaddlePaddle bf16 行为特性
+- ✅ FP8 非 expert 保留 + CPU expert 离驻：62层 ~59 GB/卡，正常运行
+- ✅ n=62 输出 `':'`：vLLM top-5 完全一致（顺序相同），**模型正确行为，不是 bug**
+- ✅ weight_scale_inv 初始化修复：FD LLM 类正常启动
+- ✅ 移除 lazy init hack，直接 `copy_`：CUDA graph capture 成功
+
+**技术决策合理性验证：**
+1. SM80 Marlin 不可用结论：8 个独立实验均失败，与 vLLM 源码 `TORCH_CHECK(major >= 89)` 一致——硬件限制，非 bug
+2. BF16 dequant workaround：与 vLLM SM80 路径（W8A16）等价，理论和实践均验证
+3. float32 MoE 累积：数值稳定性提升，与 vLLM CUDA kernel 内部 FP32 累积对齐
+
+---
+
+### 下一步计划（优先级排序）
+
+#### Step 1：端到端全量生成验证【等 GPU 空闲，立即执行】
+
+**目标**：验证 decode 循环（自回归多 token）与 vLLM 对齐
+
+```bash
+# FD LLM API（不要用 paddle.distributed.launch 包装）
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate paddle
+FD_MARLIN_FP8=1 CUDA_VISIBLE_DEVICES=4,5,6,7 python /tmp/fd_llm_gen.py
+```
+
+验证脚本需要同时运行 vLLM 对比：
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 python /tmp/vllm_generate.py  # conda: vllm
+```
+
+**成功标准**：
+- FD 和 vLLM 对 `['Hello', 'What is the capital of France?']` 的输出文本相同（或高度相似）
+- 生成 128 tokens 不崩溃
+
+**潜在问题**：每层 FP8 dequant ~12s，62 层初始化 ~744s（约 12 分钟）。这是已知代价，仅影响冷启动，不影响正确性。
+
+#### Step 2：性能基准测试【Step 1 通过后】
+
+**目标**：量化 BF16 dequant workaround 的性能代价
+
+测量指标：
+- Prefill 吞吐：tokens/s（短 prompt）
+- Decode 吞吐：tokens/s（128 token 生成）
+- GPU 内存峰值（`nvidia-smi` 监控）
+- 与 vLLM（SM80 FP8）的相对速度比
+
+关键性能风险：
+- CPU expert 离驻 → 每次 forward 都有 CPU→GPU 拷贝延迟
+- 每层非 expert FP8 dequant on-the-fly → 额外 GPU compute
+- 如果 decode 吞吐 < 5 tokens/s，需要评估是否可接受
+
+#### Step 3：代码清理【Step 1 通过后】
+
+确认 debug 代码已清理：
+
+| 文件 | 需检查 |
+|------|--------|
+| `fused_moe_marlin_backend.py` | 确认无遗留 dump/print 语句 |
+| `minimax_m2_5.py` | 确认 SM80 路径逻辑清晰，无 dead code |
+| `block_wise_fp8.py` | 确认 transpose fix 的 `apply()` 路径正确 |
+| `linear.py` | 已清理（progress 文档已记录） |
+
+更新 `CLAUDE.md` 第 3 节"当前状态"为 2026-04-14 最终状态。
+
+#### Step 4：长期路径决策【技术讨论】
+
+当前 BF16 dequant workaround 的局限性：
+
+| 方面 | 当前状态 | 理想状态 |
+|------|---------|---------|
+| 正确性 | ✅ 与 vLLM 一致 | — |
+| 显存 | ✅ ~59 GB/卡（可接受） | — |
+| 性能 | ⚠️ 未知，可能慢 2-5x | Marlin kernel 速度 |
+| 硬件覆盖 | SM80 only workaround | SM89+ 原生 FP8 Marlin |
+
+**选项 A**：保持 BF16 dequant（如果性能可接受）
+- 适合：验证/demo 场景，不适合生产高吞吐
+
+**选项 B**：同步 vLLM Marlin kernel 到 FD（为 SM80 添加官方支持）
+- 工作量：~2216 行 diff + 编译调试，优先级低
+
+**选项 C**：在 SM89+（H100/A10）上部署（原生 FP8 Marlin 可用）
+- 如果有 H100 资源，直接跳过 SM80 workaround
+
+---
+
+### 关键文件清单（2026-04-14 最终状态）
+
+| 文件 | 修改内容 |
+|------|---------|
+| `fastdeploy/model_executor/layers/quantization/block_wise_fp8.py` | `apply()` SM80 scale transpose fix + `weight_scale_inv` default_initializer |
+| `fastdeploy/model_executor/models/minimax_m2_5.py` | SM80 FP8 keep, CPU expert offload, float32 lm_head, remove lazy init hack |
+| `fastdeploy/model_executor/layers/moe/fused_moe_marlin_backend.py` | SM80 BF16 dequant, float32 accumulation, uint16 fix |
+| `fastdeploy/model_executor/layers/linear.py` | 清理 debug dump 代码 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin_template.h` | **未修改**（所有 SM80 尝试已回退） |
+
+---
+
+### 端到端验证方法
+
+1. 等 GPU 4-7 全部空闲
+2. 运行 `fd_llm_gen.py`（FD LLM API）
+3. 运行 `vllm_generate.py`（相同 prompt）
+4. 对比：输出文本、生成速度
+5. 如果 FD 输出与 vLLM 语义相符 → **EP=4 FP8 SM80 复现完成**
