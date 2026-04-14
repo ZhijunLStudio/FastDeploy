@@ -21,11 +21,19 @@ import paddle
 from paddle import nn
 
 import fastdeploy
-from fastdeploy.model_executor.ops.gpu import (
-    MoeWna16MarlinGemmApi,
-    tritonmoe_preprocess_func,
-    tritonmoe_preprocess_with_map_func,
-)
+try:
+    from fastdeploy.model_executor.ops.gpu import (
+        tritonmoe_preprocess_func,
+        tritonmoe_preprocess_with_map_func,
+    )
+except (ImportError, AttributeError):
+    tritonmoe_preprocess_func = None
+    tritonmoe_preprocess_with_map_func = None
+
+try:
+    from fastdeploy.model_executor.ops.gpu import MoeWna16MarlinGemmApi
+except (ImportError, AttributeError):
+    MoeWna16MarlinGemmApi = None
 
 from ..quantization.quant_base import QuantMethodBase
 
@@ -639,20 +647,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             topk_ids.cast("int64"), expert_map, num_local_experts, block_size_m
         )
 
-        # Step 4: Compute MoE FFN
-        # On SM80 (A100): use BF16 dequant + batched GEMM (Marlin kernel has precision issues)
-        # On SM90+ (Hopper): use Marlin FP8 kernel
-        from fastdeploy.model_executor.utils import get_sm_version
-        from fastdeploy.platforms import current_platform
-
-        if self.weight_type == "fp8" and get_sm_version() < 90 and current_platform.is_cuda():
-            if hasattr(layer, '_sm80_fp8_up_gate'):
-                return self._apply_ep_sm80_bf16(
-                    layer, x, topk_weights, topk_ids,
-                    M, hidden_size, top_k, ep_group,
-                )
-
-        # SM90+: use Marlin FP8 kernel
+        # Use Marlin FP8 kernel (SM80 and SM90+)
         b_q_type_str = "float8_e4m3fn" if self.weight_type == "fp8" else "uint4b8"
         workspace_up = paddle.zeros([528], dtype="int32")
         workspace_down = paddle.zeros([528], dtype="int32")
@@ -705,116 +700,6 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
 
         # Step 5: All-reduce across EP ranks to sum local expert outputs
         paddle.distributed.all_reduce(ffn_out, group=ep_group)
-
-        return ffn_out
-
-    def _apply_ep_sm80_bf16(
-        self,
-        layer: nn.Layer,
-        x: paddle.Tensor,
-        topk_weights: paddle.Tensor,
-        topk_ids: paddle.Tensor,
-        M: int,
-        hidden_size: int,
-        top_k: int,
-        ep_group,
-    ) -> paddle.Tensor:
-        """
-        SM80 (A100) fallback: per-layer dequant FP8→BF16 + cuBLAS GEMM.
-        Avoids Marlin kernel precision issues on SM80.
-        Dequants on-the-fly to avoid OOM from storing all layers' BF16 weights.
-        """
-        import numpy as np
-
-        BLOCK = 128
-
-        def dequant_to_bf16(fp8_weight, scale):
-            """Dequant FP8 weight to BF16 using block-wise scale."""
-            N, K = fp8_weight.shape
-            n_blocks_r = (N + BLOCK - 1) // BLOCK
-            n_blocks_c = (K + BLOCK - 1) // BLOCK
-            wt_f32 = fp8_weight.cast("float32").numpy()
-            sc = scale.numpy()
-            pad_r = n_blocks_r * BLOCK - N
-            pad_c = n_blocks_c * BLOCK - K
-            if pad_r > 0 or pad_c > 0:
-                wt_f32 = np.pad(wt_f32, ((0, pad_r), (0, pad_c)))
-            wt_blocked = wt_f32.reshape([n_blocks_r, BLOCK, n_blocks_c, BLOCK])
-            sc_expanded = sc.reshape([n_blocks_r, n_blocks_c])[:, np.newaxis, :, np.newaxis]
-            wt_dequant = (wt_blocked * sc_expanded).reshape(
-                [n_blocks_r * BLOCK, n_blocks_c * BLOCK]
-            )[:N, :K]
-            return paddle.to_tensor(wt_dequant, dtype="bfloat16")
-
-        # Dequant this layer's experts to BF16 on-the-fly
-        # (weights may be on CPU to save GPU memory; copy to GPU for dequant)
-        fp8_up_gate = layer._sm80_fp8_up_gate.cuda()     # [E, N*2, K]
-        fp8_up_gate_scale = layer._sm80_fp8_up_gate_scale.cuda()
-        fp8_down = layer._sm80_fp8_down.cuda()            # [E, N, K]
-        fp8_down_scale = layer._sm80_fp8_down_scale.cuda()
-
-        N_half = fp8_up_gate.shape[1] // 2
-        num_local = fp8_up_gate.shape[0]
-        local_start = layer.expert_id_offset
-
-        # Dequant all local experts to BF16 on-the-fly (~2.25 GB per layer)
-        gate_list, up_list, down_list = [], [], []
-        for i in range(num_local):
-            ug = dequant_to_bf16(fp8_up_gate[i], fp8_up_gate_scale[i])
-            gate_list.append(ug[:N_half])
-            up_list.append(ug[N_half:])
-            down_list.append(dequant_to_bf16(fp8_down[i], fp8_down_scale[i]))
-
-        all_gate = paddle.stack(gate_list, axis=0)  # [num_local, N, K] bf16
-        all_up = paddle.stack(up_list, axis=0)
-        all_down = paddle.stack(down_list, axis=0)
-
-        # Process each local expert: gather its tokens, compute, scatter
-        topk_ids_np = topk_ids.numpy()
-        topk_weights_np = topk_weights.numpy()
-
-        ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
-        x_bf16 = x.cast("bfloat16")
-
-        for local_expert_id in range(num_local):
-            global_expert_id = local_start + local_expert_id
-
-            mask = topk_ids_np == global_expert_id
-            if not mask.any():
-                continue
-
-            token_indices = np.where(mask)[0]
-            weights = topk_weights_np[mask]
-
-            token_x = x_bf16[token_indices]
-
-            gate_w = all_gate[local_expert_id]
-            up_w = all_up[local_expert_id]
-            down_w = all_down[local_expert_id]
-
-            gate_out = paddle.nn.functional.linear(token_x, gate_w.T)
-            up_out = paddle.nn.functional.linear(token_x, up_w.T)
-            swiglu_out = paddle.nn.functional.swiglu(
-                paddle.concat([gate_out, up_out], axis=-1)
-            )
-            expert_out = paddle.nn.functional.linear(swiglu_out, down_w.T)
-
-            weighted_expert_out = expert_out.cast("float32") * weights[:, np.newaxis].astype("float32")
-
-            # Scatter-add to ffn_out (float32 accumulation, no BF16 round-trip)
-            ffn_out_np = ffn_out.numpy()
-            weighted_np = weighted_expert_out.numpy()
-            for idx, tidx in enumerate(token_indices):
-                ffn_out_np[tidx] += weighted_np[idx]
-            ffn_out = paddle.to_tensor(ffn_out_np, dtype="float32")
-
-        # All-reduce across EP ranks (ffn_out is already float32)
-        paddle.distributed.all_reduce(ffn_out, group=ep_group)
-        ffn_out = ffn_out.cast("bfloat16")
-
-        # Free GPU copies of FP8 weights (originals stay on CPU)
-        del fp8_up_gate, fp8_up_gate_scale, fp8_down, fp8_down_scale
-        del all_gate, all_up, all_down
 
         return ffn_out
 
