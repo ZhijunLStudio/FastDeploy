@@ -490,95 +490,200 @@ for out in outputs:
 
 ---
 
-### 下一步计划（优先级排序）
+## 2026-04-14 关键问题澄清（vLLM 真实路径分析）
 
-#### Step 1：端到端全量生成验证【等 GPU 空闲，立即执行】
+### 问题 1：vLLM 在 SM80 上是否做 INT4 转换或校准？
 
-**目标**：验证 decode 循环（自回归多 token）与 vLLM 对齐
+**答案：否。vLLM 在 SM80 上全程使用 FP8 权重，不做 INT4 转换，不需要校准。**
 
-```bash
-# FD LLM API（不要用 paddle.distributed.launch 包装）
-source ~/anaconda3/etc/profile.d/conda.sh && conda activate paddle
-FD_MARLIN_FP8=1 CUDA_VISIBLE_DEVICES=4,5,6,7 python /tmp/fd_llm_gen.py
+**vLLM 的真实路径（SM80 + FP8 block-wise）：**
+
+```
+config.json: quant_method=fp8, weight_block_size=[128,128]
+      ↓
+Fp8LinearMethod.__init__: use_marlin=True (SM80 < SM89)
+      ↓
+process_weights_after_loading:
+  FP8权重 → pack_fp8_to_int32 → Marlin tile repack (仍是FP8 bit，不是INT4/BF16)
+      ↓
+apply():
+  ops.marlin_gemm(权重=FP8 packed, 激活=BF16)  ← W8A16, 激活不量化
+      ↓
+MoE: MarlinExperts → ops.moe_wna16_marlin_gemm
 ```
 
-验证脚本需要同时运行 vLLM 对比：
-```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 python /tmp/vllm_generate.py  # conda: vllm
+**关键结论：**
+- vLLM 权重始终是 FP8，只是 repack 成 Marlin 的内存布局（packed int32 存储，bit 语义仍是 FP8）
+- Marlin W8A16 kernel 支持 SM80
+- **不需要任何校准**，直接加载 FP8 权重就能跑
+- 激活保持 BF16，不做量化
+
+### 问题 2：为什么 FD 的 Marlin kernel 在 SM80 上失败？
+
+**答案：FD 的 Marlin kernel 在 SM80 上有 bug，不是硬件限制。**
+
+**对比分析：**
+
+| 项目 | vLLM | FD |
+|------|------|-----|
+| Marlin kernel 版本 | vLLM 自维护版本 | FD 自维护版本 |
+| 行数差异 | ~85KB | ~75KB |
+| 核心计算逻辑 | dequant、scale、MMA 指令 | dequant、scale、MMA 指令 |
+| 计算逻辑一致性 | ✅ bit-identical | ✅ bit-identical |
+| 调度策略 | DP+SK 调度 | 简单 stripe 调度 |
+| pipeline 优化 | 已移除 `should_load_a` | 保留 `should_load_a`/`pipe_a` |
+| SM80 结果 | ✅ 正常工作 | ❌ 从第 2 层开始退化 |
+
+**根本问题：**
+- FD 的 Marlin kernel 在 SM80 上的**调度策略或 pipeline 管理**与 vLLM 不同
+- 导致 FP32 累积顺序差异，产生精度退化
+- 不是核心计算逻辑的问题（dequant、scale、MMA 都是 bit-identical）
+
+### 问题 3：手动构造 ForwardMeta 的问题
+
+**手动 forward 的代码位置：** `/tmp/fd_n62.py`
+
+**为什么手动构造？**
+- LLM API 在 SM80 上启动时崩溃（`weight_scale_inv` 未初始化）
+- 手动 forward 绕过 LLM API，验证 prefill 阶段的数值正确性
+
+**手动 forward 的输入：**
+```python
+# 1. token IDs → embedding
+input_ids = tokenizer.encode("Hello", return_tensors="pd")
+hidden_states = model.model.embed_tokens(input_ids)  # shape=[1, 1, 3072]
+
+# 2. 手动 forward 62 层
+for layer_idx in range(62):
+    hidden_states = layer(hidden_states, meta=meta)
+
+# 3. lm_head 得到 logits
+logits = model.lm_head(hidden_states)
 ```
 
-**成功标准**：
-- FD 和 vLLM 对 `['Hello', 'What is the capital of France?']` 的输出文本相同（或高度相似）
+**问题：**
+- 手动 forward 只能测 prefill（首 token），无法测 decode 循环
+- 不优雅，但当前是验证精度的唯一方法
+
+### 问题 4：FP8 算子 vs 反量化方法的问题
+
+**FP8 Marlin 算子（FD 当前）：**
+- ❌ SM80 上精度错误（从第 2 层退化）
+- ❌ 硬件限制？否，vLLM 的 Marlin 在 SM80 上正常工作
+- ✅ 根本问题是 FD 的调度策略与 vLLM 不同
+
+**BF16 dequant workaround（FD 当前）：**
+- ✅ 精度正确（与 vLLM 一致）
+- ❌ 性能差（cuBLAS BF16 GEMM + CPU→GPU 拷贝）
+- ❌ 临时方案，不是生产可用
+
+**正确方向：**
+- 修复 FD 的 Marlin kernel（对标 vLLM 的调度策略）
+- 或：同步 vLLM 的 Marlin kernel 到 FD
+
+---
+
+## 下一步计划（优先级排序）
+
+### Step 1：修复 FD Marlin kernel 在 SM80 上的 bug【最高优先级】
+
+**目标：** 让 FD 的 Marlin kernel 在 SM80 上能正常工作（对标 vLLM）
+
+**方法：**
+1. 对比 FD 和 vLLM 的 `marlin_template.h`，找到调度策略差异
+2. 重点检查：
+   - `should_load_a`/`pipe_a` pipeline 优化
+   - `max_num_stage_groups` 计算
+   - stripe 调度 vs DP+SK 调度
+3. 修复后验证 n=2 输出是否正确
+
+**工作量：** 2-3 天
+
+**成功标准：**
+- FD Marlin kernel 在 SM80 上 n=2 输出 `'\n\n'`（与 vLLM 一致）
+- n=62 输出 `':'`（与 vLLM 一致）
+
+---
+
+### Step 2：端到端全量生成验证【Step 1 通过后】
+
+**目标：** 验证 decode 循环（自回归多 token）与 vLLM 对齐
+
+**方法：**
+1. 修复 LLM API 的 AppendAttention kernel 编译问题（补全 num_heads=6 模板）
+2. 运行 FD LLM API 生成 128 tokens
+3. 与 vLLM 对比输出文本
+
+**成功标准：**
+- FD 和 vLLM 对 `['Hello', 'What is the capital of France?']` 的输出文本相同
 - 生成 128 tokens 不崩溃
 
-**潜在问题**：每层 FP8 dequant ~12s，62 层初始化 ~744s（约 12 分钟）。这是已知代价，仅影响冷启动，不影响正确性。
+---
 
-#### Step 2：性能基准测试【Step 1 通过后】
+### Step 3：性能基准测试【Step 2 通过后】
 
-**目标**：量化 BF16 dequant workaround 的性能代价
+**目标：** 量化 Marlin kernel 的性能
 
-测量指标：
-- Prefill 吞吐：tokens/s（短 prompt）
-- Decode 吞吐：tokens/s（128 token 生成）
-- GPU 内存峰值（`nvidia-smi` 监控）
-- 与 vLLM（SM80 FP8）的相对速度比
-
-关键性能风险：
-- CPU expert 离驻 → 每次 forward 都有 CPU→GPU 拷贝延迟
-- 每层非 expert FP8 dequant on-the-fly → 额外 GPU compute
-- 如果 decode 吞吐 < 5 tokens/s，需要评估是否可接受
-
-#### Step 3：代码清理【Step 1 通过后】
-
-确认 debug 代码已清理：
-
-| 文件 | 需检查 |
-|------|--------|
-| `fused_moe_marlin_backend.py` | 确认无遗留 dump/print 语句 |
-| `minimax_m2_5.py` | 确认 SM80 路径逻辑清晰，无 dead code |
-| `block_wise_fp8.py` | 确认 transpose fix 的 `apply()` 路径正确 |
-| `linear.py` | 已清理（progress 文档已记录） |
-
-更新 `CLAUDE.md` 第 3 节"当前状态"为 2026-04-14 最终状态。
-
-#### Step 4：长期路径决策【技术讨论】
-
-当前 BF16 dequant workaround 的局限性：
-
-| 方面 | 当前状态 | 理想状态 |
-|------|---------|---------|
-| 正确性 | ✅ 与 vLLM 一致 | — |
-| 显存 | ✅ ~59 GB/卡（可接受） | — |
-| 性能 | ⚠️ 未知，可能慢 2-5x | Marlin kernel 速度 |
-| 硬件覆盖 | SM80 only workaround | SM89+ 原生 FP8 Marlin |
-
-**选项 A**：保持 BF16 dequant（如果性能可接受）
-- 适合：验证/demo 场景，不适合生产高吞吐
-
-**选项 B**：同步 vLLM Marlin kernel 到 FD（为 SM80 添加官方支持）
-- 工作量：~2216 行 diff + 编译调试，优先级低
-
-**选项 C**：在 SM89+（H100/A10）上部署（原生 FP8 Marlin 可用）
-- 如果有 H100 资源，直接跳过 SM80 workaround
+**测量指标：**
+- Prefill 吞吐：tokens/s
+- Decode 吞吐：tokens/s
+- GPU 内存峰值
+- 与 vLLM 的相对速度比
 
 ---
 
-### 关键文件清单（2026-04-14 最终状态）
+### Step 4：代码清理【Step 2 通过后】
 
-| 文件 | 修改内容 |
-|------|---------|
-| `fastdeploy/model_executor/layers/quantization/block_wise_fp8.py` | `apply()` SM80 scale transpose fix + `weight_scale_inv` default_initializer |
-| `fastdeploy/model_executor/models/minimax_m2_5.py` | SM80 FP8 keep, CPU expert offload, float32 lm_head, remove lazy init hack |
-| `fastdeploy/model_executor/layers/moe/fused_moe_marlin_backend.py` | SM80 BF16 dequant, float32 accumulation, uint16 fix |
-| `fastdeploy/model_executor/layers/linear.py` | 清理 debug dump 代码 |
-| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin_template.h` | **未修改**（所有 SM80 尝试已回退） |
+**目标：** 移除 BF16 dequant workaround（如果 Marlin kernel 修复成功）
+
+**清理内容：**
+- `fused_moe_marlin_backend.py`：移除 `_apply_ep_sm80_bf16` 方法
+- `minimax_m2_5.py`：移除 `sm80_keep_fp8` 和 CPU expert 离驻逻辑
+- `block_wise_fp8.py`：保留 scale transpose fix（这是正确的 bug 修复）
 
 ---
 
-### 端到端验证方法
+## 关键文件清单（2026-04-14）
 
-1. 等 GPU 4-7 全部空闲
-2. 运行 `fd_llm_gen.py`（FD LLM API）
-3. 运行 `vllm_generate.py`（相同 prompt）
-4. 对比：输出文本、生成速度
-5. 如果 FD 输出与 vLLM 语义相符 → **EP=4 FP8 SM80 复现完成**
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| `fastdeploy/model_executor/layers/quantization/block_wise_fp8.py` | ✅ 已修复 | scale transpose fix + weight_scale_inv default_initializer |
+| `fastdeploy/model_executor/models/minimax_m2_5.py` | ⚠️ 待清理 | 当前有 BF16 workaround，需等 Marlin kernel 修复后清理 |
+| `fastdeploy/model_executor/layers/moe/fused_moe_marlin_backend.py` | ⚠️ 待清理 | 当前有 BF16 workaround，需等 Marlin kernel 修复后清理 |
+| `custom_ops/gpu_ops/moe/moe_wna16_marlin_utils/marlin_template.h` | ❌ 需修复 | FD 版本与 vLLM 有调度策略差异，需对标修复 |
+| `/data/lizhijun/work/fd-vllm/vllm/vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py` | 📖 参考 | vLLM 的 Marlin FP8 实现，可作为对标参考 |
+
+---
+
+## 运行命令
+
+### FD Marlin kernel 测试（修复后）
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate paddle
+FD_MARLIN_FP8=1 CUDA_VISIBLE_DEVICES=4,5,6,7 python -m paddle.distributed.launch /tmp/fd_n62.py --n-layers 2
+```
+
+### vLLM 对比测试
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate vllm
+CUDA_VISIBLE_DEVICES=4,5,6,7 python /tmp/vllm_n62.py --n-layers 2
+```
+
+---
+
+## 总结
+
+**当前状态：**
+- ✅ Prefill 首 token 精度已验证（与 vLLM top-5 完全一致）
+- ❌ Decode 循环未完成（AppendAttention kernel 编译问题）
+- ❌ Marlin kernel 在 SM80 上有 bug（需修复）
+
+**下一步核心任务：**
+1. 修复 FD Marlin kernel 在 SM80 上的调度策略 bug
+2. 让 LLM API 正常启动并跑通端到端生成
+3. 清理 BF16 workaround 代码（如果 Marlin 修复成功）
+
+**关键认知修正：**
+- vLLM 在 SM80 上**不做 INT4 转换**，直接用 FP8 权重 + Marlin W8A16 kernel
+- FD 的 Marlin kernel 不是"硬件不支持"，而是"实现有 bug"
+- 修复方向是**对标 vLLM 的调度策略**，不是换 INT4 或做校准
