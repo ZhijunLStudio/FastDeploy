@@ -18,6 +18,8 @@
 | top-4 | `="'` (1139) ✅ | `="'` (1139) |
 | top-5 | `'.'` (46) ✅ | `'.'` (46) |
 
+**注意：** 这是手动 ForwardMeta 的 prefill-only 测试，只跑一步 prefill（13 tokens），没有 autoregressive decode 循环，没有用 FD 的 LLM API。
+
 ### LLM API 端到端（prefill + decode）：**TP=2 EP=2 已跑通** ✅
 
 TP=2 EP=2 + disable_sequence_parallel_moe + 2 层：成功，无崩溃，有输出。
@@ -29,6 +31,21 @@ TP=2 EP=2 + disable_sequence_parallel_moe + 2 层：成功，无崩溃，有输�
 - **vLLM**: token 367, 367, 367, 367, ...（全部是换行符 367）
 
 两者从第 2 个 token 开始就不一致。
+
+### EP=4 LLM API 端到端：**运行中但极慢** ⚠️
+
+2026-04-17 晚，首次用 FD LLM API（`fastdeploy.entrypoints.llm.LLM`）以 EP=4 模式运行 MiniMax-M2.5。
+
+**关键配置发现：** FD 的 EP size 通过 `data_parallel_size` 参数控制，不是 `expert_parallel_size`。`expert_parallel_size = data_parallel_size * tensor_parallel_size`。
+
+**运行状态：**
+- 配置正确：`expert_parallel_size=4`, `data_parallel_size=4`, `use_ep=True`
+- 模型加载成功：2 层，~23 秒，SM80 FP8 CPU offload 路径
+- KV cache 初始化成功
+- 请求已调度（M=6 tokens）
+- **卡在 MoE forward**：`_apply_ep_sm80_bf16` 处理 64 experts 时极慢（每步 forward 都需要 CPU numpy dequant 64 experts）
+
+**根因：** SM80 bf16 workaround 的设计缺陷——FP8 expert 权重存 CPU，每次 MoE forward 都要重新做 `numpy dequant FP8→BF16`（64 experts），这是每步推理的开销，不是一次性的加载开销。
 
 ### EP=4 TP=4：**已定位根因** 🔍
 
@@ -717,3 +734,107 @@ SM80 bf16 workaround 恢复后，4 卡 EP=4 应该可以跑 62 层（之前验�
 ### 优先级 3：`forward_split_allgather` 的 token 拆分逻辑验证
 
 FD 的 MoE 使用 `forward_split_allgather` 将 tokens 拆分后分别计算。需要验证这个拆分逻辑是否和 vLLM 一致。
+
+---
+
+## 十四、EP=4 LLM API 端到端首次运行（2026-04-17 晚）
+
+### 14.1 运行环境
+
+**环境：** GPU 4,5,6,7 (paddle env)，EP=4，2 层，`FD_MARLIN_FP8=1`
+
+**启动命令：**
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 FD_MARLIN_FP8=1 FD_ATTENTION_BACKEND=FLASH_ATTN \
+  conda run -n paddle python /tmp/fd_minimax_demo.py
+```
+
+**关键配置：**
+```python
+llm = LLM(
+    model='/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5',
+    tensor_parallel_size=1,
+    data_parallel_size=4,  # 控制 EP size
+    enable_expert_parallel=True,
+    disable_sequence_parallel_moe=True,
+    max_model_len=512,
+    gpu_memory_utilization=0.90,
+    max_num_seqs=4,
+    num_gpu_blocks_override=100,
+    max_num_batched_tokens=512,
+    graph_optimization_config={'use_cudagraph': False},
+)
+```
+
+### 14.2 关键发现：FD 的 EP 配置方式
+
+FD 的 `EngineArgs` 不接受 `expert_parallel_size` 参数。EP size 通过以下方式推导：
+```python
+# config.py
+if self.enable_expert_parallel:
+    self.expert_parallel_size = self.data_parallel_size * self.tensor_parallel_size
+```
+
+所以 `tensor_parallel_size=1, data_parallel_size=4, enable_expert_parallel=True` → `expert_parallel_size=4`。
+
+**之前错误的配置：** 只传 `enable_expert_parallel=True` 不传 `data_parallel_size`，导致 `expert_parallel_size=1*1=1`，EP 不生效。
+
+### 14.3 运行结果
+
+**加载阶段（成功）：**
+- 模型加载 125 个 safetensors 文件：~17 秒
+- SM80 FP8 CPU offload：每层 ~1.5 秒
+- 总加载时间：~23 秒
+- GPU 显存：GPU 4: 8097 MiB, GPU 5-7: 4759 MiB
+- KV cache 初始化成功（100 blocks, 2 层）
+
+**推理阶段（极慢）：**
+- 请求已调度：M=6 tokens, topk_ids.shape=[6, 8]
+- 卡在 `_apply_ep_sm80_bf16` 的 MoE forward
+- GPU 利用率 100%，但进展极慢
+- 5+ 分钟未完成第一步 MoE forward
+
+### 14.4 根因分析：SM80 BF16 Workaround 每次 Forward 都重新 Dequant
+
+**问题：** `_apply_ep_sm80_bf16` 在每次 MoE forward 时对每个 expert 做：
+1. FP8 权重从 CPU → GPU（`expert_w = layer._sm80_fp8_up_gate[ei].cuda()`）
+2. CPU numpy block-wise dequant FP8→BF16
+3. GPU BF16 GEMM
+
+对于 64 experts × top-8 routing，每步 decode 都要 dequant 64 个 expert 的权重。这是 O(64 × N × K) 的 numpy 计算，非常慢。
+
+**正确的设计应该是：**
+- 加载时：FP8 → BF16 反量化一次，BF16 权重常驻 GPU
+- 推理时：直接用 BF16 权重做 GEMM
+
+但当前为了省内存（62 层 4 卡 FP8 expert BF16 权重 ~144 GB，超出 4×80 GB），选择了 CPU FP8 + forward dequant。对于 2 层模型显存完全够用，不需要 CPU offload。
+
+### 14.5 下一步修复方向
+
+**方案 A（推荐，适用于小层数）：** 2 层模型直接在加载时 dequant 到 BF16 放 GPU，不做 CPU offload。
+- 2 层 × 64 experts × BF16 = ~1.5 GB/卡，完全够用
+- 每步 forward 直接用 GPU BF16 权重做 GEMM，无 dequant 开销
+
+**方案 B（适用于 62 层）：** 保持 CPU FP8 offload，但只 dequant 一次，缓存 BF16 结果。
+- 加载时不做 dequant（省内存）
+- 首次 forward 时 dequant 64 experts → BF16 缓存到 GPU
+- 后续 forward 直接用缓存的 BF16 权重
+- 问题：62 层 × 64 experts BF16 不够放 GPU
+
+**方案 C（适用于 62 层）：** LRU 缓存——只缓存最近 N 个被选中的 expert 的 BF16 权重，淘汰不常用的。
+- 复杂度较高，但能平衡显存和速度
+
+### 14.6 确认的配置信息
+
+FD LLM API 启动日志确认的配置：
+```
+expert_parallel_size: 4
+data_parallel_size: 4
+use_ep: True
+worker_num_per_node: 4
+MoE config: ep_size=4, num_experts=256[0, 64)
+SM80: Stored raw FP8 expert weights on CPU for layer 0
+Model loading took 23.609 seconds
+```
+
+Worker 日志位置：`/data/lizhijun/work/fd-vllm/vllm/log/workerlog.{0-3}`（注意在 vllm 目录下，不是 FastDeploy 目录下）。
