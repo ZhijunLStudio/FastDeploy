@@ -69,177 +69,103 @@ def _marlin_permute_scales(s, size_k, size_n, group_size):
     return s.reshape([-1, size_n]).contiguous()
 
 
-def _process_fp8_marlin_weights(moe_layer, up_gate_fp8, up_gate_scale,
-                                  down_fp8, down_scale, block_size):
+def _process_fp8_marlin_weights(moe_layer, up_gate_info_list, down_info_list,
+                                  up_gate_scales, down_scales, block_size):
     """Process FP8 MoE weights for Marlin kernel and load into layer.
 
-    Args:
-        moe_layer: the FusedMoE layer
-        up_gate_fp8: [num_experts, moe_intermediate_size*2, hidden_size] float8_e4m3fn (N, K format)
-        up_gate_scale: [num_experts, n_blocks_n_up, n_blocks_k_up] float32
-        down_fp8: [num_experts, hidden_size, moe_intermediate_size] float8_e4m3fn (N, K format)
-        down_scale: [num_experts, n_blocks_n_down, n_blocks_k_down] float32
-        block_size: FP8 block size (typically 128)
+    Per-expert with paddle ops: stack -> cast uint8 -> pack int32 -> gptq_marlin_repack.
+    C++ dispatch overhead is acceptable since GPU computation dominates.
     """
     from fastdeploy.model_executor.ops.gpu import gptq_marlin_repack
 
-    for idx, (fp8_weight, scale, weight_name, scale_name) in enumerate([
-        (up_gate_fp8, up_gate_scale, "up_gate_proj_weight", "up_gate_proj_weight_scale"),
-        (down_fp8, down_scale, "down_proj_weight", "down_proj_weight_scale"),
-    ]):
-        # Checkpoint weight is [E, N, K] format (output, input)
-        E, N, K = fp8_weight.shape
-        group_size = block_size
-        num_bits = 8
+    num_experts = len(up_gate_info_list)
+    num_bits = 8
+    perm = paddle.empty([0], dtype="int32")
 
-        marlin_qweights = []
-        marlin_scales = []
-        perm = paddle.empty([0], dtype="int32")
+    marlin_up_gate_qweights = []
+    marlin_up_gate_scales = []
+    marlin_down_qweights = []
+    marlin_down_scales = []
 
-        for i in range(E):
-            # fp8_weight[i] is [N, K] format
-            # For Marlin: pack K dimension, then repack
-            fp8_i = fp8_weight[i]  # [N, K]
-            # Transpose to [K, N] for packing
-            fp8_i_t = fp8_i.T.contiguous()  # [K, N]
-            # Pack: [K, N] -> [K, N//4] (4 FP8 per int32)
-            packed = fp8_i_t.view("int32")  # [K, N//4]
-            # Transpose for Marlin: [N//4, K]
-            packed_t = packed.T.contiguous()  # [N//4, K]
-            # Wait - gptq_marlin_repack expects [K//4, N] for input?
-            # Let me check: the INT4 code does quanted_weight.reshape([0, K//8, 8, N])
-            # which gives [E, K//8, N] and then repack with K, N
-            # For FP8: packed is [K, N//4], so we need [K//4, N] as input?
-            # Actually, gptq_marlin_repack expects b_q_weight of shape [K//pack_factor, N]
-            # where pack_factor = 32/num_bits = 4 for FP8
-            # So input should be [K//4, N]
-            # Currently we have [N//4, K] which is wrong
-            # We need to transpose: [K//4, N] from [K, N//4] by doing packed.T
-            # But packed is [K, N//4], so packed.T is [N//4, K]
-            # We need [K//4, N] which is packed transposed differently
-            # Actually: the repack function signature is gptq_marlin_repack(b_q_weight, perm, size_k, size_n, num_bits)
-            # where b_q_weight is [size_k//pack_factor, size_n]
-            # So for K=3072, N=3072: input should be [3072//4, 3072] = [768, 3072]
-            # packed is [K, N//4] = [3072, 768]
-            # We need [K//4, N] = [768, 3072]
-            # So: reshape packed [3072, 768] to [768, 3072]?
-            # No, just transpose: [K, N//4] -> [N//4, K] which is NOT [K//4, N]
-            # The issue is that view("int32") packs along the last dimension
-            # So [K, N] -> [K, N//4] packs N
-            # But Marlin expects [K//4, N] which packs K
-            # So we need to transpose FIRST, then pack, then transpose back
-            # [N, K] -> transpose -> [K, N] -> pack N -> [K, N//4] -> transpose -> [N//4, K]
-            # But we want [K//4, N]
-            # So: [N, K] -> pack K -> [N, K//4] -> transpose -> [K//4, N]
-            # This means we should NOT transpose before packing!
-            packed_k = fp8_i.view("int32")  # [N, K//4] - pack along K
-            packed_k_t = packed_k.T.contiguous()  # [K//4, N]
-            marlin_qw = gptq_marlin_repack(packed_k_t, perm, K, N, num_bits)
-            marlin_qweights.append(marlin_qw)
+    for i in range(num_experts):
+        gate_w = up_gate_info_list[i]["gate"]
+        up_w = up_gate_info_list[i]["up"]
+        N_exp, K = gate_w.shape
+        N_combined = N_exp * 2
 
-            # Permute scales
-            # scale[i] is [n_blocks_n, n_blocks_k] in checkpoint format
-            # Need to expand to [n_blocks_k, N] for Marlin
-            s = scale[i]  # [n_blocks_n, n_blocks_k]
-            # Transpose to [n_blocks_k, n_blocks_n]
-            s = s.T
-            n_blocks_n = s.shape[1]
-            s_expanded = s.unsqueeze(2).expand(
-                [s.shape[0], n_blocks_n, block_size]
-            ).reshape([s.shape[0], n_blocks_n * block_size])
-            s_expanded = s_expanded[:, :N]
-            # 1. First permute scales for Marlin layout (match vLLM order)
-            marlin_s = _marlin_permute_scales(s_expanded.cast(s.dtype), K, N, group_size)
-            # 2. Then apply 2^120 exponent bias (vLLM does bias AFTER permute_scales)
-            # BIAS_OFFSET = (1<<(8-1)) - (1<<(4-1)) = 128 - 8 = 120
-            marlin_s = marlin_s.cast("float32") * (2.0 ** 120)
-            marlin_s = marlin_s.cast(s.dtype)
-            marlin_scales.append(marlin_s)
+        stacked = paddle.stack([gate_w, up_w], axis=0).view("uint8")
+        combined = stacked.reshape([N_combined, K])
+        transposed = combined.T.contiguous()
+        reshaped = transposed.reshape([K // 4, 4, N_combined])
+        b0 = reshaped[:, 0, :].cast("int32")
+        b1 = reshaped[:, 1, :].cast("int32") << 8
+        b2 = reshaped[:, 2, :].cast("int32") << 16
+        b3 = reshaped[:, 3, :].cast("int32") << 24
+        packed = b0 | b1 | b2 | b3
+        marlin_qw_flat = gptq_marlin_repack(packed, perm, K, N_combined, num_bits)[0]
+        out_rows = K // 16
+        out_cols = N_combined * 16 // 4
+        marlin_qw = marlin_qw_flat.reshape([out_rows, out_cols])
+        marlin_up_gate_qweights.append(marlin_qw)
 
-        marlin_qweight = paddle.stack(marlin_qweights, axis=0).contiguous()
-        marlin_scale = paddle.stack(marlin_scales, axis=0).contiguous()
+        s = up_gate_scales[i].T
+        n_blocks_n = s.shape[1]
+        s_expanded = s.unsqueeze(2).expand([s.shape[0], n_blocks_n, block_size]).reshape([s.shape[0], n_blocks_n * block_size])
+        s_expanded = s_expanded[:, :N_combined]
+        marlin_s = _marlin_permute_scales(s_expanded, K, N_combined, block_size)
+        marlin_s = marlin_s * (2 ** 120)
+        marlin_up_gate_scales.append(marlin_s)
 
-        # Set weight and scale
+        down_w = down_info_list[i]
+        N_down, K_down = down_w.shape
+        down_u8 = down_w.view("uint8")
+        transposed_d = down_u8.T.contiguous()
+        reshaped_d = transposed_d.reshape([K_down // 4, 4, N_down])
+        b0_d = reshaped_d[:, 0, :].cast("int32")
+        b1_d = reshaped_d[:, 1, :].cast("int32") << 8
+        b2_d = reshaped_d[:, 2, :].cast("int32") << 16
+        b3_d = reshaped_d[:, 3, :].cast("int32") << 24
+        packed_d = b0_d | b1_d | b2_d | b3_d
+        marlin_qw_d_flat = gptq_marlin_repack(packed_d, perm, K_down, N_down, num_bits)[0]
+        out_rows_d = K_down // 16
+        out_cols_d = N_down * 16 // 4
+        marlin_qw_d = marlin_qw_d_flat.reshape([out_rows_d, out_cols_d])
+        marlin_down_qweights.append(marlin_qw_d)
+
+        s_d = down_scales[i].T
+        n_blocks_n_d = s_d.shape[1]
+        s_d_expanded = s_d.unsqueeze(2).expand([s_d.shape[0], n_blocks_n_d, block_size]).reshape([s_d.shape[0], n_blocks_n_d * block_size])
+        s_d_expanded = s_d_expanded[:, :N_down]
+        marlin_s_d = _marlin_permute_scales(s_d_expanded, K_down, N_down, block_size)
+        marlin_s_d = marlin_s_d * (2 ** 120)
+        marlin_down_scales.append(marlin_s_d)
+
+    marlin_qweight_ug = paddle.stack(marlin_up_gate_qweights, axis=0).contiguous()
+    marlin_scale_ug = paddle.stack(marlin_up_gate_scales, axis=0).contiguous()
+    marlin_qweight_d = paddle.stack(marlin_down_qweights, axis=0).contiguous()
+    marlin_scale_d = paddle.stack(marlin_down_scales, axis=0).contiguous()
+
+    for marlin_qweight, marlin_scale, weight_name, scale_name in [
+        (marlin_qweight_ug, marlin_scale_ug, "up_gate_proj_weight", "up_gate_proj_weight_scale"),
+        (marlin_qweight_d, marlin_scale_d, "down_proj_weight", "down_proj_weight_scale"),
+    ]:
         target_weight = getattr(moe_layer, weight_name)
         target_scale = getattr(moe_layer, scale_name)
-
         if marlin_qweight.shape != target_weight.shape:
-            # Need to recreate parameter with correct shape
             logger.info(f"Marlin FP8: Resizing {weight_name} from {target_weight.shape} to {marlin_qweight.shape}")
-            new_param = moe_layer.create_parameter(
-                shape=marlin_qweight.shape, dtype="int32",
-                default_initializer=paddle.nn.initializer.Constant(0),
-            )
+            new_param = moe_layer.create_parameter(shape=marlin_qweight.shape, dtype="int32", default_initializer=paddle.nn.initializer.Constant(0))
             new_param.set_value(marlin_qweight)
             setattr(moe_layer, weight_name, new_param)
         else:
             target_weight.set_value(marlin_qweight)
-
         if marlin_scale.shape != target_scale.shape:
             logger.info(f"Marlin FP8: Resizing {scale_name} from {target_scale.shape} to {marlin_scale.shape}")
-            new_scale = moe_layer.create_parameter(
-                shape=marlin_scale.shape, dtype=target_scale.dtype,
-                default_initializer=paddle.nn.initializer.Constant(0),
-            )
+            new_scale = moe_layer.create_parameter(shape=marlin_scale.shape, dtype=target_scale.dtype, default_initializer=paddle.nn.initializer.Constant(0))
             new_scale.set_value(marlin_scale.cast(target_scale.dtype))
             setattr(moe_layer, scale_name, new_scale)
         else:
             target_scale.set_value(marlin_scale.cast(target_scale.dtype))
-
-    logger.info(f"Marlin FP8: Loaded up_gate={moe_layer.up_gate_proj_weight.shape}, "
-                f"down={moe_layer.down_proj_weight.shape}")
-
-
-def _numpy_int4_quant_and_pack(wt_np):
-    """
-    Quantize a float32 numpy array to int4 and pack as int8.
-
-    Args:
-        wt_np: 2D float32 numpy array [out_dim, in_dim] (or 3D [E, K, N] for MoE).
-
-    Returns:
-        packed: int8 numpy array, shape [out_dim, in_dim//8] (2D) or [E, K//8, N] (3D).
-        scale:  float16 numpy array, shape [out_dim] (2D) or [E, 1, N] (3D).
-    """
-    max_bound = 7  # int4 range: [-7, 7]
-    is_3d = wt_np.ndim == 3
-
-    if is_3d:
-        E, K, N = wt_np.shape
-        assert K % 8 == 0, f"K ({K}) must be divisible by 8 for int4 packing"
-        # Per-output-channel quantization (along K axis)
-        ch_max = np.abs(wt_np).max(axis=1, keepdims=True)  # [E, 1, N]
-        scale = ch_max / max_bound  # [E, 1, N]
-        # Avoid division by zero
-        scale = np.where(scale == 0, 1.0, scale)
-        quanted = np.round(wt_np / scale).astype(np.int32)
-        quanted = np.clip(quanted, -7, 7) + 8  # shift to [0, 15]
-        # Pack 8 int4 values into 1 int32 along K
-        quanted = quanted.reshape([E, K // 8, 8, N])
-        packed = np.zeros([E, K // 8, N], dtype=np.int32)
-        for j in range(8):
-            packed |= quanted[:, :, j, :] << (j * 4)
-        # Pack int32 → int8 (4 int8 per int32)
-        packed = packed.view(np.int8).reshape([E, K // 8, N * 4])
-        scale_out = scale.astype(np.float16).squeeze(axis=1)  # [E, N]
-    else:
-        out_dim, in_dim = wt_np.shape
-        assert in_dim % 8 == 0, f"in_dim ({in_dim}) must be divisible by 8 for int4 packing"
-        ch_max = np.abs(wt_np).max(axis=0)  # [in_dim]
-        scale = ch_max / max_bound  # [in_dim]
-        scale = np.where(scale == 0, 1.0, scale)
-        quanted = np.round(wt_np / scale[np.newaxis, :]).astype(np.int32)
-        quanted = np.clip(quanted, -7, 7) + 8
-        # Pack 8 int4 values into 1 int32 along in_dim
-        quanted = quanted.reshape([out_dim, in_dim // 8, 8])
-        packed = np.zeros([out_dim, in_dim // 8], dtype=np.int32)
-        for j in range(8):
-            packed |= quanted[:, :, j] << (j * 4)
-        # Pack int32 → int8 (4 int8 per int32)
-        packed = packed.view(np.int8).reshape([out_dim, (in_dim // 8) * 4])
-        scale_out = scale.astype(np.float16)  # [in_dim]
-
-    return packed, scale_out
+    logger.info(f"Marlin FP8: Loaded up_gate={moe_layer.up_gate_proj_weight.shape}, down={moe_layer.down_proj_weight.shape}")
 
 
 class MiniMaxRMSNorm(paddle.nn.Layer):
@@ -489,18 +415,32 @@ class MiniMaxM2_5DecoderLayer(nn.Layer):
         hidden_states: paddle.Tensor,
         residual: paddle.Tensor = None,
     ):
+        import os, numpy as np
+        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+        li = self.layer_id
+        _rank = paddle.distributed.get_rank() if paddle.distributed.get_world_size() > 1 else 0
+        _do_dump = DUMP_DIR and hidden_states.shape[0] > 0
+
         hidden_states, residual = self.input_layernorm(
             hidden_states, residual_input=residual, forward_meta=forward_meta
         )
+        if _do_dump:
+            np.save(f"{DUMP_DIR}/fd_r{_rank}_l{li}_post_norm1.npy", hidden_states.cast("float32").numpy())
 
         hidden_states = self.self_attn(
             forward_meta=forward_meta,
             hidden_states=hidden_states,
         )
+        if _do_dump:
+            np.save(f"{DUMP_DIR}/fd_r{_rank}_l{li}_post_attn.npy", hidden_states.cast("float32").numpy())
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if _do_dump:
+            np.save(f"{DUMP_DIR}/fd_r{_rank}_l{li}_post_norm2.npy", hidden_states.cast("float32").numpy())
 
         hidden_states = self.mlp(hidden_states, forward_meta)
+        if _do_dump:
+            np.save(f"{DUMP_DIR}/fd_r{_rank}_l{li}_post_moe.npy", hidden_states.cast("float32").numpy())
 
         return hidden_states, residual
 
@@ -551,15 +491,23 @@ class MiniMaxM2_5Model(nn.Layer):
             self.layers[i].load_state_dict(state_dict)
 
     def forward(self, ids_remove_padding: paddle.Tensor, forward_meta: ForwardMeta):
+        import os, numpy as np
+        DUMP_DIR = os.environ.get("FD_DUMP_DIR")
+        _rank = paddle.distributed.get_rank() if paddle.distributed.get_world_size() > 1 else 0
+
         hidden_states = self.embed_tokens(
             ids_remove_padding=ids_remove_padding, forward_meta=forward_meta
         )
+        if DUMP_DIR and hidden_states.shape[0] > 0:
+            np.save(f"{DUMP_DIR}/fd_r{_rank}_embed.npy", hidden_states.cast("float32").numpy())
 
         residual = None
         for i in range(self.num_layers):
             hidden_states, residual = self.layers[i](forward_meta, hidden_states, residual)
 
         out = self.norm(hidden_states, residual, forward_meta=forward_meta)[0]
+        if DUMP_DIR and out.shape[0] > 0:
+            np.save(f"{DUMP_DIR}/fd_r{_rank}_final_norm.npy", out.cast("float32").numpy())
 
         if self.norm.is_last_norm and self.norm.fd_config.parallel_config.use_sequence_parallel_moe:
             out = self.norm.allgather(out, forward_meta.ids_remove_padding.shape[0])
@@ -904,21 +852,69 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                             if hasattr(parent, "weight_scale_inv") and parent.weight_scale_inv is not None:
                                 si = parent.weight_scale_inv
                                 # For stacked params (qkv), the scale_inv param has stacked
-                                # shape but we load one shard at a time. Use direct copy
-                                # into the right slice.
-                                if shard_id is not None and si.shape[0] > sc_tensor.shape[0]:
-                                    # Compute offset: weight uses head_dim=128, scale uses block_size=128
-                                    # So scale offset = weight_offset // 128
-                                    num_q_blocks = getattr(parent, 'num_heads_per_rank', 0) * 128 // 128  # = num_heads_per_rank
-                                    num_kv_blocks = getattr(parent, 'kv_num_heads_per_rank', 0) * 128 // 128  # = kv_num_heads_per_rank
-                                    if shard_id == "q":
-                                        si_slice = si[:num_q_blocks]
-                                    elif shard_id == "k":
-                                        si_slice = si[num_q_blocks:num_q_blocks + num_kv_blocks]
-                                    else:  # "v"
-                                        si_slice = si[num_q_blocks + num_kv_blocks:num_q_blocks + 2 * num_kv_blocks]
-                                    si_slice.copy_(sc_tensor, False)
+                                # shape but we load one shard at a time. Accumulate shards
+                                # in a dict and copy the full tensor at the end.
+                                if shard_id is not None:
+                                    if not hasattr(parent, '_scale_shards'):
+                                        parent._scale_shards = {}
+                                    # Shard the scale to match weight's TP shard.
+                                    # Scale dim0 corresponds to weight's output_dim.
+                                    # weight_loader already sharded weight along output_dim.
+                                    # We need to shard scale along dim0 with the same offset/size.
+                                    tp_size = self.fd_config.parallel_config.tensor_parallel_size
+                                    tp_rank = self.fd_config.parallel_config.tensor_parallel_rank
+                                    head_dim = getattr(parent, 'head_dim', 128)
+                                    num_heads_per_rank = getattr(parent, 'num_heads_per_rank', 0)
+                                    kv_num_heads_per_rank = getattr(parent, 'kv_num_heads_per_rank', 0)
+                                    block_size = BLOCK_SIZE
+                                    if tp_size > 1:
+                                        if shard_id == 'q':
+                                            # q scale: [num_heads_full, n_blocks_in]
+                                            # TP shard: [num_heads_per_rank, n_blocks_in]
+                                            # Each head = head_dim // block_size blocks
+                                            blocks_per_head = head_dim // block_size
+                                            shard_blocks = num_heads_per_rank * blocks_per_head
+                                            shard_offset = tp_rank * shard_blocks
+                                            sc_shard = sc_tensor[shard_offset:shard_offset+shard_blocks, :]
+                                        elif shard_id == 'k':
+                                            blocks_per_head = head_dim // block_size
+                                            kv_replicas = max(1, tp_size // getattr(parent, 'kv_num_heads', 8))
+                                            kv_shard_id = tp_rank // kv_replicas
+                                            shard_blocks = kv_num_heads_per_rank * blocks_per_head
+                                            shard_offset = kv_shard_id * shard_blocks
+                                            sc_shard = sc_tensor[shard_offset:shard_offset+shard_blocks, :]
+                                        elif shard_id == 'v':
+                                            blocks_per_head = head_dim // block_size
+                                            kv_replicas = max(1, tp_size // getattr(parent, 'kv_num_heads', 8))
+                                            kv_shard_id = tp_rank // kv_replicas
+                                            shard_blocks = kv_num_heads_per_rank * blocks_per_head
+                                            shard_offset = kv_shard_id * shard_blocks
+                                            sc_shard = sc_tensor[shard_offset:shard_offset+shard_blocks, :]
+                                        else:
+                                            sc_shard = sc_tensor
+                                    else:
+                                        sc_shard = sc_tensor
+                                    parent._scale_shards[shard_id] = sc_shard
+                                    # When all 3 shards are loaded, concat and copy full tensor
+                                    if len(parent._scale_shards) == 3:
+                                        shards = parent._scale_shards
+                                        # Concat along the first dimension (n_blocks_out)
+                                        full_scale_np = np.concatenate([
+                                            shards['q'].numpy(),
+                                            shards['k'].numpy(),
+                                            shards['v'].numpy(),
+                                        ], axis=0)
+                                        full_scale = paddle.to_tensor(full_scale_np, dtype=si.dtype)
+                                        # si shape may differ from full_scale (e.g. [24,64] vs [64,24]).
+                                        # Transpose full_scale to match si's shape before copy_.
+                                        if full_scale.shape != si.shape:
+                                            full_scale = full_scale.transpose([1, 0])
+                                        si.copy_(full_scale, False)
+                                        del parent._scale_shards
                                 else:
+                                    # si shape may differ from sc_tensor (e.g. [24,48] vs [48,24])
+                                    if sc_tensor.shape != si.shape:
+                                        sc_tensor = sc_tensor.transpose([1, 0])
                                     si.copy_(sc_tensor, False)
                     msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
                                  "", model_param_name)
@@ -936,7 +932,10 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                         if sublayer_name in sublayers_dict:
                             parent = sublayers_dict[sublayer_name]
                             if hasattr(parent, "weight_scale_inv") and parent.weight_scale_inv is not None:
-                                parent.weight_scale_inv.copy_(sc_tensor, False)
+                                si = parent.weight_scale_inv
+                                if sc_tensor.shape != si.shape:
+                                    sc_tensor = sc_tensor.transpose([1, 0])
+                                si.copy_(sc_tensor, False)
                     msn = re.sub(r"\.(up_gate_proj_weight|down_proj_weight|weight)$",
                                  "", wname)
                     pending_process.add(msn)
@@ -1021,14 +1020,15 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 process_weights_after_loading_fn(msn)
 
     def _load_fp8_marlin_layer(self, layer_idx, fp8_weights, fp8_scales,
-                                params_dict, expert_params_mapping, block_size):
+                                params_dict, expert_params_mapping, block_size,
+                                moe_layer=None):
         """Load FP8 expert weights directly to Marlin backend for a single layer."""
-        # Find the MoE layer for this decoder layer
-        moe_layer = None
-        for name, sublayer in self.named_sublayers():
-            if f"layers.{layer_idx}." in name and hasattr(sublayer, 'up_gate_proj_weight'):
-                moe_layer = sublayer
-                break
+        # Use cached moe_layer if provided, otherwise search
+        if moe_layer is None:
+            for name, sublayer in self.named_sublayers():
+                if f"layers.{layer_idx}." in name and hasattr(sublayer, 'up_gate_proj_weight'):
+                    moe_layer = sublayer
+                    break
 
         if moe_layer is None:
             logger.warning(f"Marlin FP8: No MoE layer found for layer {layer_idx}")
@@ -1091,52 +1091,30 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                            f"up_gate={len(expert_up_gate)}, down={len(expert_down)}")
             return
 
-        # Concatenate gate and up projections
-        # Each w1/w3 is [moe_intermediate_size, hidden_size] = [1536, 3072] (N, K format)
-        # Combined: [moe_intermediate_size*2, hidden_size] = [3072, 3072] (N, K format)
-        up_gate_list = []
-        for i in range(num_experts):
-            gate_w = expert_up_gate[i]["gate"]  # [1536, 3072]
-            up_w = expert_up_gate[i]["up"]      # [1536, 3072]
-            # Concatenate along output (N) dimension: [3072, 3072]
-            combined = paddle.concat([gate_w, up_w], axis=0)
-            up_gate_list.append(combined)
-        up_gate_tensor = paddle.stack(up_gate_list, axis=0)
+        # Prepare per-expert data lists (avoid paddle.concat/stack on FP8)
+        up_gate_info_list = []
+        down_info_list = []
+        up_gate_scales = []
+        down_scales = []
 
-        down_list = [expert_down[i] for i in range(num_experts)]
-        down_tensor = paddle.stack(down_list, axis=0)
-
-        # Stack scales - concatenate gate and up scales
-        # Each scale is [n_blocks_n, n_blocks_k] = [12, 24] for w1/w3
-        # Combined: [n_blocks_n*2, n_blocks_k] = [24, 24] (concat along N dimension)
-        up_gate_scale_list = []
         for i in range(num_experts):
+            gate_w = expert_up_gate[i]["gate"]  # [1536, 3072] FP8
+            up_w = expert_up_gate[i]["up"]      # [1536, 3072] FP8
+            up_gate_info_list.append({"gate": gate_w, "up": up_w})
+
             gate_s = expert_up_gate_scales[i]["gate"]  # [12, 24]
             up_s = expert_up_gate_scales[i]["up"]      # [12, 24]
-            combined_s = paddle.concat([gate_s, up_s], axis=0)  # [24, 24]
-            up_gate_scale_list.append(combined_s)
-        up_gate_scale_tensor = paddle.stack(up_gate_scale_list, axis=0)
+            combined_s = paddle.concat([gate_s.cast("float32"), up_s.cast("float32")], axis=0)
+            up_gate_scales.append(combined_s)
 
-        down_scale_list = [expert_down_scales[i] for i in range(num_experts)]
-        down_scale_tensor = paddle.stack(down_scale_list, axis=0)
+            down_info_list.append(expert_down[i])  # FP8
+            down_scales.append(expert_down_scales[i].cast("float32"))
 
-        # Process through Marlin backend (SM90+ only; SM80 uses raw FP8 + BF16 dequant)
-        from fastdeploy.model_executor.utils import get_sm_version
-        from fastdeploy.platforms import current_platform
-        if get_sm_version() < 90 and current_platform.is_cuda():
-            # SM80: skip Marlin packing (saves ~1.6 GB/layer), use raw FP8 in _apply_ep_sm80_bf16
-            # Store on CPU to save GPU memory; copy to GPU on-the-fly during forward
-            moe_layer._sm80_fp8_up_gate = up_gate_tensor.cpu()
-            moe_layer._sm80_fp8_up_gate_scale = up_gate_scale_tensor.cpu()
-            moe_layer._sm80_fp8_down = down_tensor.cpu()
-            moe_layer._sm80_fp8_down_scale = down_scale_tensor.cpu()
-            del up_gate_tensor, up_gate_scale_tensor, down_tensor, down_scale_tensor
-            paddle.device.cuda.empty_cache()
-        else:
-            _process_fp8_marlin_weights(
-                moe_layer, up_gate_tensor, up_gate_scale_tensor,
-                down_tensor, down_scale_tensor, block_size,
-            )
+        # Process through Marlin backend (packs weights for Marlin kernel)
+        _process_fp8_marlin_weights(
+            moe_layer, up_gate_info_list, down_info_list,
+            up_gate_scales, down_scales, block_size,
+        )
 
     @paddle.no_grad()
     def load_weights(self, weights_iterator) -> None:
@@ -1168,6 +1146,15 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         process_weights_after_loading_fn = process_weights_after_loading(
             dict(self.named_sublayers()), self.fd_config
         )
+
+        # Cache layer_idx -> moe_sublayer mapping (avoids named_sublayers() traversal per layer)
+        _enable_marlin_fp8 = os.environ.get("FD_MARLIN_FP8", "0") == "1"
+        moe_layers = {}
+        if _enable_marlin_fp8:
+            for name, sublayer in self.named_sublayers():
+                m = re.match(r'.*layers\.(\d+)\.', name)
+                if m and hasattr(sublayer, 'up_gate_proj_weight'):
+                    moe_layers[int(m.group(1))] = sublayer
 
         num_main_layers = self.fd_config.model_config.num_hidden_layers  # 62
         _enable_wint4 = os.environ.get("FD_WINT4_QUANTIZE", "0") == "1"
@@ -1344,7 +1331,6 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             paddle.device.cuda.empty_cache()
 
         # Process each decoder layer's FP8 weights (layer-by-layer streaming)
-        _enable_marlin_fp8 = os.environ.get("FD_MARLIN_FP8", "0") == "1"
         from fastdeploy.model_executor.utils import get_sm_version
         from fastdeploy.platforms import current_platform
         _is_sm80 = _enable_marlin_fp8 and get_sm_version() < 90 and current_platform.is_cuda()
@@ -1360,6 +1346,7 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 self._load_fp8_marlin_layer(
                     li, fp8_by_layer[li], scales_by_layer.get(li, {}),
                     params_dict, expert_params_mapping, BLOCK_SIZE,
+                    moe_layer=moe_layers.get(li),
                 )
                 # Non-expert FP8 weights (attention qkv/o_proj)
                 non_expert_fp8 = {k: v for k, v in fp8_by_layer[li].items()
@@ -1367,22 +1354,14 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 non_expert_scales = {k: v for k, v in scales_by_layer.get(li, {}).items()
                                      if "mlp.experts" not in k}
                 if non_expert_fp8:
-                    if _is_sm80:
-                        # SM80: load FP8 weights directly, dequant on-the-fly in
-                        # BlockWiseFP8LinearMethod.apply() to save ~4x memory per layer
-                        self._dequant_fp8_weights(
-                            non_expert_fp8, non_expert_scales,
-                            params_dict, stacked_params_mapping, expert_params_mapping,
-                            process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
-                            sm80_keep_fp8=True,
-                        )
-                    else:
-                        # SM90+: dequant non-expert weights to BF16 at load time
-                        self._dequant_fp8_weights(
-                            non_expert_fp8, non_expert_scales,
-                            params_dict, stacked_params_mapping, expert_params_mapping,
-                            process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
-                        )
+                    # Dequant non-expert FP8 weights to BF16 at load time.
+                    # sm80_keep_fp8 has scale TP shard issues, so we dequant
+                    # at load time even on SM80.
+                    self._dequant_fp8_weights(
+                        non_expert_fp8, non_expert_scales,
+                        params_dict, stacked_params_mapping, expert_params_mapping,
+                        process_weights_after_loading_fn, BLOCK_SIZE, _enable_wint4,
+                    )
             else:
                 self._dequant_fp8_weights(
                     fp8_by_layer[li], scales_by_layer.get(li, {}),
@@ -1396,7 +1375,9 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             del fp8_by_layer[li]
             if li in scales_by_layer:
                 del scales_by_layer[li]
-            paddle.device.cuda.empty_cache()
+            # Only call empty_cache every 10 layers to reduce implicit sync overhead
+            if li % 10 == 0:
+                paddle.device.cuda.empty_cache()
             mem_after = paddle.device.cuda.memory_allocated() / (1024**3)
             logger.info(f"  Layer {li} done. GPU: {mem_after:.1f} GB (freed {mem_before - mem_after:.1f} GB)")
 
