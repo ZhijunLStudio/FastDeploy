@@ -520,3 +520,200 @@ python scripts/compare_dump.py /tmp/dump_compare 0
 - **模型路径**: `/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5`
 - **Checkpoint**: 125 个 safetensors 文件，总计 230 GB (FP8)
 - **可用 GPU**: GPU 6,7 空闲（常用）；GPU 0,1 被占用；GPU 3,4 有时空闲
+
+---
+
+## 十二、EP=2 MoE 内部调试（2026-04-17）
+
+### 12.1 EP=2 运行验证
+
+**环境：** GPU 4,5 (paddle env)，EP=2，长 prompt（201 tokens），2 层
+
+**结果：**
+- `num_tokens_pp=1024` > 0 ✅（之前担心的 zero-token 问题在大 batch 下不发生）
+- FD 输出：`' increí'` ❌（西班牙语乱码）
+- vLLM EP=2 输出：`'\n\n'` ✅
+
+### 12.2 MoE dump 分析
+
+**Dump 文件命名问题：** MoE dump（`fd_moe_r{rk}_*.npy`）没有 layer index 后缀，多层运行时互相覆盖。n=2 时 dump 来自 layer 1（最后一层），n=1 时 dump 来自 layer 0。
+
+**n=1 验证结果：**
+- `gate_input` (MoE 输入) == `l0_post_norm2` ✅（dump 一致性验证通过）
+- `post_attn` = **全零** ❌（attention 输出为零）
+- `post_norm2` ≠ `RMSNorm(embed)`（因为 residual 连接使用原始输入而非 normed）
+
+### 12.3 关键发现：attention 输出为零
+
+FD 的 append attention backend 在 EP=2 模式下输出全零（`post_attn: mean=0, std=0`）。这不是 MoE 的问题，而是 **attention 实现阶段的问题**。
+
+- 同样的 prompt，vLLM 的 attention 正常工作
+- FD 使用 `APPEND ATTN backend` + `CUDA GRAPH`，可能在 capture 阶段没有正确初始化 KV cache
+- 这影响所有层的精度，不仅是 MoE
+
+### 12.4 FD vs vLLM gate routing 对比
+
+单独对比 gate routing（用 FD 的 embed 输入 + vLLM 的 gate weight）：
+- `topk_ids` **完全不匹配**（因为输入不同：FD embed vs vLLM embed）
+- 当使用相同输入时，gate routing 应该一致（之前 2026-04-12 验证过 cos=1.0）
+
+### 12.5 FD Marlin kernel 在 SM80 上的状态
+
+**当前代码状态：** `fused_moe_marlin_backend.py` 只有 Marlin 路径（`apply` 和 `apply_ep_noalltoall`）。之前的 SM80 bf16 workaround（`_apply_ep_sm80_bf16`）已丢失（被 linter revert）。
+
+**Marlin kernel 在 SM80 上不工作的根本原因：**
+- FD 的 `marlin_template.h` 与 vLLM 有 2216 行差异
+- 核心计算逻辑（dequant、scale）byte-identical
+- 差异在调度策略（FD stripe vs vLLM DP+SK）和类型系统
+- 尝试过禁用 `should_load_a`、修改 `max_num_stage_groups`、修改 shm padding — 全部无效
+
+### 12.6 SM80 bf16 workaround 回顾（2026-04-12 验证成功）
+
+之前的 SM80 bf16 workaround 在 EP=4 下验证成功：
+- FP8 expert 权重 CPU numpy 反量化到 bfloat16
+- 使用 cuBLAS BF16 GEMM 代替 Marlin kernel
+- n=1~61 层全部正确（scale expansion transpose fix 之后）
+- n=62 输出 `':'` — 与 vLLM 一致（确认正确）
+- 限制：62 层 4 卡 ~59 GB GPU，接近 80 GB 上限
+
+**该 workaround 的代码在 `fused_moe_marlin_backend.py` 的多次 revert 中丢失。需要重新实现。**
+
+### 12.7 SM80 bf16 workaround 重新实现的工作量评估
+
+**需要修改的文件：**
+
+| 文件 | 修改内容 | 工作量 |
+|------|----------|--------|
+| `fused_moe_marlin_backend.py` | 添加 `_apply_ep_sm80_bf16` 方法（~80 行），在 `apply_ep_noalltoall` 中 SM80 检测 + 路由 | **中等**（有之前的代码可参考） |
+| `minimax_m2_5.py` | `_load_fp8_marlin_layer` 中 SM80 路径：不创建 Marlin packed，保持 FP8 在 CPU；expert 权重 `.cuda()` 按需拷贝 | **中等**（需要恢复之前的逻辑） |
+| `block_wise_fp8.py` | 已有 SM80 scale transpose fix ✅，无需修改 | **无** |
+
+**4 卡能跑吗？**
+- 4 卡 EP=4：每卡 64 experts × 1536×3072 FP8 (CPU) + 62 层非 expert 权重 FP8 → SM80 bf16 dequant
+- GPU 显存估算：attention 权重 bf16 ~3 GB + KV cache ~5 GB + workspace ~1 GB = ~9 GB/卡（可接受）
+- Expert 权重在 CPU，forward 时 `.cuda()` 拷贝 + dequant + 计算后释放
+- **4 卡完全可以跑**，之前的实验已验证 n=61 正确
+
+**总体工作量：** ~2-3 小时（恢复之前的代码 + 测试验证）。核心逻辑之前已写过并验证成功，主要是代码恢复和集成。
+
+### 12.8 当前分支
+
+当前在 `feat/minimax-m2.5-wint4` 分支上。
+
+---
+
+## 十三、SM80 BF16 Workaround 恢复 + 逐层 Dump 对比（2026-04-17 下午）
+
+### 13.1 SM80 BF16 Workaround 恢复
+
+**已完成。** 恢复了之前在 linter revert 中丢失的 SM80 bf16 workaround 代码。
+
+**修改的文件：**
+
+**`fused_moe_marlin_backend.py`：**
+1. `_moe_dump` / `_moe_dump_int` 添加 `layer_idx` 参数，文件名从 `fd_moe_r0_gate_input` 改为 `fd_moe_r0_l0_gate_input`
+2. 所有 dump 调用点添加 `layer.layer_idx`
+3. `apply_ep_noalltoall` 添加 SM80 检测路由（`get_sm_version() < 90` 时跳过 Marlin，调用 `_apply_ep_sm80_bf16`）
+4. 新增 `_apply_ep_sm80_bf16` 方法（~100 行）：
+   - FP8 expert 权重从 CPU → GPU
+   - numpy block-wise dequant FP8→BF16
+   - 逐 expert cuBLAS BF16 GEMM（gate/up → swiglu → down）
+   - float32 scatter-add 汇总
+   - all_reduce 跨 EP ranks
+   - 关键：`.numpy()` 前必须 `.cast("float32")`（避免 bf16→uint16 bug）
+5. MoE dump 添加 `x.shape[0] > 0` 保护（跳过 M=0 的 decode 阶段）
+6. `num_tokens_pp == 0` 的 early return 改为 dummy `[1, hidden_size]` 做 all_reduce（NCCL 不接受 0-size tensor）
+
+**`minimax_m2_5.py`：**
+1. `_load_fp8_marlin_layer` 添加 SM80 分支：
+   - SM80 上不创建 Marlin packed int32 格式
+   - 将 raw FP8 expert weights stack 为 `[E, N*2, K]` + `[E, N, K]`
+   - 存储到 `moe_layer._sm80_fp8_up_gate` / `_sm80_fp8_down` 等属性
+   - 全部 `.cpu()` 放 CPU，forward 时按需拷贝到 GPU
+2. Decoder layer dump 添加 `_dumped_once` 保护（只 dump prefill，避免 decode 覆盖）
+
+**`vllm/vllm/model_executor/models/minimax_m2.py`：**
+1. Decoder layer forward 添加 dump 逻辑（通过 `VLLM_DUMP_DIR` 环境变量控制）
+2. 使用 `torch.distributed.get_rank()` 动态获取 rank 号
+3. `import numpy as np` 在 `_do_dump` 分支内（避免 torch.compile 崩溃，需 `enforce_eager=True`）
+
+### 13.2 加载速度改善
+
+SM80 bf16 workaround 路径完全跳过了 `gptq_marlin_repack`（128 次 C++ dispatch），直接 `paddle.stack()` 后 `.cpu()`。
+
+| 方案 | 2 层加载时间 | 瓶颈 |
+|------|------------|------|
+| Marlin packed（旧路径） | ~200s | 128 次 `gptq_marlin_repack` C++ dispatch |
+| SM80 FP8 CPU（新路径） | ~46s | FP8 → CPU stack（无 C++ dispatch） |
+
+**加载速度提升 ~4.3x。**
+
+### 13.3 EP=2 逐层 Dump 对比结果（2026-04-17）
+
+**环境：** GPU 6,7，EP=2，2 层，`FD_MARLIN_FP8=1`，prompt=`'Hello, how are you?'`
+
+| Layer | Sublayer | Cosine | MaxAbsDiff | 判断 |
+|-------|----------|--------|------------|------|
+| L0 | post_norm1 (input_layernorm) | **0.999995** | 0.0039 | ✅ 基本一致 |
+| L0 | post_attn (attention output) | **0.999656** | 1.0000 | ✅ 轻微差异 |
+| L0 | post_norm2 (post_attn_norm) | **0.998221** | 0.1763 | ✅ 轻微差异 |
+| **L0** | **post_moe (MoE output)** | **0.565885** | **2.2588** | **❌ 严重 DIVERGE** |
+| L1 | post_norm1 | **0.926653** | 0.0586 | ❌ 已偏离 |
+| L1 | post_attn | **0.841503** | 4.7656 | ❌ 更偏 |
+| L1 | post_moe | **0.666216** | 3.3359 | ❌ 更偏 |
+
+**关键发现：**
+1. **Attention 输出不再全零** ✅ — 之前 EP=2 模式下 attention 全零（`post_attn: std=0`），现在 `std=0.506724` 正常
+2. **L0 MoE 仍然严重 diverge** ❌ — cosine=0.57，和之前 Marlin 路径的结果完全一致
+3. **这说明 MoE 的精度问题不是 Marlin kernel 的问题** — SM80 bf16 workaround 用 cuBLAS GEMM 替代了 Marlin kernel，但输出仍然 diverge
+4. **问题在 MoE 层内部** — 需要进一步排查 gate routing、expert GEMM、swiglu、scatter-add 等环节
+
+### 13.4 MoE 内部 Dump 分析
+
+MoE dump 正确捕获了 prefill 阶段（M=3），不再被 decode（M=0）覆盖：
+
+```
+fd_moe_r0_l0_gate_input: shape=(3, 3072), mean=0.005815, std=0.269330
+fd_moe_r0_l0_topk_weights: shape=(3, 8), mean=0.125000
+fd_moe_r0_l0_topk_ids: shape=(3, 8)
+fd_moe_r0_l0_sorted_token_ids: shape=(896,)
+```
+
+**Shape 不匹配发现：** `gate_input shape=(3, 3072)` 而 `post_norm2 shape=(6, 3072)`。这是因为 FD 的 MoE 使用 `forward_split_allgather` 路径（`attn_tp_size=2`），将 6 个 tokens 拆成 2 份（每份 3 个），分别计算 MoE 后 all_gather。MoE dump 只捕获了第 1 份。
+
+**影响：** MoE 内部 dump 的 `gate_input` 无法直接和 vLLM 的 MoE dump 对比（token 数不同）。需要对比 MoE 的最终输出（`post_moe`），或在 MoE forward 内部逐 expert dump。
+
+### 13.5 修复的 Bug
+
+| Bug | 修复 |
+|-----|------|
+| M=0 all_reduce 崩溃 | dummy `[1, hidden_size]` tensor 做 all_reduce |
+| MoE dump 被 decode 覆盖 | 添加 `x.shape[0] > 0` 保护 |
+| Decoder layer dump 被覆盖 | 添加 `_dumped_once` 保护（只 dump prefill） |
+| vLLM dump rank 硬编码 | 使用 `torch.distributed.get_rank()` |
+
+### 13.6 下一步
+
+### 优先级 1（最紧急）：MoE 内部逐 Expert Dump
+
+L0 MoE 输出 cosine=0.57，但 SM80 bf16 workaround 和 Marlin 路径结果一致，说明问题不在 Marlin kernel 本身。需要在 `_apply_ep_sm80_bf16` 中添加更细粒度的 dump：
+
+- 每个 expert 的 dequant 后 BF16 weights（和 vLLM 对比）
+- gate/up GEMM 的输入和输出
+- swiglu 的输入和输出
+- down GEMM 的输出
+- scatter-add 后的最终 MoE 输出
+
+可能的根因：
+1. FP8 dequant 的 scale 处理不对（虽然之前的 scale expansion transpose fix 已验证正确）
+2. Expert weights 的排列顺序不对（gate vs up 的合并方式）
+3. Swiglu 实现差异（paddle.nn.functional.swiglu vs vLLM 的 swiglu）
+4. Scatter-add 的累积方式差异
+
+### 优先级 2：4 卡 EP=4 全量验证
+
+SM80 bf16 workaround 恢复后，4 卡 EP=4 应该可以跑 62 层（之前验证 n=1~61 正确）。
+
+### 优先级 3：`forward_split_allgather` 的 token 拆分逻辑验证
+
+FD 的 MoE 使用 `forward_split_allgather` 将 tokens 拆分后分别计算。需要验证这个拆分逻辑是否和 vLLM 一致。

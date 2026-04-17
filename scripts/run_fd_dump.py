@@ -22,6 +22,7 @@ try:
     DUMP_DIR = "/tmp/dump_compare/fd"
     os.makedirs(DUMP_DIR, exist_ok=True)
     os.environ["FD_DUMP_DIR"] = DUMP_DIR
+    os.environ["FD_MOE_DUMP_DIR"] = DUMP_DIR
 
     from fastdeploy.entrypoints.llm import LLM
     from fastdeploy.engine.sampling_params import SamplingParams
