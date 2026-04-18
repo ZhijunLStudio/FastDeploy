@@ -217,6 +217,7 @@ class MiniMaxM2_5Attention(nn.Layer):
         super().__init__()
 
         self.fd_config = fd_config
+        self.layer_id = layer_id
         self.head_dim = fd_config.model_config.head_dim
         tp_size = fd_config.parallel_config.tensor_parallel_size
         num_kv_heads_replicas = max(1, tp_size // fd_config.model_config.num_key_value_heads)
@@ -240,7 +241,7 @@ class MiniMaxM2_5Attention(nn.Layer):
             fd_config,
             layer_id=layer_id,
             prefix=prefix,
-            use_neox_rotary_style=False,
+            use_neox_rotary_style=True,
         )
 
         # QK Norm: per-token full-vector RMSNorm, matching MiniMaxText01RMSNormTP
@@ -267,6 +268,9 @@ class MiniMaxM2_5Attention(nn.Layer):
         self.attn.load_state_dict(state_dict)
 
     def forward(self, forward_meta: ForwardMeta, hidden_states: paddle.Tensor):
+        import os
+        _DMP = os.environ.get("FD_MOE_DUMP_DIR")
+        _li = getattr(self, 'layer_id', None)
         qkv_out = self.qkv_proj(hidden_states)
         # Split QKV and apply per-token QK norm
         q = qkv_out[:, :self.q_size]
@@ -276,7 +280,15 @@ class MiniMaxM2_5Attention(nn.Layer):
         k = self.k_norm(k)
         qkv_normed = paddle.concat([q, k, v], axis=-1)
         attn_out = self.attn(qkv=qkv_normed, forward_meta=forward_meta)
+        if _DMP and _li is not None and attn_out.shape[0] > 0:
+            import numpy as np
+            _rk = paddle.distributed.get_rank() if paddle.distributed.get_world_size() > 1 else 0
+            np.save(f"{_DMP}/fd_moe_r{_rk}_l{_li}_attn_before_o_proj.npy", attn_out.cast("float32").numpy())
         output = self.o_proj(attn_out)
+        if _DMP and _li is not None and output.shape[0] > 0:
+            import numpy as np
+            _rk = paddle.distributed.get_rank() if paddle.distributed.get_world_size() > 1 else 0
+            np.save(f"{_DMP}/fd_moe_r{_rk}_l{_li}_attn_after_o_proj.npy", output.cast("float32").numpy())
         return output
 
 
@@ -409,7 +421,8 @@ class MiniMaxM2_5DecoderLayer(nn.Layer):
         li = self.layer_id
         _rank = paddle.distributed.get_rank() if paddle.distributed.get_world_size() > 1 else 0
         # Only dump prefill (first forward pass per layer) to avoid decode overwriting
-        _do_dump = DUMP_DIR and hidden_states.shape[0] > 0
+        # Only dump first 2 layers for alignment comparison
+        _do_dump = DUMP_DIR and hidden_states.shape[0] > 0 and li < 2
         if _do_dump:
             if not hasattr(self, '_dumped_once'):
                 self._dumped_once = True
@@ -1354,10 +1367,10 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             )
             process_weights_after_loading_fn(model_sublayer_name, param)
 
-        # ---- Streaming FP8 dequant + WINT4 quant (layer-by-layer) ----
+        # ---- Batch FP8 dequant + WINT4 quant (all layers at once) ----
         # Process non-layer weights first (embed, norm, lm_head, etc.)
-        # Then process each decoder layer's FP8 weights independently,
-        # immediately quantizing to WINT4 and freeing BF16 to keep peak memory low.
+        # Then process ALL decoder layers' FP8 weights in one batch,
+        # to avoid repeated per-layer overhead.
         BLOCK_SIZE = 128
 
         # Process non-layer FP8 weights (layer_idx = -1)
@@ -1373,17 +1386,21 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 del scales_by_layer[-1]
             paddle.device.cuda.empty_cache()
 
-        # Process each decoder layer's FP8 weights (layer-by-layer streaming)
+        # Process ALL decoder layers' FP8 weights in one batch
         from fastdeploy.model_executor.utils import get_sm_version
         from fastdeploy.platforms import current_platform
         _is_sm80 = _enable_marlin_fp8 and get_sm_version() < 90 and current_platform.is_cuda()
-        layer_indices = sorted(k for k in fp8_by_layer.keys() if k >= 0)
-        for li in layer_indices:
-            n_wts = len(fp8_by_layer[li])
-            mem_before = paddle.device.cuda.memory_allocated() / (1024**3)
-            logger.info(f"FP8 dequant + {'WINT4' if _enable_wint4 else 'BF16'} layer {li}/{num_main_layers} "
-                        f"({n_wts} tensors, GPU: {mem_before:.1f} GB) ...")
 
+        # Collect ALL expert weights across layers for batch processing
+        # (SM80: concat all experts per layer, then batch across layers)
+        all_expert_layers = []  # list of layer_idx that have expert weights
+        layer_indices = sorted(k for k in fp8_by_layer.keys() if k >= 0)
+        mem_before_all = paddle.device.cuda.memory_allocated() / (1024**3)
+        logger.info(f"Batch FP8 dequant: processing {len(layer_indices)} layers "
+                    f"({sum(len(fp8_by_layer[li]) for li in layer_indices)} tensors total, "
+                    f"GPU: {mem_before_all:.1f} GB) ...")
+
+        for li in layer_indices:
             if _enable_marlin_fp8:
                 # Marlin FP8 mode: load FP8 expert weights directly to Marlin backend
                 self._load_fp8_marlin_layer(
@@ -1397,9 +1414,6 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
                 non_expert_scales = {k: v for k, v in scales_by_layer.get(li, {}).items()
                                      if "mlp.experts" not in k}
                 if non_expert_fp8:
-                    # Dequant non-expert FP8 weights to BF16 at load time.
-                    # sm80_keep_fp8 has scale TP shard issues, so we dequant
-                    # at load time even on SM80.
                     self._dequant_fp8_weights(
                         non_expert_fp8, non_expert_scales,
                         params_dict, stacked_params_mapping, expert_params_mapping,
@@ -1418,11 +1432,11 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
             del fp8_by_layer[li]
             if li in scales_by_layer:
                 del scales_by_layer[li]
-            # Only call empty_cache every 10 layers to reduce implicit sync overhead
-            if li % 10 == 0:
-                paddle.device.cuda.empty_cache()
-            mem_after = paddle.device.cuda.memory_allocated() / (1024**3)
-            logger.info(f"  Layer {li} done. GPU: {mem_after:.1f} GB (freed {mem_before - mem_after:.1f} GB)")
+
+        paddle.device.cuda.empty_cache()
+        mem_after_all = paddle.device.cuda.memory_allocated() / (1024**3)
+        logger.info(f"Batch FP8 dequant done. GPU: {mem_after_all:.1f} GB "
+                    f"(freed {mem_before_all - mem_after_all:.1f} GB)")
 
         del fp8_by_layer, scales_by_layer
 

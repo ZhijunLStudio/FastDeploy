@@ -838,3 +838,123 @@ Model loading took 23.609 seconds
 ```
 
 Worker 日志位置：`/data/lizhijun/work/fd-vllm/vllm/log/workerlog.{0-3}`（注意在 vllm 目录下，不是 FastDeploy 目录下）。
+
+---
+
+## 十五、MoE 精度深度分析 + RoPE 根因定位（2026-04-18）
+
+### 15.1 单 Expert 精度对比（FD vs Reference）
+
+**方法：** 在 GPU 7 上单卡加载 Expert 0 (Layer 0)，对比 FD 的 numpy dequant + BF16 GEMM vs 纯 float32 参考实现。
+
+**Dequant 精度：**
+
+| 对比方法 | cosine | max_diff | 结论 |
+|----------|--------|----------|------|
+| FD numpy dequant vs 纯 float32 | **0.99998556** | 4.9e-4 | FD dequant 本身正确 |
+| FD numpy dequant vs numpy expand+transpose | **0.98538098** | 7.4e-2 | transpose 是错误的 |
+
+**关键发现：** FD 的 numpy block-wise dequant（reshape blocked → scale → reshape back）和纯 float32 方法 **cos=0.99999**，说明 dequant 逻辑本身完全正确。之前测试中 "vLLM-style" 的差异来自 paddle expand+transpose，而实际 vLLM 的 Marlin kernel 不这样做。
+
+**MoE 单 Expert 计算精度：**
+
+| 路径 | vs Reference (float32) | cosine | max_diff |
+|------|------------------------|--------|----------|
+| FD 实际路径 (bf16 GEMM + f32 scatter-add) | Ref(f32) | **0.99999971** | 0.127 |
+| bf16 dequant + f32 GEMM | Ref(f32) | **1.00000000** | 0.031 |
+| 全 bf16 (包括 scatter-add) | Ref(f32) | **0.99999745** | 0.372 |
+
+**结论：** FD 的 MoE 单 expert 计算精度 **cos=0.99999971**，非常接近完美。之前的 cos=0.988 的 MoE 层差异来自 **upstream attention 差异的放大**，不是 MoE 本身的精度问题。
+
+### 15.2 Batch FP8 Dequant 改造
+
+**修改文件：** `minimax_m2_5.py` 的 `load_weights` 方法
+
+**改动：** 将逐层 dequant 循环改为一次性处理所有层：
+- 移除每层的 `empty_cache()` 调用（只在全部处理完后调用一次）
+- 移除每层的内存日志（改为汇总日志）
+- 保持每层内部的 FP8 → dequant → load → free 流程不变
+
+### 15.3 RoPE 根因定位（关键发现）
+
+**问题描述：** MoE 单 expert 精度 cos=0.99999971，但端到端 MoE 输出 cos=0.988。差异来自 attention 层（cos=0.9996）被 MoE routing 放大。
+
+**根因：** FD 的 RoPE 实现对 MiniMax-M2.5 是**错误的**。
+
+**MiniMax-M2.5 配置：**
+- `head_dim=128`, `rotary_dim=64`, `partial_rotary_factor=0.5`
+- 只旋转 Q/K 的**前 64 个维度**，后 64 个保持不变（standard-style partial RoPE）
+
+**FD 当前实现（错误）：**
+- `minimax_m2_5.py` 设置 `use_neox_rotary_style=False`
+- 这导致 CUDA kernel `GQAVariableLengthRotarySplitKernel` 对**所有 128 个维度都做旋转**
+- 后 64 个维度被错误旋转，导致 attention 输出偏差
+
+**vLLM 参考实现（`modeling_minimax_m2.py`）：**
+```python
+q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]  # rotary_dim=64
+q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+q_embed = torch.cat([q_embed, q_pass], dim=-1)  # 后 64 个不变
+```
+
+**FD CUDA kernel 路由逻辑（`gqa_rope_write_cache.cu`）：**
+
+| `use_neox_rotary_style` | `rotary_dim` | 调用的 kernel | 行为 |
+|--------------------------|--------------|--------------|------|
+| `False` | 任意 | `GQAVariableLengthRotarySplitKernel` | **旋转所有 head_dim=128 维度** ❌ |
+| `True` | == head_dim | `gqa_rotary_qk_split_variable_qwen3` | 旋转所有维度（Qwen3 风格） |
+| `True` | < head_dim | `gqa_neox_partial_rotary_qk_split_variable` | **只旋转前 rotary_dim=64 维度** ✅ |
+
+**修复方案：**
+1. `minimax_m2_5.py`: `use_neox_rotary_style=False` → `True`
+2. `get_rope` 调用: `rotary_dim=128` → `rotary_dim=model_config.rotary_dim=64`
+   - 这使 `rotary_embs.shape[4] = 64 // 2 = 32`
+   - CUDA kernel 中 `rotary_embs.dims()[4] == head_dim / 4` → `32 == 32` ✓
+   - 然后 `rotary_dim = head_dim / 2 = 64` ✓
+
+**Neox partial kernel 的旋转方式：**
+- `half_rotary_dim = 32`
+- `h_bias < 32`: forward pair `(x[i], x[i+32])`
+- `h_bias >= 32`: backward pair `(x[i], x[i-32])`
+- 这和 vLLM 的 `rotate_half`（对 rotary_dim=64，pair 是 `(x[i], x[i+32])`）**完全一致** ✅
+
+### 15.4 RoPE 修复验证结果
+
+**EP=2, 2 层, GPU 6,7：**
+
+| 指标 | RoPE 修复前 | RoPE 修复后 | 改进 |
+|------|------------|------------|------|
+| Embed | 1.00000000 | 1.00000000 | - |
+| L0 post_attn | ~0.9996 | **0.99999447** | **+0.0004** |
+| L0 post_moe | ~0.988 | **0.99903549** | **+0.011** |
+| L0 post_norm1 | ~0.9996 | **0.99999516** | **+0.0004** |
+| L0 post_norm2 | ~0.9996 | **0.99991466** | **+0.0003** |
+| L1 post_attn | 退化 | **0.99747502** | 大幅改进 |
+| L1 post_moe | 退化 | **0.99231013** | 大幅改进 |
+| final_norm | 退化 | **0.99950202** | 大幅改进 |
+
+**关键成果：**
+1. **L0 post_attn**: cos 从 0.9996 → **0.99999447**（attention 输出几乎完美对齐）
+2. **L0 post_moe**: cos 从 0.988 → **0.99903549**（MoE 输出大幅改进）
+3. **2 层端到端**: 所有层都有合理精度，没有退化
+4. **top-1 输出**: `'\n\n'` (16.88%) — 合理输出
+
+### 15.5 剩余差异分析
+
+L0 post_moe cos=0.9990（而非 1.0）的剩余差异来源：
+1. EP=2 vs EP=8 的 routing 差异（不同 expert 分片，vLLM dump 是 EP=8）
+2. SM80 bf16 workaround 的固有精度差异（numpy dequant + cuBLAS GEMM vs Marlin CUDA kernel）
+3. Scatter-add 累积顺序差异（float32 累加顺序不同）
+
+### 15.6 修改的文件（本次更新）
+
+| 文件 | 修改 |
+|------|------|
+| `minimax_m2_5.py` | `use_neox_rotary_style=False` → `True`（行 244）；`load_weights` 批量 dequant 改造 |
+| `ep4_e2e_dump.py` | `get_rope(rotary_dim=hdim, ...)` → `get_rope(rotary_dim=fd.model_config.rotary_dim, ...)` |
+
+### 15.7 下一步
+
+1. **全量 62 层验证** — RoPE 修复后，62 层端到端精度应大幅改善
+2. **性能优化** — SM80 bf16 workaround 的 numpy dequant 仍是瓶颈
+3. **EP=4 验证** — 4 卡全量测试
