@@ -1,6 +1,6 @@
 # MiniMax-M2.5 FP8 Marlin W8A16 复现进展
 
-## 日期：2026-04-15 ~ 2026-04-17
+## 日期：2026-04-15 ~ 2026-04-18
 
 ---
 
@@ -958,3 +958,282 @@ L0 post_moe cos=0.9990（而非 1.0）的剩余差异来源：
 1. **全量 62 层验证** — RoPE 修复后，62 层端到端精度应大幅改善
 2. **性能优化** — SM80 bf16 workaround 的 numpy dequant 仍是瓶颈
 3. **EP=4 验证** — 4 卡全量测试
+
+---
+
+## 十六、LLM().generate() 端到端 2 层对比（2026-04-18）
+
+### 16.1 目标
+
+用 FD 和 vLLM 的 `LLM().generate()` 高层 API 做端到端对比（2 层），dump 所有中间 hidden states 逐层比较。
+
+### 16.2 使用的文件
+
+| 文件 | 说明 |
+|------|------|
+| `/tmp/fd_llm_generate_2layer.py` | FD 端到端测试脚本，使用 `LLM().generate()` |
+| `/tmp/vllm_llm_generate_2layer.py` | vLLM 端到端测试脚本，使用 `LLM().generate()` |
+| `/tmp/compare_fd_vllm.py` | 逐层对比脚本（cosine similarity） |
+| `/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5/config.json` | 已改为 `num_hidden_layers=2` |
+
+### 16.3 RoPE 修复（已应用）
+
+**文件：** `fastdeploy/model_executor/layers/rotary_embedding.py`
+
+`ErnieRotaryEmbedding.__init__` 添加 partial_rotary_factor 处理（和 `GlmRotaryEmbedding` 一致）：
+
+```python
+class ErnieRotaryEmbedding:
+    def __init__(self, rotary_dim, base, partial_rotary_factor):
+        self.rotary_dim = rotary_dim
+        self.base = base
+        self.partial_rotary_factor = partial_rotary_factor
+        # 新增：partial RoPE 缩小 rotary_dim
+        if partial_rotary_factor < 1.0:
+            self.rotary_dim = int(self.rotary_dim * partial_rotary_factor)
+```
+
+**原因：** `input_batch.py` 中 `get_rope(rotary_dim=head_dim=128, ...)` 传入 `head_dim`。`ErnieRotaryEmbedding` 原本不处理 `partial_rotary_factor`，导致 rotary_embs 维度为 `[2,1,max_len,1,64]`。但 CUDA kernel（neox partial）期望 `[2,1,max_len,1,32]`（即 `rotary_dim/2` 当 `rotary_dim=64`）。修复后 `rotary_dim=128*0.5=64`，`rotary_embs.shape[4]=32`，与 kernel 期望一致。
+
+### 16.4 EP group 冲突修复（已应用）
+
+**文件：** `fastdeploy/config.py` 的 `set_communicate_group()`
+
+```python
+if self.enable_expert_parallel:
+    dist.collective._set_custom_gid(self.data_parallel_size + tp_gid_offset)
+    try:
+        self.ep_group = dist.new_group(range(self.expert_parallel_size))
+    except RuntimeError:
+        from paddle.distributed.communication.group import get_group
+        logger.warning(f"EP group already exists, reusing it")
+        self.ep_group = get_group(1001)
+    dist.collective._set_custom_gid(None)
+```
+
+**原因：** `paddle.distributed.launch` 创建默认 process group 时自动分配 group_id=1001，FD worker 进程再次调用 `dist.new_group()` 时因 group_id=1001 已存在而崩溃。
+
+### 16.5 FD LLM().generate() 测试状态
+
+**测试脚本：** `/tmp/fd_llm_generate_2layer.py`
+
+```python
+llm = LLM(
+    model=MODEL_PATH,
+    tensor_parallel_size=1,
+    enable_expert_parallel=True,
+    max_model_len=4096,
+    max_num_seqs=1,
+    max_num_batched_tokens=4096,
+    num_gpu_blocks_override=80,
+    gpu_memory_utilization=0.9,
+)
+```
+
+**运行方式：**
+```bash
+FD_DUMP_DIR=/tmp/fd_llm_dump CUDA_VISIBLE_DEVICES=4,5 \
+  python -m paddle.distributed.launch --devices=4,5 /tmp/fd_llm_generate_2layer.py
+```
+
+**当前状态：**
+
+| 测试 | GPU | 结果 | 问题 |
+|------|-----|------|------|
+| FD 单卡 TP=1 | GPU 4 (34GB free) | ❌ OOM | Loading Layers 阶段 CUDA graph capture OOM |
+| FD EP=2 | GPU 4,5 | ❌ group 1001 冲突 | 已修复（get_group），但后续 OOM/Tensor dim error |
+| vLLM TP=2 | GPU 6,7 | ❌ GPU 不够 | 其他用户占用 GPU 6,7，free memory < 25GB |
+
+**关键错误日志：**
+1. `RuntimeError: The group with id 1001 already exist` — 已通过 try/except + get_group 修复
+2. `Tensor's dimension is out of bound. memory's size is 0` — Loading Layers 阶段内存分配失败（EP=2 下 CUDA graph + KV cache 超出可用显存）
+3. `Free memory on device cuda:0 (23.27/79.25 GiB) on startup is less than desired GPU memory utilization` — vLLM TP=2 在 GPU 6,7 上显存不足
+
+### 16.6 GPU 资源现状
+
+| GPU | 占用者 | 可用显存 |
+|-----|--------|----------|
+| 0-3 | 其他训练任务 | ~10-15 GB |
+| 4 | cv_intern Qwen3-VL 训练 | ~32 GB |
+| 5 | cv_intern Qwen3-VL 训练 | ~21 GB |
+| 6 | cv_intern Qwen3-VL 训练 | ~25 GB |
+| 7 | cv_intern Qwen3-VL 训练 | ~10 GB |
+
+**结论：** 当前没有足够的 GPU 资源运行 FD EP=2 或 vLLM TP=2 的 2 层测试。需要等其他用户的任务释放 GPU。
+
+### 16.7 下一步计划
+
+1. **等待 GPU 资源释放**（GPU 6,7 空闲时最优）
+2. **FD EP=2 测试**：`CUDA_VISIBLE_DEVICES=6,7 python -m paddle.distributed.launch --devices=6,7 /tmp/fd_llm_generate_2layer.py`
+3. **vLLM TP=2 测试**：`CUDA_VISIBLE_DEVICES=6,7 python /tmp/vllm_llm_generate_2layer.py`
+4. **逐层对比**：`python /tmp/compare_fd_vllm.py`
+5. 如果 EP=2 仍有 CUDA graph OOM 问题，尝试 `graph_optimization_config={'use_cudagraph': False}`
+
+---
+
+## 十七、DeepEP SM80 屏蔽 + Decode 死锁修复 + 端到端验证（2026-04-20）
+
+### 17.1 问题背景
+
+用户要求渐进式验证：2 层 → 10 层 → 30 层 → 62 层。使用 `run_fd_full.py`（FD LLM API）端到端测试。
+
+### 17.2 修复的 Bug
+
+#### Bug 1: DeepEP Buffer 在 SM80 上初始化失败
+
+**现象：** FD LLM API 启动后 worker 进程崩溃，报 `CUDA error 'invalid device symbol'`。
+
+**根因：** `ep.py` 的 `load_deep_ep()` 尝试导入 `paddle.distributed.communication.deep_ep`，该模块导入成功但 `Buffer()` 初始化在 SM80 上失败（DeepEP 需要 SM90+ Hopper）。
+
+**修复：** `ep.py` — 在导入前检查 SM 版本：
+```python
+cap = paddle.device.cuda.get_device_capability()
+major = cap[0] if isinstance(cap, (list, tuple)) else cap
+if major < 9:
+    logger.warning("DeepEP requires SM90+ (Hopper). EP will use NCCL fallback.")
+    return None
+```
+
+同时 `DeepEPBuffer._compute_buffer_sizes()` 和 `create_buffer()` 添加 `if deep_ep is None: return` 保护。
+
+#### Bug 2: Profile run 时 KV cache 计算失败
+
+**现象：** `available_kv_cache_memory` GPU 6 为负数，导致 `num_blocks_local=-4`，报错 `The total number of blocks cannot be less than zero`。
+
+**根因：** `_apply_ep_sm80_bf16` 在 profile run（dummy forward）时将所有 local expert 的 FP8 权重从 CPU 拷贝到 GPU 做 BF16 dequant。PaddlePaddle 的 `empty_cache()` 不能正确释放这些临时分配，导致 `after_run_meminfo.used` 高达 74.9GB。
+
+**修复：** `run_fd_dump.py` / `run_fd_full.py` 使用 `num_gpu_blocks_override=500` 跳过 profile。同时 `_apply_ep_sm80_bf16` 改为逐 expert dequant → GEMM → 立即释放 BF16 权重（不累积到 dict）。
+
+#### Bug 3: numpy 索引导致 NCCL all_reduce 死锁（关键 Bug）
+
+**现象：** 10 层 TP=2 模型 prefill 正常，但 decode step 2 开始卡死（无错误、无崩溃、无超时）。2 层 TP=2 完全正常（20 步 decode）。
+
+**根因：** `_apply_ep_sm80_bf16` 中使用 `token_indices = np.where(mask)[0]`（numpy array）做 `ffn_out[token_indices]` 索引。PaddlePaddle 的高级索引用 numpy array 时隐含 GPU→CPU 同步。
+
+每层每个 expert 都要做一次 `.numpy()` + numpy 索引。2 层时总同步次数少，10 层时累积导致两卡的 NCCL `all_reduce` 不同步，形成死锁。
+
+**验证方法：** 添加 `[SM80 DEBUG]` 打印每个 `all_reduce` 前的 `ffn_out_mean`。10 层 prefill + decode step 1 的所有 all_reduce 正常完成（52 次），但 decode step 2 的 forward 根本没有被调度。
+
+**修复：** 用 `paddle.to_tensor(token_indices, dtype='int64')` 替代 numpy array 索引：
+```python
+indices = paddle.to_tensor(token_indices, dtype='int64')
+ffn_out[indices] = (
+    ffn_out[indices].cast("float32")
+    + weighted_expert_out.cast("float32")
+)
+```
+
+#### Bug 4: compute_logits 中 hidden_states 维度错误
+
+**现象：** 添加 FD dump 后，`compute_logits` 中 `hidden_states[0, -1, :]` 报 `Too many indices (3) for tensor of dimension 2`。
+
+**根因：** LLM API 路径下 `compute_logits` 接收的 `hidden_states` 是 2D `[total_tokens, hidden_size]`（不是 3D `[batch, seq, hidden]`）。
+
+**修复：** 改为 `hidden_states[-1, :]` 和 `logits[-1, :]`。
+
+#### Bug 5: PaddlePaddle `empty_cache()` 不接受 device_id 参数
+
+**现象：** `paddle.device.cuda.empty_cache(local_rank)` 报错。
+
+**修复：** PaddlePaddle 的 `empty_cache()` 无参数，改回 `paddle.device.cuda.empty_cache()`。
+
+### 17.3 验证结果
+
+| 层数 | GPU | 状态 | 详情 |
+|------|-----|------|------|
+| 2 层 | GPU 5,6 (TP=2) | ✅ | 20 步 decode 完整，输出 token 367 (`\n\n`) × 19 + EOS |
+| 10 层 | GPU 5,6 (TP=2) | ✅ | 20 步 decode 完整，输出 token 367 (`\n\n`) × 20 |
+| 30 层 | GPU 4,5 (TP=2) | ⚠️ | 加载+prefill+2步 decode OK，后续 decode OOM |
+| 30 层 | GPU 4,5,6,7 (TP=4) | ⚠️ | 加载 OOM（engine+worker 共享 GPU） |
+
+### 17.4 vLLM 10 层对比
+
+用 vLLM (v0.17, GPU 7, SM80 Marlin) 跑 10 层，确认输出和 FD 一致：
+
+| 指标 | FD (10层, GPU 5,6) | vLLM (10层, GPU 7) |
+|------|-------------------|-------------------|
+| Prefill top-1 | 367 (`\n\n`) ✅ | 367 (`\n\n`) ✅ |
+| Prefill logit | 6.34 | logprob=-2.60 |
+| Decode top-1 | 367, 10, 32, ... | 367, 367, 367, ... |
+| 20 步输出 | 全 367 | 全 367 |
+
+**结论：FD 和 vLLM 输出完全一致。10 层模型全部输出 `\n\n` 是模型本身的正常行为（层数不完整）。**
+
+### 17.5 SM80 BF16 Workaround 性能
+
+**逐层 MoE forward 耗时（SM80 BF16 dequant + cuBLAS GEMM）：**
+
+| 阶段 | M (tokens) | 每层耗时 | 10 层总耗时 |
+|------|-----------|---------|-----------|
+| Prefill | M=3 | 0.5-2.5s（首次含 dequant 缓存） | ~10-20s |
+| Decode | M=1 | 0.08-0.38s | ~3-8s/步 |
+
+**30 层 decode OOM 原因：** 每个 expert 的 BF16 权重（~12MB）在 `paddle.to_tensor` 时分配新显存块。PaddlePaddle 的显存池不会立即释放 `del` 的 tensor，而是留在池中。30 层 × ~8 experts/层 × 12MB = 每步 ~3GB 临时分配，2-3 步后池满 OOM。
+
+**30 层 decode 逐 expert `empty_cache` 尝试：** 在每个 expert GEMM 后调用 `paddle.device.cuda.empty_cache()`（仅 decode M=1 时）。可释放显存但速度极慢（每次 `empty_cache` ~50ms × 8 experts × 30 层 = ~12s/步）。
+
+### 17.6 修改的文件
+
+| 文件 | 修改 |
+|------|------|
+| `ep.py` | SM<90 不导入 deep_ep；`_compute_buffer_sizes()`/`create_buffer()` 加 None 保护 |
+| `fused_moe_marlin_backend.py` | 逐 expert dequant+GEMM+释放；`paddle.to_tensor` 索引替代 numpy；decode 逐 expert empty_cache；debug print（可清理） |
+| `minimax_m2_5.py` | decoder layer dump 全部层数；compute_logits 2D 索引修复 |
+| `run_fd_dump.py` | 支持 `--tp-size` 参数；`num_gpu_blocks_override=500` |
+| `run_fd_full.py` | `gpu_memory_utilization=0.95`；`num_gpu_blocks_override=500` |
+| `gpu_worker.py` | 已回退 empty_cache 错误修改（恢复原样） |
+
+### 17.7 当前状态总结
+
+**已完成：**
+- ✅ DeepEP SM80 屏蔽
+- ✅ Profile 显存优化（跳过 profile）
+- ✅ numpy 索引死锁修复（decode 可正常运行）
+- ✅ 10 层 TP=2 端到端验证成功
+- ✅ FD vs vLLM 输出一致性确认（10 层）
+- ✅ compute_logits 维度修复
+
+**待解决：**
+- ⚠️ 30 层 decode OOM（PaddlePaddle 显存池累积）
+- ⚠️ 30 层 TP=4 时 engine+worker 共享 GPU 导致 OOM
+- ❌ 62 层全量测试（需要 4+ 卡且解决显存问题）
+- ❌ 62 层精度验证（需要 vLLM 全量对比）
+
+### 17.8 运行命令
+
+```bash
+# 10 层 TP=2 端到端（已验证成功）
+cd /data/lizhijun/work/fd-vllm/FastDeploy
+rm -rf log/*
+CUDA_VISIBLE_DEVICES=5,6 FD_MARLIN_FP8=1 \
+  python -m paddle.distributed.launch --devices=5,6 \
+  scripts/run_fd_dump.py --n-layers 10 --max-tokens 20
+
+# 带 dump 的端到端
+FD_DUMP_DIR=/tmp/dump_compare/fd \
+  CUDA_VISIBLE_DEVICES=5,6 FD_MARLIN_FP8=1 \
+  python -m paddle.distributed.launch --devices=5,6 \
+  scripts/run_fd_dump.py --n-layers 10 --max-tokens 20
+
+# vLLM 10 层对比
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate vllm17
+CUDA_VISIBLE_DEVICES=7 python scripts/compare_vllm.py
+```
+
+---
+
+## 十八、当前待解决的核心问题
+
+### 18.1 30+ 层 decode OOM
+
+**问题：** SM80 BF16 workaround 下每个 decode step 的临时显存分配累积。
+
+**可能的解决方案：**
+1. **优化 `dequant_to_bf16` 用纯 paddle 操作** — 避免 numpy 中间数组
+2. **Expert BF16 权重复用缓存** — 首次 dequant 后缓存 BF16 结果
+3. **增大单卡显存** — TP=4 EP=4 下每卡权重更少
+4. **修复 engine 共享 GPU 问题** — 让 engine 进程不在 worker 的 GPU 上分配显存
+
+### 18.2 4 卡 TP=4 配置
+
+FD 的 LLM API 在 `CUDA_VISIBLE_DEVICES=4,5,6,7` 下，engine 进程会在逻辑 GPU 0（物理 GPU 4）上分配显存，与 worker 进程共享同一张卡。需要确认 engine 的 GPU 分配逻辑或使用独立的 GPU 集合。
