@@ -1,7 +1,7 @@
-"""Quick benchmark: SM80 BF16 MoE single layer forward speed."""
+"""Quick benchmark: SM80 WINT4 MoE single layer forward speed."""
 import os, sys, time, argparse, numpy as np
 sys.path.insert(0, '/data/lizhijun/work/fd-vllm/FastDeploy')
-os.environ["FD_MARLIN_FP8"] = "1"
+os.environ["FD_WINT4_QUANTIZE"] = "1"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--n_layers", type=int, default=0, help="Override num_hidden_layers (0=use full model)")
@@ -26,7 +26,6 @@ tp_size = len(args.gpus.split(","))
 llm_kwargs = dict(
     model='/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5',
     tensor_parallel_size=tp_size,
-    enable_expert_parallel=True,
     disable_sequence_parallel_moe=True,
     max_model_len=256,
     gpu_memory_utilization=0.90,

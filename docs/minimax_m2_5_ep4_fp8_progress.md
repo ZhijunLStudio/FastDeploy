@@ -1558,3 +1558,88 @@ sigmoid mean_diff: 0.001 - 0.004
 2. **逐层对比**: embed → post_norm1 → post_attn → post_moe → final_norm
 3. **对齐 routing**: 如果 routing 完全一致，post_moe 应该接近
 4. **跑 10 层**: 2 层对齐后扩展到 10 层
+
+---
+
+## 21. WINT4 模式在 SM80 上的可行性验证（2026-04-21）
+
+### 21.1 目标
+
+尝试用 WINT4 量化替代 SM80 BF16 workaround，实现 62 层全量推理。WINT4 权重只有 FP8 的一半大小，理论上 4 卡 ~29 GB/卡 可以跑下。
+
+### 21.2 WINT4 激活方式
+
+- 环境变量：`FD_WINT4_QUANTIZE=1`（必须），`FD_MARLIN_FP8=0`（不能同时设）
+- `load_weights` 流程：每层 FP8→BF16→WINT4→释放 BF16，逐层串行
+- Linear 层（QKV/O）在 SM80 上保持 BF16（`weight_only_linear` 不支持 SM80）
+- MoE experts 用 `CutlassWeightOnlyMoEMethod` → `moe_expert_ffn` cutlass kernel
+
+### 21.3 Bug 修复
+
+#### 21.3.1 `moe.py` `forward_split_allgather` 跳过逻辑扩展
+
+原 `_is_sm80` 检查只匹配 `weight_type == 'fp8'`，WINT4 的 `weight_type` 是 `'int4'` 不会被跳过。修改为匹配所有 SM80：
+
+```python
+# 修改前：
+_is_sm80 = current_platform.is_cuda() and hasattr(self, 'quant_method') and \
+    getattr(self.quant_method, 'weight_type', '') == 'fp8'
+
+# 修改后：
+_is_sm80 = current_platform.is_cuda()
+if _is_sm80:
+    from fastdeploy.model_executor.utils import get_sm_version
+    _is_sm80 = get_sm_version() < 90
+```
+
+#### 21.3.2 `CutlassWeightOnlyMoEMethod.process_weights_after_loading` 跳过已 WINT4 量化层
+
+`_wint4_quantize_layer` 替换了 `quant_method` 为 `CutlassWeightOnlyMoEMethod`，但 `process_final_after_loading` 仍调用其 `process_weights_after_loading`，导致尝试重新量化已量化的权重。添加 `_wint4_quantized` 检查跳过。
+
+#### 21.3.3 Cutlass mixed-type tile config 不匹配（关键修复）
+
+**根因**：`fused_moe_gemm_kernels_template.h` 的 mixed-type dispatch 函数（BF16 activation + int4 weight）的 `else` 分支（SM75+）缺少 PaddlePaddle `get_candidate_tiles` 返回的部分 tile configs。
+
+PaddlePaddle 的 `get_candidate_tiles` 对 SM80 weight_only 返回：
+```
+CtaShape64x64x64_WarpShape32x32x64
+CtaShape128x64x64_WarpShape64x32x64
+```
+
+但 dispatch 函数里没有这些 configs，导致 autotune 遍历时所有候选 config 都报 "Config is invalid for mixed type tensorop GEMM" 被跳过，最终所有 expert GEMM 输出全零。
+
+**修复**：在 dispatch 函数的 `else` 分支中添加缺失的 tile configs：
+```cpp
+dispatch_gemm_config_macro(64, 64, 64, 32, 32, 64);
+dispatch_gemm_config_macro(128, 64, 64, 64, 32, 64);
+```
+
+**编译问题**：PaddlePaddle 的 `setup_ops.py build` 并行编译系统有 bug——当某些 `.cu` 文件（如 `fused_moe_gemm_kernels_*.cu`，每个需要 2-5 分钟编译）编译时间过长时，build 系统在其他所有文件编译完后就尝试链接，导致 linker 找不到还没编译完的 `.o` 文件。解决方法是手动用 nvcc 编译这些 `.cu` 文件，然后放到 build 目录的正确位置再重新链接。
+
+### 21.4 验证结果
+
+WINT4 2 层测试（GPU 4,5，TP=2）：
+- **加载**：成功，WINT4 量化 ~50 秒（2 层）
+- **推理**：不崩溃，cutlass kernel 正常执行（无 "Config is invalid" 错误）
+- **输出**：`text: ''`, `tokens: [200020]`（EOS token）—— 2 层模型太小，输出退化到 EOS
+- **GPU 显存**：~10 GB/卡（2 层）
+
+### 21.5 结论
+
+**WINT4 在 SM80 上现在可以工作了**（cutlass tile config 修复后）。2 层测试不崩溃，推理流程完整。但 2 层模型输出质量差是预期的，需要进一步测试 10 层、30 层、62 层的输出质量。
+
+### 21.6 修改的文件
+
+| 文件 | 修改 |
+|------|------|
+| `FastDeploy/fastdeploy/model_executor/layers/moe/moe.py` | `_is_sm80` 检查从匹配 `fp8` 扩展为匹配所有 SM80 |
+| `FastDeploy/fastdeploy/model_executor/layers/moe/fused_moe_cutlass_backend.py` | `process_weights_after_loading` 添加 `_wint4_quantized` 跳过检查 |
+| `FastDeploy/custom_ops/gpu_ops/cutlass_kernels/moe_gemm/fused_moe_gemm_kernels_template.h` | mixed-type dispatch 添加 2 个缺失的 SM80 tile configs |
+| `FastDeploy/scripts/bench_sm80.py` | 改为 `FD_WINT4_QUANTIZE=1`，关闭 EP |
+
+### 21.7 下一步
+
+1. 测试 10 层 WINT4 输出质量
+2. 测试 30 层 WINT4 输出质量
+3. 测试 62 层全量 WINT4
+4. 与 vLLM 输出对比

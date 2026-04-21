@@ -1600,6 +1600,10 @@ class CutlassWeightOnlyMoEMethod(CutlassMoEMethod):
             )
 
     def process_weights_after_loading(self, layer):
+        # WINT4 weights are already quantized in _wint4_quantize_layer, skip re-quantization
+        if getattr(layer, '_wint4_quantized', False):
+            return
+
         def _process_quantize(weight_idx):
             # 1.init shape and type
             # quantized_weight_name
@@ -1656,7 +1660,7 @@ class CutlassWeightOnlyMoEMethod(CutlassMoEMethod):
             else:
                 weight_type = "down"
 
-            if self.model_format == "torch":
+            if getattr(self, 'model_format', None) == "torch":
                 unquantized_weight_name = self.added_weight_attrs[weight_id_map[weight_type]].replace(
                     "quant_weight", "weight"
                 )

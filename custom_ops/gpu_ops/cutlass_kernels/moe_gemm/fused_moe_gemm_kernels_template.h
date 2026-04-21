@@ -589,21 +589,18 @@ void dispatch_moe_gemm_to_cutlass(
     switch (gemm_config.tile_config) {
       dispatch_gemm_config_macro(16, 128, 64, 16, 32, 64);
       dispatch_gemm_config_macro(16, 256, 64, 16, 64, 64);
-      // Note: (64, 64, 64, 32, 32, 64) maps to CtaShape64x64x64_WarpShape32x32x64
-      // which is not in PaddlePaddle's phi::CutlassTileConfig.
-      // Use CtaShape64x128x64_WarpShape32x64x64 as closest match.
-      dispatch_gemm_config_macro(64, 128, 64, 32, 64, 64);
       dispatch_gemm_config_macro(32, 128, 64, 32, 32, 64);
-      // Note: (128, 64, 64, 64, 32, 64) maps to CtaShape128x64x64_WarpShape64x32x64
-      // which is not in PaddlePaddle's phi::CutlassTileConfig.
-      // Use CtaShape128x128x64_WarpShape64x32x64 as closest match.
+      dispatch_gemm_config_macro(64, 128, 64, 32, 64, 64);
       dispatch_gemm_config_macro(128, 128, 64, 64, 32, 64);
+      dispatch_gemm_config_macro(64, 128, 64, 64, 32, 64);
       dispatch_gemm_config_macro(64, 128, 64, 64, 64, 64);
       dispatch_gemm_config_macro(128, 128, 64, 64, 64, 64);
       dispatch_gemm_config_macro(128, 128, 64, 128, 32, 64);
       dispatch_gemm_config_macro(128, 256, 64, 64, 64, 64);
-      dispatch_gemm_config_macro(64, 128, 64, 64, 32, 64);
       dispatch_gemm_config_macro(256, 128, 64, 64, 64, 64);
+      // PaddlePaddle's get_candidate_tiles also returns these for SM80 weight_only
+      dispatch_gemm_config_macro(64, 64, 64, 32, 32, 64);
+      dispatch_gemm_config_macro(128, 64, 64, 64, 32, 64);
       case CutlassTileConfig::Undefined:
         throw std::runtime_error(
             "[dispatch_moe_gemm_to_cutlass] gemm config undefined.");
