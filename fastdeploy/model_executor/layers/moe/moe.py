@@ -739,8 +739,16 @@ class FusedMoE(nn.Layer):
         # on top of the inner NCCL all-to-all, causing incorrect results.
         # Instead, always use forward_normal which calls apply_ep directly.
         _use_nccl_ep = self.ep_size > 1 and hasattr(self, '_nccl_ep_runner')
+        # SM80: also skip forward_split_allgather — _apply_ep_sm80_bf16 needs
+        # all tokens on all ranks (it does its own per-expert routing internally).
+        _is_sm80 = current_platform.is_cuda() and hasattr(self, 'quant_method') and \
+            getattr(self.quant_method, 'weight_type', '') == 'fp8'
+        if _is_sm80:
+            from fastdeploy.model_executor.utils import get_sm_version
+            _is_sm80 = get_sm_version() < 90
         if (
             not _use_nccl_ep
+            and not _is_sm80
             and self.ep_size > 1
             and self.attn_tp_size > 1
             and (not self.fd_config.parallel_config.use_sequence_parallel_moe)

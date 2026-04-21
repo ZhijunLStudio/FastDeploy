@@ -15,6 +15,7 @@
 """
 
 import os
+import time
 from typing import Callable
 
 import paddle
@@ -184,6 +185,23 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
     def create_weights(self, layer: nn.Layer, **extra_weight_attrs):
         self.default_dtype = layer._helper.get_default_dtype()
         self.weight_dtype = "int32"
+
+        # SM80: skip creating Marlin packed weights (we use BF16 dequant instead).
+        # Create minimal dummy params so attribute access doesn't fail.
+        from fastdeploy.model_executor.utils import get_sm_version
+        from fastdeploy.platforms import current_platform
+        if self.weight_type == "fp8" and get_sm_version() < 90 and current_platform.is_cuda():
+            for name in self.added_weight_attrs:
+                setattr(layer, name, layer.create_parameter(
+                    shape=[1], dtype="int32",
+                    default_initializer=paddle.nn.initializer.Constant(0),
+                ))
+            for name in self.added_scale_attrs:
+                setattr(layer, name, layer.create_parameter(
+                    shape=[1], dtype="float32",
+                    default_initializer=paddle.nn.initializer.Constant(0),
+                ))
+            return
 
         up_gate_proj_weight_name = self.added_weight_attrs[0]
         down_proj_weight_name = self.added_weight_attrs[1]
@@ -422,7 +440,11 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         shared_experts: nn.Layer = None,
     ) -> paddle.Tensor:
         """Marlin compute Fused MoE. Routes to apply_ep_noalltoall() when ep_size > 1."""
-        if getattr(layer, 'ep_size', 1) > 1:
+        from paddleformers.utils.log import logger
+        ep_sz = getattr(layer, 'ep_size', 1)
+        _gpu_mem = paddle.device.cuda.memory_allocated() / (1024**3)
+        logger.info(f"APPLY: ep_size={ep_sz}, x.shape={x.shape}, layer={getattr(layer, 'layer_idx', '?')}, gpu={_gpu_mem:.1f}GB")
+        if ep_sz > 1:
             return self.apply_ep_noalltoall(layer, x, gate, topk_ids_hookfunc, shared_experts)
 
         gate_out = gate(x)
@@ -589,8 +611,26 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         ep_rank = fd_config.parallel_config.expert_parallel_rank
         ep_group = fd_config.parallel_config.ep_group
 
+        # Early return for M=0 (empty input, e.g. dummy run)
+        if M == 0:
+            return paddle.zeros([0, hidden_size], dtype=x.dtype)
+
         # Step 1: Routing
         gate_out = gate(x).cast("float32")
+
+        # Dump gate output for comparison
+        if _DMP and M > 0:
+            li = getattr(layer, 'layer_idx', None)
+            if li is not None:
+                import numpy as np
+                np.save(f"{_DMP}/fd_moe_r{_RK}_l{li}_gate_out.npy", gate_out.numpy())
+                # Also dump correction bias (first call only)
+                bias = layer.gate_correction_bias
+                if bias is not None:
+                    bias_file = f"{_DMP}/fd_correction_bias.npy"
+                    if not os.path.exists(bias_file):
+                        np.save(bias_file, bias.numpy())
+
         _, topk_weights, topk_ids = get_moe_scores(
             gate_out,
             layer.n_group, layer.topk_group, top_k,
@@ -627,7 +667,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             _moe_dump_int("expert_ids", expert_ids, layer.layer_idx)
 
         # Debug: print num_tokens_pp and shapes
-        logger.info(f"EP DEBUG: M={M}, num_tokens_pp={num_tokens_pp}, "
+        logger.debug(f"EP DEBUG: M={M}, num_tokens_pp={num_tokens_pp}, "
                      f"topk_ids.shape={topk_ids.shape}, "
                      f"sorted_token_ids.shape={sorted_token_ids.shape}, "
                      f"expert_ids.shape={expert_ids.shape}, "
@@ -635,23 +675,23 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
                      f"ep_rank={ep_rank}, "
                      f"expert_map nonzero={int((expert_map >= 0).sum().item())}")
 
-        # Skip if no tokens assigned to local experts
-        if num_tokens_pp == 0:
-            logger.debug(f"EP: num_tokens_pp=0, M={M}, hidden_size={hidden_size}, skipping Marlin kernel")
-            # Use dummy [1, hidden_size] for all_reduce (NCCL requires numel > 0)
-            dummy = paddle.zeros([1, hidden_size], dtype=x.dtype)
-            paddle.distributed.all_reduce(dummy, group=ep_group)
-            return paddle.zeros([M, hidden_size], dtype=x.dtype)
+        # Skip if no tokens assigned to local experts.
+        # IMPORTANT: All ranks must participate in the same all_reduce at the end.
+        # We still need to do routing on all ranks (gate(x) + get_moe_scores) to stay
+        # in sync. When num_tokens_pp==0, we skip the GEMM but still do all_reduce.
+        num_tokens_pp_val = int(num_tokens_pp.item()) if hasattr(num_tokens_pp, 'item') else int(num_tokens_pp)
 
         # SM80 (A100): BF16 dequant + cuBLAS GEMM（Marlin kernel 在 SM80 上有精度问题）
         from fastdeploy.model_executor.utils import get_sm_version
         from fastdeploy.platforms import current_platform
         if self.weight_type == "fp8" and get_sm_version() < 90 and current_platform.is_cuda():
-            if hasattr(layer, '_sm80_fp8_up_gate'):
+            if hasattr(layer, '_sm80_gate'):
                 return self._apply_ep_sm80_bf16(
                     layer, x, topk_weights, topk_ids,
                     M, hidden_size, top_k, ep_group,
                 )
+            else:
+                logger.warning(f"SM80: layer {getattr(layer, 'layer_idx', '?')} has no _sm80_gate, falling through to Marlin path")
 
         b_q_type_str = "float8_e4m3fn" if self.weight_type == "fp8" else "uint4b8"
         workspace_up = paddle.zeros([528], dtype="int32")
@@ -725,97 +765,112 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         ep_group,
     ) -> paddle.Tensor:
         """
-        SM80 (A100) fallback: per-layer dequant FP8->BF16 + cuBLAS GEMM.
-        Avoids Marlin kernel precision issues on SM80.
+        SM80 (A100) fallback: use pre-stacked BF16 expert weights on GPU.
+        Batched GEMM with paddle.bmm for all active experts at once.
         """
         import numpy as np
+        import sys
+
+        gate_all = layer._sm80_gate   # [E, 1536, 3072]
+        up_all = layer._sm80_up       # [E, 1536, 3072]
+        down_all = layer._sm80_down   # [E, 1536, 3072]
+        local_start = layer.expert_id_offset
+        moe_inter = gate_all.shape[1]  # 1536
+
         from paddleformers.utils.log import logger
 
-        BLOCK = 128
+        _gpu_mem = paddle.device.cuda.memory_allocated() / (1024**3)
+        _gpu_max = paddle.device.cuda.max_memory_allocated() / (1024**3)
+        logger.info(f"SM80_BF16_ENTER: layer={getattr(layer, 'layer_idx', '?')}, M={M}, "
+              f"top_k={top_k}, x.shape={x.shape}, gpu_alloc={_gpu_mem:.1f}GB, gpu_max={_gpu_max:.1f}GB")
 
-        def dequant_to_bf16(fp8_weight, scale):
-            """Dequant FP8 weight to BF16 using block-wise scale."""
-            N, K = fp8_weight.shape
-            n_blocks_r = (N + BLOCK - 1) // BLOCK
-            n_blocks_c = (K + BLOCK - 1) // BLOCK
-            wt_f32 = fp8_weight.cast("float32").numpy()
-            sc = scale.numpy()
-            pad_r = n_blocks_r * BLOCK - N
-            pad_c = n_blocks_c * BLOCK - K
-            if pad_r > 0 or pad_c > 0:
-                wt_f32 = np.pad(wt_f32, ((0, pad_r), (0, pad_c)))
-            wt_blocked = wt_f32.reshape([n_blocks_r, BLOCK, n_blocks_c, BLOCK])
-            sc_expanded = sc.reshape([n_blocks_r, n_blocks_c])[:, np.newaxis, :, np.newaxis]
-            wt_dequant = (wt_blocked * sc_expanded).reshape(
-                [n_blocks_r * BLOCK, n_blocks_c * BLOCK]
-            )[:N, :K]
-            return paddle.to_tensor(wt_dequant, dtype="bfloat16")
+        # Dump MoE input states for comparison
+        _li = getattr(layer, 'layer_idx', None)
+        if _DMP and _li is not None and x.shape[0] > 0:
+            _moe_dump("gate_input", x, _li)
+            _moe_dump("topk_weights", topk_weights, _li)
+            _moe_dump_int("topk_ids", topk_ids, _li)
 
-        # Copy FP8 expert weights from CPU to GPU for dequant
-        fp8_up_gate = layer._sm80_fp8_up_gate.cuda()      # [E, N*2, K]
-        fp8_up_gate_scale = layer._sm80_fp8_up_gate_scale.cuda()
-        fp8_down = layer._sm80_fp8_down.cuda()             # [E, N, K]
-        fp8_down_scale = layer._sm80_fp8_down_scale.cuda()
-
-        N_half = fp8_up_gate.shape[1] // 2
-        num_local = fp8_up_gate.shape[0]
-        local_start = layer.expert_id_offset
-
-        # Dequant all local experts to BF16
-        gate_list, up_list, down_list = [], [], []
-        for i in range(num_local):
-            ug = dequant_to_bf16(fp8_up_gate[i], fp8_up_gate_scale[i])
-            gate_list.append(ug[:N_half])
-            up_list.append(ug[N_half:])
-            down_list.append(dequant_to_bf16(fp8_down[i], fp8_down_scale[i]))
-
-        all_gate = paddle.stack(gate_list, axis=0)  # [num_local, N, K] bf16
-        all_up = paddle.stack(up_list, axis=0)
-        all_down = paddle.stack(down_list, axis=0)
-
-        # Process each local expert
-        topk_ids_np = topk_ids.numpy()
+        topk_ids_np = topk_ids.numpy()  # [M, top_k]
         topk_weights_np = topk_weights.numpy()
 
-        ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
+        # Build per-expert token list
+        num_local = gate_all.shape[0]
+        expert_rows = [[] for _ in range(num_local)]
+        expert_wts = [[] for _ in range(num_local)]
+        for r in range(M):
+            for c in range(top_k):
+                eid = int(topk_ids_np[r, c])
+                if local_start <= eid < local_start + num_local:
+                    lid = eid - local_start
+                    expert_rows[lid].append(r)
+                    expert_wts[lid].append(float(topk_weights_np[r, c]))
+
+        active = [lid for lid in range(num_local) if expert_rows[lid]]
+
+        logger.info(f"SM80_BF16_GEMM: layer={getattr(layer, 'layer_idx', '?')}, M={M}, "
+              f"active={len(active)}")
+
+        if not active:
+            # Must use float32 to match the all_reduce dtype on other ranks
+            ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
+            paddle.distributed.all_reduce(ffn_out, group=ep_group)
+            ffn_out = ffn_out.cast(x.dtype)
+            logger.info(f"SM80_BF16_DONE: layer={getattr(layer, 'layer_idx', '?')}, M={M} (no active local experts)")
+            return ffn_out
+
         x_bf16 = x.cast("bfloat16")
+        ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
 
-        for local_expert_id in range(num_local):
-            global_expert_id = local_start + local_expert_id
-            mask = topk_ids_np == global_expert_id
-            if not mask.any():
-                continue
-            token_indices = np.where(mask)[0]
-            weights = topk_weights_np[mask]
-            token_x = x_bf16[token_indices]
+        # Batched GEMM: group experts by token count to avoid padding overhead
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for lid in active:
+            n_tok = len(expert_rows[lid])
+            if n_tok > 0:
+                groups[n_tok].append(lid)
 
-            gate_w = all_gate[local_expert_id]
-            up_w = all_up[local_expert_id]
-            down_w = all_down[local_expert_id]
+        for n_tok, lids in groups.items():
+            A = len(lids)
 
-            gate_out = paddle.nn.functional.linear(token_x, gate_w.T)
-            up_out = paddle.nn.functional.linear(token_x, up_w.T)
-            swiglu_out = paddle.nn.functional.swiglu(
-                paddle.concat([gate_out, up_out], axis=-1)
-            )
-            expert_out = paddle.nn.functional.linear(swiglu_out, down_w.T)
+            all_rows = []
+            all_wts = []
+            for lid in lids:
+                all_rows.extend(expert_rows[lid])
+                all_wts.extend(expert_wts[lid])
 
-            weighted_expert_out = expert_out.cast("float32") * weights[:, np.newaxis].astype("float32")
+            tok_idx = paddle.to_tensor(all_rows, dtype='int64')
+            tok = x_bf16[tok_idx]
+            tok = tok.reshape([A, n_tok, hidden_size])
 
-            # Scatter-add (float32 accumulation)
-            # NOTE: must .cast("float32") before .numpy() — bf16 .numpy() returns uint16
-            ffn_out_np = ffn_out.cast("float32").numpy()
-            weighted_np = weighted_expert_out.cast("float32").numpy()
-            for idx, tidx in enumerate(token_indices):
-                ffn_out_np[tidx] += weighted_np[idx]
-            ffn_out = paddle.to_tensor(ffn_out_np, dtype="float32")
+            active_idx = paddle.to_tensor(lids, dtype='int64')
+            gate_w = gate_all[active_idx]
+            up_w = up_all[active_idx]
 
-        # All-reduce across EP ranks
+            g = paddle.bmm(tok, gate_w.transpose([0, 2, 1]))
+            u = paddle.bmm(tok, up_w.transpose([0, 2, 1]))
+            del tok, gate_w, up_w
+
+            sw = paddle.nn.functional.swiglu(paddle.concat([g, u], -1))
+            del g, u
+
+            down_w = down_all[active_idx]
+            o = paddle.bmm(sw, down_w.transpose([0, 2, 1]))
+            del sw, down_w, active_idx
+
+            wt = paddle.to_tensor(all_wts, dtype='float32').reshape([A, n_tok, 1])
+            wo = o.cast("float32") * wt
+            del o, wt
+            wo = wo.reshape([A * n_tok, hidden_size])
+
+            ffn_out = paddle.index_put(ffn_out, [tok_idx], wo, accumulate=True)
+            del wo, tok_idx
+
         paddle.distributed.all_reduce(ffn_out, group=ep_group)
         ffn_out = ffn_out.cast(x.dtype)
 
-        # Free GPU copies
-        del fp8_up_gate, fp8_up_gate_scale, fp8_down, fp8_down_scale
-        del all_gate, all_up, all_down
+        if _DMP and _li is not None and ffn_out.shape[0] > 0:
+            _moe_dump("moe_output", ffn_out, _li)
 
+        logger.info(f"SM80_BF16_DONE: layer={getattr(layer, 'layer_idx', '?')}, M={M}")
         return ffn_out

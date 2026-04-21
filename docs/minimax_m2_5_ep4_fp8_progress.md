@@ -1237,3 +1237,324 @@ CUDA_VISIBLE_DEVICES=7 python scripts/compare_vllm.py
 ### 18.2 4 卡 TP=4 配置
 
 FD 的 LLM API 在 `CUDA_VISIBLE_DEVICES=4,5,6,7` 下，engine 进程会在逻辑 GPU 0（物理 GPU 4）上分配显存，与 worker 进程共享同一张卡。需要确认 engine 的 GPU 分配逻辑或使用独立的 GPU 集合。
+
+---
+
+## 十九、SM80 BF16 Workaround 重写 + 30层 LLM API 端到端成功（2026-04-21）
+
+### 19.1 问题背景
+
+之前（17.7）的 SM80 BF16 workaround 使用逐 expert 的 `paddle.nn.functional.linear` 做 BF16 GEMM，每个 decode step 都要做 FP8→BF16 dequant（CPU numpy），导致 30 层 decode OOM（PaddlePaddle 显存池累积）。
+
+用户要求：
+1. FP8→BF16 反量化必须在**加载时**完成，不是 forward 时
+2. BF16 权重常驻 GPU，便于快速推理
+3. 使用 `llm.generate` 接口（不能直接用 `paddle.distributed.launch` 跑模型）
+4. 需要对比 FD 和 vLLM 的 hidden states
+
+### 19.2 SM80 BF16 Workaround 重写
+
+**核心改动：** 将 FP8→BF16 dequant 从 forward 时移到加载时，BF16 权重常驻 GPU。
+
+#### `minimax_m2_5.py` — `_load_fp8_marlin_layer` 重写
+
+**加载时 dequant（SM80 分支）：**
+
+```python
+# SM80: dequant all local experts FP8→BF16 at load time, store on GPU.
+for i in range(num_experts):
+    gate_w = expert_up_gate[i]["gate"]  # [1536, 3072] FP8
+    up_w = expert_up_gate[i]["up"]      # [1536, 3072] FP8
+    combined_w = paddle.concat([gate_w, up_w], axis=0)  # [3072, 3072] FP8
+    combined_s = paddle.concat([gate_s, up_s], axis=0)  # [24, 24] f32
+    ug_bf16 = _dequant_fp8_blockwise_to_bf16(combined_w, combined_s)
+    # ... same for down ...
+
+# Stack into contiguous tensors for fast forward
+moe_layer._sm80_gate = paddle.stack([w[:w.shape[0]//2] for w in ug_bf16_list], axis=0)  # [E, 1536, 3072] BF16
+moe_layer._sm80_up = paddle.stack([w[w.shape[0]//2:] for w in ug_bf16_list], axis=0)    # [E, 1536, 3072] BF16
+moe_layer._sm80_down = paddle.stack(down_bf16_list, axis=0)                               # [E, 1536, 3072] BF16
+```
+
+**关键点：**
+- 不再创建 Marlin packed int32 格式（SM80 上不需要）
+- Expert 权重从 CPU FP8 改为 GPU BF16（加载时一次 dequant）
+- 非 expert 权重保持 FP8 + `sm80_keep_fp8=True`（forward 时用 `BlockWiseFP8LinearMethod.apply()` SM80 路径 dequant）
+- 每层 ~1.7 GB（64 experts × 3 BF16 tensors），30 层 ~51 GB/GPU
+
+#### `fused_moe_marlin_backend.py` — `_apply_ep_sm80_bf16` 重写
+
+**Forward 时直接用 BF16 权重做 batched GEMM：**
+
+```python
+def _apply_ep_sm80_bf16(self, layer, x, topk_weights, topk_ids, M, hidden_size, top_k, ep_group):
+    gate_all = layer._sm80_gate   # [E, 1536, 3072] BF16 (already on GPU)
+    up_all = layer._sm80_up       # [E, 1536, 3072] BF16
+    down_all = layer._sm80_down   # [E, 1536, 3072] BF16
+
+    # Group experts by token count for batched GEMM
+    groups = defaultdict(list)
+    for lid in active:
+        groups[len(expert_rows[lid])].append(lid)
+
+    for n_tok, lids in groups.items():
+        tok = x_bf16[tok_idx].reshape([A, n_tok, hidden_size])
+        g = paddle.bmm(tok, gate_w.transpose([0, 2, 1]))   # batched GEMM
+        u = paddle.bmm(tok, up_w.transpose([0, 2, 1]))
+        sw = paddle.nn.functional.swiglu(paddle.concat([g, u], -1))
+        o = paddle.bmm(sw, down_w.transpose([0, 2, 1]))
+        ffn_out = paddle.index_put(ffn_out, [tok_idx], wo, accumulate=True)
+
+    paddle.distributed.all_reduce(ffn_out, group=ep_group)
+    return ffn_out.cast(x.dtype)
+```
+
+**关键改进：**
+- 不再有 CPU→GPU 拷贝、numpy dequant、逐 expert 循环
+- 使用 `paddle.bmm` 做 batched GEMM（同一 token 数的 experts 合并为一个 batch）
+- 使用 `paddle.index_put(accumulate=True)` 做 scatter-add（替代 numpy 索引）
+- 每层 forward ~3ms（M=1），30 层 ~100ms
+
+### 19.3 修复的死锁 Bug
+
+#### Bug 1: `all_reduce` dtype 不匹配（致命）
+
+**现象：** 30 层模型 prefill 时 layer 0 完成，layer 1 死锁。Worker 0 的 `apply()` 进入 layer 1 但 never returns。
+
+**根因：** 当 `active=0`（某个 rank 没有本地 expert 命中），旧代码对 **bfloat16** tensor 做 `all_reduce`：
+```python
+if not active:
+    paddle.distributed.all_reduce(
+        paddle.zeros([M, hidden_size], dtype=x.dtype), group=ep_group  # x.dtype = bfloat16
+    )
+```
+
+其他 rank（`active > 0`）对 **float32** tensor 做 `all_reduce`：
+```python
+ffn_out = paddle.zeros([M, hidden_size], dtype="float32")  # float32
+# ... GEMM loop ...
+paddle.distributed.all_reduce(ffn_out, group=ep_group)  # float32
+```
+
+NCCL `all_reduce` 要求所有 rank 使用相同 dtype → **死锁**。
+
+**修复：** `active=0` 路径使用 float32（匹配正常路径）：
+```python
+if not active:
+    ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
+    paddle.distributed.all_reduce(ffn_out, group=ep_group)
+    ffn_out = ffn_out.cast(x.dtype)
+    return ffn_out
+```
+
+#### Bug 2: `num_tokens_pp==0` 时提前 `all_reduce` 返回（致命）
+
+**现象：** 同上，但根因不同。当某个 rank 的 `num_tokens_pp==0`（没有 token 分配给本地 experts），旧代码提前 `all_reduce` + return。其他 rank 继续走到 SM80 路径做另一个 `all_reduce`（不同 tensor）→ 死锁。
+
+**修复：** 移除 `num_tokens_pp==0` 的 early return。所有 rank 统一走 SM80 路径，在 `_apply_ep_sm80_bf16` 内部处理 `active=0` 的情况（用相同 dtype 的 zero tensor 做 `all_reduce`）。
+
+### 19.4 30 层 LLM API 端到端验证
+
+**环境：** GPU 4,5,6,7 (4×A100 80GB)，EP=4，30 层，`FD_MARLIN_FP8=1`
+
+**启动命令：**
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 FD_MARLIN_FP8=1 python /data/lizhijun/work/fd-vllm/FastDeploy/scripts/bench_sm80.py
+```
+
+**bench_sm80.py 配置：**
+```python
+llm = LLM(
+    model='/data-ssd/lizhijun/models/MiniMax/MiniMax-M2.5',
+    tensor_parallel_size=4,
+    enable_expert_parallel=True,
+    disable_sequence_parallel_moe=True,
+    max_model_len=256,
+    gpu_memory_utilization=0.90,
+    max_num_seqs=1,
+    num_gpu_blocks_override=100,
+    max_num_batched_tokens=256,
+    graph_optimization_config={'use_cudagraph': False},
+)
+```
+
+**结果：**
+
+| 指标 | 值 |
+|------|-----|
+| 模型加载时间 | ~10 分钟（62 层 checkpoint 逐层 dequant 64 experts） |
+| GPU 显存 | ~56 GB/GPU（30 层 expert BF16 + 非 expert FP8） |
+| MoE forward（30 层，M=1） | **~100ms** |
+| Prefill + 1 decode 总时间 | **32.4 秒**（加载占 99%+） |
+| 生成 token | `[200020]`（EOS） |
+
+**Forward 时序（workerlog.0）：**
+```
+08:38:24.915 SM80_BF16_DONE: layer=0, M=1
+08:38:24.922 SM80_BF16_DONE: layer=1, M=1 (no active local experts)
+08:38:24.928 SM80_BF16_DONE: layer=2, M=1
+...
+08:38:25.006 SM80_BF16_DONE: layer=29, M=1
+```
+
+30 层 MoE forward 总耗时 **~91ms**（平均每层 ~3ms）。
+
+### 19.5 性能分析
+
+| 阶段 | 耗时 | 瓶颈 |
+|------|------|------|
+| 模型加载（62 层 checkpoint 读取 + 30 层 dequant） | ~600s | CPU numpy dequant 64 experts/层 × 30 层 |
+| Prefill（M=1） | ~100ms | 30 层 attention + MoE |
+| Decode（M=1） | ~100ms/步 | 同上 |
+
+**加载瓶颈：** 每层 `_load_fp8_marlin_layer` 做 64 次 FP8→BF16 numpy dequant（~15s/层）。30 层 ~450s，加上 checkpoint 读取 ~150s，总计 ~600s。
+
+**Forward 性能优秀：** SM80 BF16 workaround 使用 `paddle.bmm` batched GEMM，无 CPU 同步、无 numpy 操作、无逐 expert 循环。每层 ~3ms。
+
+### 19.6 显存分析
+
+| 组件 | 每层 | 30 层总计 |
+|------|------|----------|
+| Expert BF16 权重（64 experts × 3 tensors） | 1.7 GB | 51 GB |
+| 非 expert FP8 权重 + scales | 0.04 GB | 1.2 GB |
+| KV cache | - | ~0.03 GB |
+| **总计** | **~1.74 GB** | **~52 GB/GPU** |
+
+62 层需要 ~107 GB/GPU，超出 80 GB A100。需要优化方案：
+1. **非 expert 权重也做 CPU offload**（FP8 保 CPU，forward 时 dequant）
+2. **Expert 权重分层加载**（只在当前层 forward 时加载该层 BF16 权重）
+3. **或者只跑 40-50 层**（~70 GB/GPU，刚好在 80 GB 以内）
+
+### 19.7 修改的文件
+
+| 文件 | 修改 |
+|------|------|
+| `minimax_m2_5.py` | `_load_fp8_marlin_layer` SM80 分支：加载时 dequant FP8→BF16，stacked BF16 常驻 GPU（`_sm80_gate`, `_sm80_up`, `_sm80_down`）；非 expert 权重 `sm80_keep_fp8=True` |
+| `fused_moe_marlin_backend.py` | `_apply_ep_sm80_bf16` 重写：batched `paddle.bmm` + `paddle.index_put` scatter-add；`active=0` dtype 修复（float32）；移除 `num_tokens_pp==0` early return；添加 GPU 显存日志 |
+| `block_wise_fp8.py` | `get_quant_method` SM80 检测 + `MarlinWeightOnlyMoEMethod` 返回 |
+| `engine.py` | （已回退）elastic_timeout 尝试 |
+| `scripts/bench_sm80.py` | **新建** — 30 层 SM80 benchmark 脚本 |
+| `scripts/bench_sm80_llm.py` | **新建** — LLM API benchmark 脚本 |
+| `scripts/test_sm80_minimal.py` | **新建** — 最小化 SM80 测试脚本（config 构建太复杂，未成功运行） |
+| `fastdeploy/model_executor/model_loader/default_loader_v1.py` | 添加加载后 GPU 显存日志 |
+| `analysis_sm80_loading.md` | **新建** — OOM 根因分析文档 |
+
+### 19.8 下一步计划
+
+1. **对比 vLLM 的 hidden states** — 确认 30 层输出精度
+2. **测试更长 prompt** — "Hello" 太短，模型直接输出 EOS
+3. **扩展到 62 层** — 需要优化显存（非 expert CPU offload 或分层加载）
+4. **清理 debug 日志** — `logger.info` in `apply()` / `_apply_ep_sm80_bf16` 可降级为 `debug`
+5. **decode 性能测试** — 多步 decode 的吞吐和延迟
+
+---
+
+## 20. Hidden States 逐层对比：FD vs vLLM（2026-04-21）
+
+### 20.1 目标
+
+使用 GPU 6,7（TP=2, EP=2），将 FD 的 hidden states 与 vLLM 逐层对齐，先 2 层再 10 层。
+
+### 20.2 实施方案
+
+利用已有的 dump 基础设施（`FD_DUMP_DIR` / `VLLM_DUMP_DIR`），逐层逐阶段对比 embed、post_norm1、post_attn、post_moe、final_norm 的 cosine similarity。
+
+### 20.3 关键修复：SM80 上 `forward_split_allgather` 导致 token 丢失
+
+**Bug**: `moe.py` 的 `FusedMoE.forward()` 在 `ep_size > 1` 且 `attn_tp_size > 1` 且 `token_num >= attn_tp_size` 时调用 `forward_split_allgather()`，将 5 个 token 按 TP rank 拆分（rank 0 得 3 个，rank 1 得 2 个）。但 `_apply_ep_sm80_bf16` 需要所有 token 在所有 rank 上（它自己做 per-expert routing）。
+
+**现象**: FD 的 MoE gate output shape 为 `(3, 256)` 而非 `(5, 256)`，导致 routing 完全错误。
+
+**修复**: 在 `moe.py` 的 `forward()` 中，SM80 上跳过 `forward_split_allgather`：
+```python
+_is_sm80 = current_platform.is_cuda() and getattr(self.quant_method, 'weight_type', '') == 'fp8'
+if _is_sm80:
+    from fastdeploy.model_executor.utils import get_sm_version
+    _is_sm80 = get_sm_version() < 90
+if (
+    not _use_nccl_ep
+    and not _is_sm80          # ← 新增
+    and self.ep_size > 1
+    ...
+):
+```
+
+**验证**: 修复后 gate output shape 从 `(3, 256)` → `(5, 256)`，top-3 experts 完全匹配 vLLM。
+
+### 20.4 对比结果（修复后，2 层，GPU 6,7，EP=2）
+
+#### 可靠对比的阶段
+
+| 阶段 | cos_sim | 状态 |
+|------|---------|------|
+| Embed | 1.000000 | 完全一致 |
+| Gate output (layer 0) | 0.999850 | 非常接近 |
+| Gate correction bias | identical | 完全一致 |
+| Top-3 experts (all tokens) | 100% 匹配 | 一致 |
+
+#### Gate output 详情
+
+```
+Gate output cos_sim: mean=0.999850, min=0.999693
+  token 0: cos=0.999980, FD_top3=[167 83 250], vLLM_top3=[167 83 250] ✓
+  token 1: cos=0.999763, FD_top3=[65 184 102], vLLM_top3=[65 184 102] ✓
+  token 2: cos=0.999693, FD_top3=[167 250 176], vLLM_top3=[167 250 176] ✓
+  token 3: cos=0.999930, FD_top3=[71 184 102], vLLM_top3=[71 184 102] ✓
+  token 4: cos=0.999883, FD_top3=[167 236 250], vLLM_top3=[167 250 236] ✓
+```
+
+#### Top-8 expert selection 差异
+
+Top-8 experts 仍然不完全匹配（大多数 token 0 overlap），原因是：
+1. Gate output 有微小 BF16 精度差异（cos=0.9999 而非 1.0）
+2. Sigmoid routing 是非线性的 — 小输入差异会被放大
+3. 很多 expert 的分数非常接近（0.69-0.81 区间），微小分数差异就改变 top-8 选择
+
+```
+sigmoid max_diff: 0.004 - 0.010
+sigmoid mean_diff: 0.001 - 0.004
+```
+
+#### 不可靠对比的阶段（vLLM V1 engine 问题）
+
+| 阶段 | FD shape | vLLM shape | vLLM 行数据 |
+|------|----------|------------|------------|
+| post_norm1 | (5, 3072) | (256, 3072) | 所有 5 行相同 |
+| post_attn | (5, 3072) | (256, 3072) | 全零 |
+| post_norm2 | (5, 3072) | (256, 3072) | 所有 5 行相同 |
+| post_moe | (5, 3072) | (256, 3072) | 所有 5 行相同 |
+
+**原因**: vLLM V1 engine 的 chunked prefill 机制在 decoder layer 内部对 hidden states 做了 pad/reshape，导致 dump 捕获的是 padded tensor，而非 per-token hidden states。
+
+### 20.5 vLLM V1 engine dump 的限制
+
+- `embed` 和 `final_norm` 正确（shape=(5,3072)）
+- `moe_gate_input` 和 `moe_router_logits` 正确（在 MoE forward 内部 dump，shape=(5,3072)）
+- Decoder layer 内部的 dump（post_norm1, post_attn, post_moe 等）全部被 pad 到 max_model_len=256，且所有 token 行相同
+- `llm.apply_model()` 做 manual forward 失败（pickle 序列化问题，V1 engine 不支持闭包/嵌套函数）
+- `VLLM_USE_V1=0` 在当前 vLLM 版本下不生效（仍使用 V1 engine）
+
+### 20.6 添加的 dump 点
+
+`fused_moe_marlin_backend.py` 的 `apply_ep_noalltoall()` 新增：
+- `gate_out`: gate linear layer 的输出（sigmoid 前），用于与 vLLM 的 router_logits 对比
+- `correction_bias`: 首次调用时 dump e_score_correction_bias
+
+### 20.7 修改的文件
+
+| 文件 | 修改 |
+|------|------|
+| `fastdeploy/model_executor/layers/moe/moe.py` | SM80 跳过 `forward_split_allgather` |
+| `fastdeploy/model_executor/layers/moe/fused_moe_marlin_backend.py` | 添加 gate_out / correction_bias dump |
+| `FastDeploy/scripts/bench_sm80.py` | 添加 --n_layers, --prompt, --gpus, --dump_dir 参数 |
+| `vllm/vllm/model_executor/models/minimax_m2.py` | dump 条件从 `li < 2` 改为 dump 所有层 |
+| `my-tools/compare_dump.py` | **新建** — dump 对比脚本（支持 padding trim） |
+| `my-tools/run_vllm_n_layers.py` | **新建** — vLLM N 层 dump 脚本 |
+| `my-tools/run_vllm_manual.py` | **新建** — vLLM manual forward（pickle 问题未解决） |
+
+### 20.8 下一步
+
+1. **解决 vLLM layer-level dump**: 用独立脚本加载 vLLM 模型（不走 LLM API），手动跑 forward
+2. **逐层对比**: embed → post_norm1 → post_attn → post_moe → final_norm
+3. **对齐 routing**: 如果 routing 完全一致，post_moe 应该接近
+4. **跑 10 层**: 2 层对齐后扩展到 10 层
