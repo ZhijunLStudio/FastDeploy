@@ -20,10 +20,15 @@ import paddle
 from paddle import nn
 
 import fastdeploy
-from fastdeploy.model_executor.ops.gpu import (
-    MoeWna16MarlinGemmApi,
-    tritonmoe_preprocess_func,
-)
+
+try:
+    from fastdeploy.model_executor.ops.gpu import (
+        MoeWna16MarlinGemmApi,
+        tritonmoe_preprocess_func,
+    )
+except (ImportError, AttributeError):
+    MoeWna16MarlinGemmApi = None
+    tritonmoe_preprocess_func = None
 
 from ..quantization.quant_base import QuantMethodBase
 
