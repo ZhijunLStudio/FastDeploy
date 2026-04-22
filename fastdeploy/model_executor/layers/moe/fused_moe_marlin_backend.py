@@ -433,6 +433,8 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         gate: nn.Layer,
         topk_ids_hookfunc: Callable = None,
         shared_experts: nn.Layer = None,
+        fc1_latent_proj: nn.Layer = None,
+        fc2_latent_proj: nn.Layer = None,
     ) -> paddle.Tensor:
         """Marlin compute Fused MoE. Routes to apply_ep_noalltoall() when ep_size > 1."""
         ep_sz = getattr(layer, "ep_size", 1)
@@ -573,6 +575,8 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         gate: nn.Layer,
         topk_ids_hookfunc: Callable = None,
         shared_experts: nn.Layer = None,
+        fc1_latent_proj: nn.Layer = None,
+        fc2_latent_proj: nn.Layer = None,
     ) -> paddle.Tensor:
         """
         vLLM-style NoEP EP: all tokens remain on all ranks, each rank computes
@@ -618,22 +622,7 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         expert_map = paddle.to_tensor(expert_map_list, dtype="int32")
 
         # Step 3: Triton preprocess with expert_map filtering
-        block_size_m = 64
-        for m in [8, 16, 32, 48, 64]:
-            if M * top_k / num_local_experts / m < 0.9:
-                block_size_m = m
-                break
-
-        sorted_token_ids, expert_ids, num_tokens_pp = tritonmoe_preprocess_with_map_func(
-            topk_ids.cast("int64"), expert_map, num_local_experts, block_size_m
-        )
-
-        # Skip if no tokens assigned to local experts.
-        # IMPORTANT: All ranks must participate in the same all_reduce at the end.
-        # We still need to do routing on all ranks (gate(x) + get_moe_scores) to stay
-        # in sync. When num_tokens_pp==0, we skip the GEMM but still do all_reduce.
-
-        # SM80 (A100): BF16 dequant + cuBLAS GEMM
+        # On SM80, skip preprocess and go directly to _apply_ep_sm80_bf16
         from fastdeploy.model_executor.utils import get_sm_version
         from fastdeploy.platforms import current_platform
 
@@ -649,10 +638,22 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
                     top_k,
                     ep_group,
                 )
-            else:
-                logger.warning(
-                    f"SM80: layer {getattr(layer, 'layer_idx', '?')} has no _sm80_gate, falling through to Marlin path"
-                )
+
+        block_size_m = 64
+        for m in [8, 16, 32, 48, 64]:
+            if M * top_k / num_local_experts / m < 0.9:
+                block_size_m = m
+                break
+
+        if tritonmoe_preprocess_with_map_func is None:
+            raise RuntimeError(
+                "tritonmoe_preprocess_with_map_func is not available. "
+                "Ensure custom ops are compiled for your platform."
+            )
+
+        sorted_token_ids, expert_ids, num_tokens_pp = tritonmoe_preprocess_with_map_func(
+            topk_ids.cast("int64"), expert_map, num_local_experts, block_size_m
+        )
 
         b_q_type_str = "float8_e4m3fn" if self.weight_type == "fp8" else "uint4b8"
         workspace_up = paddle.zeros([528], dtype="int32")

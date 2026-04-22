@@ -14,6 +14,15 @@
 # limitations under the License.
 """
 
+# Force lazy binding for shared library loading to allow undefined symbols
+# at load time (resolved only when actually called). This is needed for
+# custom ops .so files that may have template symbols for unused code paths.
+import sys
+try:
+    sys.setdlopenflags(sys.getdlopenflags() | 1)  # RTLD_LAZY
+except Exception:
+    pass
+
 # Configure root logger first to unify log formats
 # This must be done before importing any modules that may use the logger
 import logging

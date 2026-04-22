@@ -923,37 +923,52 @@ class MiniMaxM2ForCausalLM(ModelForCasualLM):
         if get_sm_version() < 90 and current_platform.is_cuda():
             _t_start = time.time()
 
-            ug_bf16_list = []
-            down_bf16_list = []
+            # Get dimensions from expert weight shapes
+            # gate weight: [moe_intermediate_size, hidden_size] = [1536, 3072]
+            # down weight: [hidden_size, moe_intermediate_size] = [3072, 1536]
+            first_gate_w = expert_up_gate[0]["gate"]
+            first_down_w = expert_down[0]
+            _moe_intermediate_size = first_gate_w.shape[0]  # 1536
+            _hidden_size = first_gate_w.shape[1]  # 3072
+
+            # Pre-allocate stacked output tensors (match weight shapes)
+            # gate+up combined: concat([1536,3072], [1536,3072]) = [3072, 3072]
+            # down: [3072, 1536]
+            stacked_ug = paddle.zeros([num_experts, _moe_intermediate_size * 2, _hidden_size], dtype=paddle.bfloat16)
+            stacked_down = paddle.zeros([num_experts] + list(first_down_w.shape), dtype=paddle.bfloat16)
+
             for i in range(num_experts):
                 gate_w = expert_up_gate[i]["gate"]  # [1536, 3072] FP8
                 up_w = expert_up_gate[i]["up"]  # [1536, 3072] FP8
 
-                # Dequant up_gate combined
+                # Dequant up_gate combined - use slice assignment to avoid temp allocation
                 gate_s = expert_up_gate_scales[i]["gate"].cast("float32")
                 up_s = expert_up_gate_scales[i]["up"].cast("float32")
                 combined_w = paddle.concat([gate_w, up_w], axis=0)  # [3072, 3072] FP8
                 combined_s = paddle.concat([gate_s, up_s], axis=0)  # [24, 24] f32
                 ug_bf16 = _dequant_fp8_blockwise_to_bf16(combined_w, combined_s)
-                ug_bf16_list.append(ug_bf16)  # Keep on GPU
+                stacked_ug[i] = ug_bf16
                 del combined_w, combined_s, ug_bf16, gate_s, up_s
 
                 # Dequant down
-                down_w = expert_down[i]  # [1536, 3072] FP8
+                down_w = expert_down[i]  # [3072, 1536] FP8 (hidden_size, moe_intermediate_size)
                 down_s = expert_down_scales[i].cast("float32")
                 down_bf16 = _dequant_fp8_blockwise_to_bf16(down_w, down_s)
-                down_bf16_list.append(down_bf16)  # Keep on GPU
+                stacked_down[i] = down_bf16
                 del down_w, down_s, down_bf16
 
-                if (i + 1) % 32 == 0:
+                # Free FP8 weights for this expert to save memory
+                del expert_up_gate[i]
+                del expert_down[i]
+
+                if (i + 1) % 16 == 0:
                     paddle.device.cuda.empty_cache()
 
-            # Stack into contiguous tensors for fast forward (avoid paddle.stack per forward)
-            # gate: [E, 1536, 3072], up: [E, 1536, 3072], down: [E, 1536, 3072]
-            moe_layer._sm80_gate = paddle.stack([w[: w.shape[0] // 2] for w in ug_bf16_list], axis=0)
-            moe_layer._sm80_up = paddle.stack([w[w.shape[0] // 2 :] for w in ug_bf16_list], axis=0)
-            moe_layer._sm80_down = paddle.stack(down_bf16_list, axis=0)
-            del ug_bf16_list, down_bf16_list
+            # Split stacked_ug into gate and up
+            moe_layer._sm80_gate = stacked_ug[:, :_moe_intermediate_size, :]  # [E, 1536, 3072]
+            moe_layer._sm80_up = stacked_ug[:, _moe_intermediate_size:, :]  # [E, 1536, 3072]
+            moe_layer._sm80_down = stacked_down  # [E, 3072, 1536]
+            del stacked_ug, stacked_down
             paddle.device.cuda.empty_cache()
 
             _dt = time.time() - _t_start

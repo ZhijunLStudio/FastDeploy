@@ -438,6 +438,14 @@ void SetValueByFlagsAndIdx(const paddle::Tensor& token_ids_all,
                            const paddle::Tensor& step_idx,
                            const paddle::Tensor& stop_flags);
 
+void SetDataIpc(const paddle::Tensor& tmp_input,
+                const std::string& shm_name);
+
+void UnsetDataIpc(const paddle::Tensor& tmp_input,
+                  const std::string& shm_name,
+                  bool close_ipc,
+                  bool unlink_shm);
+
 paddle::Tensor RebuildPaddingFunc(
     const paddle::Tensor& tmp_out,      // [token_num, dim_embed]
     const paddle::Tensor& cum_offsets,  // [bsz, 1]
@@ -1546,6 +1554,28 @@ PYBIND11_MODULE(fastdeploy_ops, m) {
   m.def("set_value_by_flags_and_idx",
         &SetValueByFlagsAndIdx,
         "SetValueByFlagsAndIdx");
+
+  /**
+   * set_data_ipc.cu
+   * set_data_ipc - export CUDA IPC memory handle for inter-process sharing
+   */
+  m.def("set_data_ipc",
+        &SetDataIpc,
+        py::arg("tmp_input"),
+        py::arg("shm_name"),
+        "SetDataIpc");
+
+  /**
+   * unset_data_ipc.cu
+   * unset_data_ipc - close CUDA IPC handle and/or unlink shared memory
+   */
+  m.def("unset_data_ipc",
+        &UnsetDataIpc,
+        py::arg("tmp_input"),
+        py::arg("shm_name"),
+        py::arg("close_ipc"),
+        py::arg("unlink_shm"),
+        "UnsetDataIpc");
 
   /**
    * get_padding_offset.cu

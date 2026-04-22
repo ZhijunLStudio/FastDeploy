@@ -88,6 +88,18 @@ else:
         get_position_ids_and_mask_encoder_batch,
     )
 
+    # Fallback: if set_data_ipc is None (op not loaded), use no-op
+    if set_data_ipc is None:
+        import logging
+        logging.getLogger("fastdeploy").warning(
+            "set_data_ipc is None - IPC cache sharing disabled. KV cache will work but won't be shared via IPC."
+        )
+        def set_data_ipc(tensor, name):
+            pass
+    if unset_data_ipc is None:
+        def unset_data_ipc(tensor, name, close_ipc, unlink_shm):
+            pass
+
 import zmq
 
 from fastdeploy import envs
