@@ -83,14 +83,10 @@ class UnquantizedLinearMethod(QuantMethodBase):
         layer.weight.set_value(weights)
 
     def apply(self, layer: nn.Layer, x: paddle.Tensor) -> paddle.Tensor:
-        # Weight may be in [out, in] format (from torch model loading via process_weight_transpose).
-        # PaddlePaddle matmul expects [in, out], so transpose if needed.
-        w = layer.weight
+        linear_out = paddle.matmul(x, layer.weight)
         if layer.with_bias:
-            out = paddle.matmul(x, w, transpose_y=True) + layer.bias
-        else:
-            out = paddle.matmul(x, w, transpose_y=True)
-        return out
+            linear_out = paddle.add(linear_out, layer.bias)
+        return linear_out
 
 
 class LinearBase(nn.Layer):
