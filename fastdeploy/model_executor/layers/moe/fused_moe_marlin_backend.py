@@ -21,22 +21,26 @@ from paddle import nn
 
 import fastdeploy
 
-try:
-    from fastdeploy.model_executor.ops.gpu import (
-        MoeWna16MarlinGemmApi,
-        tritonmoe_preprocess_func,
-    )
-except (ImportError, AttributeError):
-    MoeWna16MarlinGemmApi = None
-    tritonmoe_preprocess_func = None
+from fastdeploy.model_executor.ops.gpu import (
+    MoeWna16MarlinGemmApi,
+    tritonmoe_preprocess_func,
+)
+
+# ops.gpu.__getattr__ returns None for missing ops instead of raising.
+# Check and try alternative names.
+if tritonmoe_preprocess_func is None:
+    from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess as tritonmoe_preprocess_func
+
+# Fallback: if MoeWna16MarlinGemmApi is not available, try moe_wna16_marlin_gemm
+if MoeWna16MarlinGemmApi is None:
+    from fastdeploy.model_executor.ops.gpu import moe_wna16_marlin_gemm as MoeWna16MarlinGemmApi
 
 from ..quantization.quant_base import QuantMethodBase
 
 # Optional: tritonmoe_preprocess_with_map_func for EP mode
-try:
-    from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess_with_map_func
-except (ImportError, AttributeError):
-    tritonmoe_preprocess_with_map_func = None
+from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess_with_map_func
+if tritonmoe_preprocess_with_map_func is None:
+    from fastdeploy.model_executor.ops.gpu import tritonmoe_preprocess_with_map as tritonmoe_preprocess_with_map_func
 
 
 def _swiglu(x):

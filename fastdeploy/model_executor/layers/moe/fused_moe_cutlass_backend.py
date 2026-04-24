@@ -333,6 +333,77 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
             ffn_out, topk_idx, topk_weights, handle, quant_group_size=quant_group_size
         )
 
+    def _apply_tp_pure_python(
+        self,
+        layer: nn.Layer,
+        x: paddle.Tensor,
+        gate_out: paddle.Tensor,
+        topk_ids_hookfunc: Callable = None,
+    ) -> paddle.Tensor:
+        """Pure Python MoE forward using standard PaddlePaddle ops.
+        Fallback for SM80 where custom ops segfault."""
+        from fastdeploy.model_executor.layers.moe.moe import get_moe_scores
+
+        top_k = layer.top_k
+        num_experts = layer.num_experts
+
+        # Top-k selection
+        if layer.topk_method == "noaux_tc":
+            gate_out, topk_weights, topk_idx = get_moe_scores(
+                gate_out,
+                layer.n_group,
+                layer.topk_group,
+                top_k,
+                layer.routed_scaling_factor,
+                layer.gate_correction_bias,
+                getattr(layer, "renormalize", True),
+            )
+        else:
+            topk_weights, topk_idx = paddle.topk(gate_out, top_k, axis=-1)
+            topk_weights = paddle.nn.functional.softmax(topk_weights.cast("float32"), axis=-1)
+
+        if topk_ids_hookfunc is not None:
+            topk_ids_hookfunc(topk_ids=topk_idx)
+
+        # Get expert weights: [num_experts, hidden_size, moe_intermediate_size*2]
+        up_gate_weight = getattr(layer, self.added_weight_attrs[0])  # [E, H, 2*I]
+        down_weight = getattr(layer, self.added_weight_attrs[1])     # [E, I, H]
+
+        token_num = x.shape[0]
+        final_output = paddle.zeros_like(x)
+
+        # Flatten: process all (token, expert) pairs
+        flat_topk_idx = topk_idx.reshape([-1])           # [T*K]
+        flat_topk_weights = topk_weights.reshape([-1]).cast(x.dtype)  # [T*K]
+
+        # Repeat each token K times
+        x_repeated = paddle.repeat_interleave(x, top_k, axis=0)  # [T*K, H]
+
+        # Gather expert weights for each (token, expert) pair
+        # up_gate_weight[flat_topk_idx] → [T*K, H, 2*I]
+        gathered_up_gate = paddle.gather(up_gate_weight, flat_topk_idx, axis=0)
+        # Batched matmul: [T*K, 1, H] @ [T*K, H, 2*I] → [T*K, 1, 2*I]
+        x_expanded = x_repeated.unsqueeze(1)  # [T*K, 1, H]
+        up_gate_out = paddle.bmm(x_expanded, gathered_up_gate).squeeze(1)  # [T*K, 2*I]
+
+        # SwiGLU
+        gate_part, up_part = up_gate_out.chunk(2, axis=-1)
+        hidden = gate_part * paddle.nn.functional.silu(up_part)  # [T*K, I]
+
+        # Down projection
+        gathered_down = paddle.gather(down_weight, flat_topk_idx, axis=0)  # [T*K, I, H]
+        hidden_expanded = hidden.unsqueeze(1)  # [T*K, 1, I]
+        out = paddle.bmm(hidden_expanded, gathered_down).squeeze(1)  # [T*K, H]
+
+        # Weight by topk weights
+        out = out * flat_topk_weights.unsqueeze(-1)  # [T*K, H]
+
+        # Reshape back and sum over top_k
+        out = out.reshape([token_num, top_k, -1])  # [T, K, H]
+        final_output = out.sum(axis=1)  # [T, H]
+
+        return final_output
+
     def apply_tp(
         self,
         layer: nn.Layer,
@@ -350,6 +421,11 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
 
         if fc1_latent_proj is not None:
             x = fc1_latent_proj(x)
+
+        # Pure Python fallback for SM80 or when custom ops are unavailable.
+        # Uses standard paddle ops instead of moe_expert_dispatch/moe_permute.
+        if self.moe_quant_type == "w16a16":
+            return self._apply_tp_pure_python(layer, x, gate_out, topk_ids_hookfunc)
 
         if fastdeploy.envs.FD_USE_PHI_MOE_PERMUTE and self.moe_quant_type == "w16a16":
             if layer.topk_method == "noaux_tc":
@@ -371,7 +447,6 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
                     False,
                 )
             topk_idx_i32 = topk_idx.astype(paddle.int32)
-            override_buffer_size = x.shape[0] * layer.top_k + layer.num_experts * (128 - 1)
             (permute_input, permute_indices_per_token, dst_weights, _scale_out) = (  # zipped_expertwise_rowmap
                 paddle.nn.functional.moe_permute(
                     hidden_states=x,
@@ -381,7 +456,6 @@ class CutlassMoEMethod(UnquantizedFusedMoEMethod):
                     num_experts=layer.num_experts,
                     tokens_per_expert=[],
                     padding_alignment=128,
-                    override_buffer_size=override_buffer_size,
                 )
             )
 

@@ -100,6 +100,24 @@ os.environ["AISTUDIO_LOG"] = "critical"
 
 import typing
 
+# Pre-load native libraries that may segfault if loaded AFTER PaddlePaddle.
+# On PaddlePaddle 3.3.1 + Python 3.13, PaddlePaddle's initialization corrupts
+# the native library state, causing subsequent native extension loads to segfault.
+# Pre-loading ensures these native libs are cached before PaddlePaddle touches the
+# global native state.
+for _mod in (
+    "sklearn", "sklearn.utils._cython_blas", "sklearn.neighbors._typedefs",
+    "sklearn.neighbors._quad_tree", "sklearn.tree._utils",
+    "scipy", "scipy.sparse", "scipy.sparse.csgraph", "scipy.special",
+    "scipy.linalg", "scipy.stats", "scipy.interpolate",
+    "joblib", "threadpoolctl", "sentencepiece", "tiktoken",
+):
+    try:
+        __import__(_mod)  # noqa: F401
+    except ImportError:
+        pass
+del _mod
+
 with _intercept_paddle_loggers():
     import paddle
 

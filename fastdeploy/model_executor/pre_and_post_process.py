@@ -127,7 +127,7 @@ def async_set_value(tgt, src):
         dtype_str = str(tgt.dtype).split(".")[1]
         if isinstance(src, list):
             src = np.array(src, dtype=dtype_str if dtype_str != "bfloat16" else "float32")
-        if current_platform.is_cuda():
+        if current_platform.is_cuda() and custom_numpy_to_tensor is not None:
             if str(src.dtype) != dtype_str:
                 srt_tensor = paddle.empty(tgt.shape, dtype=str(src.dtype))
                 src = custom_numpy_to_tensor(src, srt_tensor)

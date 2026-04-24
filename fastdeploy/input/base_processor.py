@@ -100,12 +100,7 @@ class BaseTextProcessor(ABC):
         )
 
         # EOS tokens
-        try:
-            from paddleformers.trl.llm_utils import get_eos_token_id
-        except Exception:
-            from paddleformers.cli.utils.llm_utils import get_eos_token_id
-
-        self.eos_token_ids = get_eos_token_id(self.tokenizer, self.generation_config)
+        self.eos_token_ids = self._get_eos_token_id(self.tokenizer, self.generation_config)
         data_processor_logger.info(
             f"The eos_token_ids obtained by merging tokenizer and generation_config is {self.eos_token_ids}"
         )
@@ -186,6 +181,31 @@ class BaseTextProcessor(ABC):
         self.tool_parser_obj = tool_parser_obj
         if reasoning_parser_obj:
             self.reasoning_parser = reasoning_parser_obj(self.tokenizer)
+
+    @staticmethod
+    def _get_eos_token_id(tokenizer, generation_config=None):
+        """Merge eos_token_id from tokenizer and generation_config.
+
+        Equivalent to paddleformers.cli.utils.llm_utils.get_eos_token_id
+        but avoids importing that module (which pulls in sklearn/scipy and
+        triggers a glog static-initializer segfault on PaddlePaddle 3.3.1).
+        """
+        eos_token_ids = []
+        if tokenizer.eos_token_id is not None:
+            eos_token_ids.append(tokenizer.eos_token_id)
+        if generation_config is not None and generation_config.eos_token_id is not None:
+            if isinstance(generation_config.eos_token_id, int):
+                eos_token_ids.append(generation_config.eos_token_id)
+            else:
+                eos_token_ids.extend(generation_config.eos_token_id)
+        # Deduplicate while preserving order
+        seen = set()
+        result = []
+        for eid in eos_token_ids:
+            if eid not in seen:
+                seen.add(eid)
+                result.append(eid)
+        return result
 
     # ------------------------------------------------------------------
     # ids2tokens

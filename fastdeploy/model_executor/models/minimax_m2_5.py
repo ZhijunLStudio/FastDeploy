@@ -359,6 +359,7 @@ class MiniMaxM2_5MoE(nn.Layer):
         # renormalize=True: MiniMax-M2.5 normalizes top-k weights by their sum
         self.experts = FusedMoE(
             fd_config,
+            hidden_size=fd_config.model_config.hidden_size,
             renormalize=True,
             moe_intermediate_size=fd_config.model_config.intermediate_size,
             num_experts=num_experts,

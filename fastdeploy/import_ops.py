@@ -27,6 +27,10 @@ from fastdeploy.utils import llm_logger as logger
 # Populated on first load, reused for subsequent calls.
 _PD_OP_NAMES = None
 
+# Global flag: has fastdeploy_ops_pd_.so been loaded via load_op_meta_info_and_register_op?
+# Set on first successful load, prevents re-loading (which would crash PaddlePaddle).
+_PD_SO_LOADED = False
+
 
 def import_custom_ops(package, module_name, global_ns):
     """
@@ -40,7 +44,7 @@ def import_custom_ops(package, module_name, global_ns):
     # Load custom ops from fastdeploy_ops_pd_.so (DeepGEMM build).
     # This .so contains all ops including get_token_penalty_multi_scores,
     # gptq_marlin_repack, etc.
-    pd_loaded = _load_pd_ops(package, global_ns)
+    pd_loaded = _load_pd_ops(package, module_name, global_ns)
 
     if not pd_loaded:
         # pd_.so not available — fallback to fastdeploy_ops.so if it exists
@@ -71,16 +75,19 @@ def _extract_op_names_from_py(pd_so_path):
     """
     try:
         py_path = os.path.join(os.path.dirname(pd_so_path), 'fastdeploy_ops.py')
-        if os.path.exists(py_path):
-            op_names = []
-            with open(py_path, 'r') as f:
-                for line in f:
-                    m = re.match(r'^def (static_op_\w+)\(', line)
-                    if m:
-                        op_names.append(m.group(1))
-            if op_names:
-                logger.debug(f"Extracted {len(op_names)} op names from {py_path}")
-                return op_names
+        # Also check __init__.py which may contain the op wrappers
+        init_path = os.path.join(os.path.dirname(pd_so_path), '__init__.py')
+        for candidate_path in [py_path, init_path]:
+            if os.path.exists(candidate_path):
+                op_names = []
+                with open(candidate_path, 'r') as f:
+                    for line in f:
+                        m = re.match(r'^def (static_op_\w+)\(', line)
+                        if m:
+                            op_names.append(m.group(1))
+                if op_names:
+                    logger.debug(f"Extracted {len(op_names)} op names from {candidate_path}")
+                    return op_names
     except Exception as e:
         logger.debug(f"Failed to extract op names from .py: {e}")
     return []
@@ -118,37 +125,47 @@ def _find_pd_so(package):
     return None
 
 
-def _load_pd_ops(package, global_ns):
+def _load_pd_ops(package, module_name, global_ns):
     """Load custom ops from fastdeploy_ops_pd_.so.
 
     Returns True if ops were loaded successfully, False otherwise.
     """
+    global _PD_SO_LOADED, _PD_OP_NAMES
+
+    # Global guard: if pd_.so was already loaded (by cpu/gcu/gpu module),
+    # skip the load_op_meta_info_and_register_op call — calling it twice
+    # crashes PaddlePaddle with "meta info register failed".
+    if _PD_SO_LOADED:
+        # Still populate wrappers in this namespace
+        for op_name in (_PD_OP_NAMES or []):
+            short_name = op_name.removeprefix("static_op_")
+            if short_name not in global_ns:
+                global_ns[short_name] = _make_op_fn(op_name)
+            if op_name not in global_ns:
+                global_ns[op_name] = _make_op_fn(op_name)
+        return True
+
     pd_so_path = _find_pd_so(package)
     if pd_so_path is None:
         logger.debug("fastdeploy_ops_pd_.so not found, skipping")
         return False
 
-    # Check if ops are already available
+    # Check if ops are already available in this namespace
     if global_ns.get('get_token_penalty_multi_scores') is not None:
-        logger.debug("PD ops already available, skipping load")
+        logger.debug("PD ops already available in namespace, skipping load")
         return True
 
     try:
-        # Prevent fastdeploy_ops.py from being imported during pd_.so loading.
-        # If fastdeploy_ops.py is imported, its __bootstrap__() will try to
-        # load fastdeploy_ops_pd_.so again, causing op registration conflicts.
-        _block_bootstrap()
+        # Prevent the ops module's __bootstrap__() from running during import.
+        # If __bootstrap__() runs, it will load fastdeploy_ops_pd_.so again,
+        # causing op registration conflicts.
+        _block_bootstrap(module_name, package)
 
-        # Load the .so and register ops with PaddlePaddle.
-        # Note: load_op_meta_info_and_register_op returns ops registered in THIS
-        # call only. If another module already loaded this .so, it returns empty.
-        # We always call it to ensure ops are registered, even if already loaded.
+        # Load the .so and register ops with PaddlePaddle (only once globally).
         paddle.utils.cpp_extension.load_op_meta_info_and_register_op(pd_so_path)
+        _PD_SO_LOADED = True
 
         # Create wrappers for all known op names, regardless of return value.
-        # The _PD_OP_NAMES list is populated on first load and reused for
-        # subsequent calls.
-        global _PD_OP_NAMES
         if _PD_OP_NAMES is None:
             _PD_OP_NAMES = _extract_op_names_from_py(pd_so_path)
 
@@ -179,25 +196,36 @@ def _make_op_fn(op_name):
 
 
 _PD_BOOTSTRAP_BLOCKED = False
+_PD_BOOTSTRAP_BLOCK_KEY = None
 
 
-def _block_bootstrap():
-    """Prevent fastdeploy_ops.py's __bootstrap__() from running during import."""
-    global _PD_BOOTSTRAP_BLOCKED
+def _block_bootstrap(module_name, package):
+    """Prevent the ops module's __bootstrap__() from running during import.
+
+    Inserts a dummy module into sys.modules at the resolved module path so that
+    importlib.import_module() returns the dummy instead of loading the real .py
+    (which would call __bootstrap__() and re-register ops).
+    """
+    global _PD_BOOTSTRAP_BLOCKED, _PD_BOOTSTRAP_BLOCK_KEY
     _PD_BOOTSTRAP_BLOCKED = True
+    # Resolve full dotted path: e.g. "fastdeploy.model_executor.ops.gpu.fastdeploy_ops.fastdeploy_ops"
+    full_path = (package + module_name).lstrip('.')
+    _PD_BOOTSTRAP_BLOCK_KEY = full_path
+
     class _DummyOpsModule:
         pass
-    sys.modules['fastdeploy.model_executor.ops.gpu.fastdeploy_ops_80.fastdeploy_ops'] = _DummyOpsModule()
+    sys.modules[full_path] = _DummyOpsModule()
 
 
 def _unblock_bootstrap():
     """Remove the dummy module block."""
-    global _PD_BOOTSTRAP_BLOCKED
+    global _PD_BOOTSTRAP_BLOCKED, _PD_BOOTSTRAP_BLOCK_KEY
     _PD_BOOTSTRAP_BLOCKED = False
-    key = 'fastdeploy.model_executor.ops.gpu.fastdeploy_ops_80.fastdeploy_ops'
-    mod = sys.modules.get(key)
-    if mod is not None and mod.__class__.__name__ == '_DummyOpsModule':
-        del sys.modules[key]
+    if _PD_BOOTSTRAP_BLOCK_KEY and _PD_BOOTSTRAP_BLOCK_KEY in sys.modules:
+        mod = sys.modules[_PD_BOOTSTRAP_BLOCK_KEY]
+        if mod.__class__.__name__ == '_DummyOpsModule':
+            del sys.modules[_PD_BOOTSTRAP_BLOCK_KEY]
+    _PD_BOOTSTRAP_BLOCK_KEY = None
 
 
 def rename_imported_op(old_name, new_name, global_ns):
