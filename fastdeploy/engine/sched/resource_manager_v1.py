@@ -1338,6 +1338,8 @@ class ResourceManagerV1(ResourceManager):
         Match and fetch cache for a task.
         """
         try:
+            trace_print(LoggingEventName.PREPARE_PREFIX_CACHE_START, request.request_id, getattr(request, "user", ""))
+
             (common_block_ids, matched_token_num, metrics) = self._request_match_blocks(
                 request  # skip_storage 使用默认值 True
             )
@@ -1378,10 +1380,13 @@ class ResourceManagerV1(ResourceManager):
                 request.metrics.storage_cache_token_num = metrics["storage_match_token_num"]
                 request.metrics.cpu_cache_prepare_time = metrics["cpu_cache_prepare_time"]
                 request.metrics.storage_cache_prepare_time = metrics["storage_cache_prepare_time"]
+                request.metrics.prompt_token_ids_len = request.prompt_token_ids_len
 
                 main_process_metrics.prefix_cache_token_num.inc(request.num_computed_tokens)
                 main_process_metrics.prefix_gpu_cache_token_num.inc(request.metrics.gpu_cache_token_num)
                 main_process_metrics.prefix_cpu_cache_token_num.inc(request.metrics.cpu_cache_token_num)
+
+            trace_print(LoggingEventName.PREPARE_PREFIX_CACHE_END, request.request_id, getattr(request, "user", ""))
 
             return True
         except Exception as e:
@@ -1502,7 +1507,6 @@ class ResourceManagerV1(ResourceManager):
             request.disaggregate_info["block_tables"] = request.block_tables
             allocated_position = self.get_available_position()
             request.idx = allocated_position
-            self.tasks_list[request.idx] = request
             self.stop_flags[request.idx] = False
             self.requests[request.request_id] = request
             self.req_dict[request.request_id] = allocated_position
@@ -1546,6 +1550,8 @@ class ResourceManagerV1(ResourceManager):
             request.metrics = copy.deepcopy(request_output.metrics)
             request.metrics.decode_inference_start_time = time.time()
             request.metrics.update_decoder_start_time()
+
+            self.tasks_list[request.idx] = request
             self.running.append(request)
 
     def _free_blocks(self, request: Request):
@@ -1647,7 +1653,8 @@ class ResourceManagerV1(ResourceManager):
         blocks_used_by_tasks = set()
         for task in self.tasks_list:
             if task is not None:
-                blocks_used_by_tasks.update(task.block_tables)
+                blocks_used_by_tasks.update(getattr(task, "block_tables", []))
+                blocks_used_by_tasks.update(getattr(task, "extend_block_tables", []))
         main_process_metrics.available_gpu_block_num.set(self.total_block_number() - len(blocks_used_by_tasks))
         main_process_metrics.batch_size.set(self.max_num_seqs - self.available_batch())
         main_process_metrics.gpu_cache_usage_perc.set(self.get_gpu_cache_usage_perc())
@@ -1680,6 +1687,13 @@ class ResourceManagerV1(ResourceManager):
         total_blocks = self.total_block_number()
         free_blocks = self.available_block_num()
         used_blocks = max(total_blocks - free_blocks, 0)
+        # Evictable = used blocks not held by any running task
+        blocks_used_by_tasks = set()
+        for task in self.tasks_list:
+            if task is not None:
+                blocks_used_by_tasks.update(getattr(task, "block_tables", []))
+                blocks_used_by_tasks.update(getattr(task, "extend_block_tables", []))
+        evictable_blocks = used_blocks - len(blocks_used_by_tasks)
         tokens_used = used_blocks * self.config.cache_config.block_size
         token_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
         running_cnt = len(self.running)
@@ -1695,6 +1709,8 @@ class ResourceManagerV1(ResourceManager):
             queue_cnt=queue_cnt,
             tokens_used=tokens_used,
             token_usage=token_usage,
+            free_blocks=free_blocks,
+            evictable_blocks=evictable_blocks,
         )
         if has_decode:
             has_prefill = len(prefill_reqs) > 0
@@ -1720,4 +1736,6 @@ class ResourceManagerV1(ResourceManager):
                 tokens_used=tokens_used,
                 token_usage=token_usage,
                 use_cudagraph=use_decode_cudagraph,
+                free_blocks=free_blocks,
+                evictable_blocks=evictable_blocks,
             )
