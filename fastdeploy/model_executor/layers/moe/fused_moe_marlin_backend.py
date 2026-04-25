@@ -794,9 +794,15 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             )
             mask = valid.cast("float32")                      # [M]
 
-            gate_w = gate_all[safe_eid]                       # [M, interm, hidden]
-            up_w = up_all[safe_eid]                           # [M, interm, hidden]
-            down_w = down_all[safe_eid]                       # [M, hidden, interm]
+            # Reshape to 2D before gather to avoid gather_nd on 3D tensors
+            interm_size = gate_all.shape[1]
+            gate_flat = gate_all.reshape([num_local, -1])        # [E, interm*hidden]
+            up_flat = up_all.reshape([num_local, -1])
+            down_flat = down_all.reshape([num_local, -1])        # [E, hidden*interm]
+
+            gate_w = paddle.gather(gate_flat, safe_eid, axis=0).reshape([M, interm_size, hidden_size])
+            up_w = paddle.gather(up_flat, safe_eid, axis=0).reshape([M, interm_size, hidden_size])
+            down_w = paddle.gather(down_flat, safe_eid, axis=0).reshape([M, hidden_size, interm_size])
 
             tok = x_bf16.unsqueeze(1)                         # [M, 1, hidden]
             g = paddle.bmm(tok, gate_w.transpose([0, 2, 1]))  # [M, 1, interm]
