@@ -478,6 +478,24 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         if topk_ids_hookfunc is not None:
             topk_ids_hookfunc(topk_ids=topk_ids)
 
+        # SM80 (A100): route to BF16 bmm path (skip Marlin kernel)
+        from fastdeploy.model_executor.utils import get_sm_version
+        from fastdeploy.platforms import current_platform
+
+        if self.weight_type == "fp8" and get_sm_version() < 90 and current_platform.is_cuda():
+            if hasattr(layer, "_sm80_gate"):
+                ep_group = getattr(layer, "ep_group", None)
+                return self._apply_ep_sm80_bf16(
+                    layer,
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    token_num,
+                    hidden_size,
+                    top_k,
+                    ep_group,
+                )
+
         block_size_m = 64
         for m in [8, 16, 32, 48, 64]:
             if token_num * top_k / num_experts / m < 0.9:
@@ -733,8 +751,9 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         # Weighted sum: [M*top_k, hidden] -> [M, hidden]
         ffn_out = ffn_out.reshape([M, top_k, hidden_size]).sum(axis=1)
 
-        # All-reduce across EP ranks to sum local expert outputs
-        paddle.distributed.all_reduce(ffn_out, group=ep_group)
+        # All-reduce across EP ranks to sum local expert outputs (skip if ep_group is None)
+        if ep_group is not None:
+            paddle.distributed.all_reduce(ffn_out, group=ep_group)
 
         return ffn_out
 
@@ -779,7 +798,8 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
         if not active:
             # Must use float32 to match the all_reduce dtype on other ranks
             ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
-            paddle.distributed.all_reduce(ffn_out, group=ep_group)
+            if ep_group is not None:
+                paddle.distributed.all_reduce(ffn_out, group=ep_group)
             ffn_out = ffn_out.cast(x.dtype)
             return ffn_out
 
@@ -831,7 +851,8 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             ffn_out = paddle.index_put(ffn_out, [tok_idx], wo, accumulate=True)
             del wo, tok_idx
 
-        paddle.distributed.all_reduce(ffn_out, group=ep_group)
+        if ep_group is not None:
+            paddle.distributed.all_reduce(ffn_out, group=ep_group)
         ffn_out = ffn_out.cast(x.dtype)
 
         return ffn_out
