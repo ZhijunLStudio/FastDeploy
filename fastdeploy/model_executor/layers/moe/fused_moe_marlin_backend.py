@@ -770,86 +770,49 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
     ) -> paddle.Tensor:
         """
         SM80 (A100) fallback: use pre-stacked BF16 expert weights on GPU.
-        Batched GEMM with paddle.bmm for all active experts at once.
+        Per-selection batched GEMM with paddle.bmm. CUDA graph compatible:
+        no numpy(), no data-dependent Python loops, no dynamic tensor creation.
         """
-
-        gate_all = layer._sm80_gate  # [E, 1536, 3072]
-        up_all = layer._sm80_up  # [E, 1536, 3072]
-        down_all = layer._sm80_down  # [E, 1536, 3072]
+        gate_all = layer._sm80_gate   # [local_E, interm, hidden]
+        up_all = layer._sm80_up       # [local_E, interm, hidden]
+        down_all = layer._sm80_down   # [local_E, hidden, interm]
         local_start = layer.expert_id_offset
-
-        topk_ids_np = topk_ids.numpy()  # [M, top_k]
-        topk_weights_np = topk_weights.numpy()
-
-        # Build per-expert token list
         num_local = gate_all.shape[0]
-        expert_rows = [[] for _ in range(num_local)]
-        expert_wts = [[] for _ in range(num_local)]
-        for r in range(M):
-            for c in range(top_k):
-                eid = int(topk_ids_np[r, c])
-                if local_start <= eid < local_start + num_local:
-                    lid = eid - local_start
-                    expert_rows[lid].append(r)
-                    expert_wts[lid].append(float(topk_weights_np[r, c]))
-
-        active = [lid for lid in range(num_local) if expert_rows[lid]]
-
-        if not active:
-            # Must use float32 to match the all_reduce dtype on other ranks
-            ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
-            if ep_group is not None:
-                paddle.distributed.all_reduce(ffn_out, group=ep_group)
-            ffn_out = ffn_out.cast(x.dtype)
-            return ffn_out
 
         x_bf16 = x.cast("bfloat16")
         ffn_out = paddle.zeros([M, hidden_size], dtype="float32")
 
-        # Batched GEMM: group experts by token count to avoid padding overhead
-        from collections import defaultdict
+        for k in range(top_k):
+            eid_global = topk_ids[:, k]                      # [M] global expert ID
+            local_eid = eid_global - local_start              # [M] local ID
+            wt = topk_weights[:, k]                           # [M]
 
-        groups = defaultdict(list)
-        for lid in active:
-            n_tok = len(expert_rows[lid])
-            if n_tok > 0:
-                groups[n_tok].append(lid)
+            # Zero-out non-local experts via validity mask
+            valid = (local_eid >= 0) & (local_eid < num_local)
+            safe_eid = paddle.where(
+                valid, local_eid, paddle.zeros([], dtype=local_eid.dtype)
+            )
+            mask = valid.cast("float32")                      # [M]
 
-        for n_tok, lids in groups.items():
-            A = len(lids)
+            gate_w = gate_all[safe_eid]                       # [M, interm, hidden]
+            up_w = up_all[safe_eid]                           # [M, interm, hidden]
+            down_w = down_all[safe_eid]                       # [M, hidden, interm]
 
-            all_rows = []
-            all_wts = []
-            for lid in lids:
-                all_rows.extend(expert_rows[lid])
-                all_wts.extend(expert_wts[lid])
-
-            tok_idx = paddle.to_tensor(all_rows, dtype="int64")
-            tok = x_bf16[tok_idx]
-            tok = tok.reshape([A, n_tok, hidden_size])
-
-            active_idx = paddle.to_tensor(lids, dtype="int64")
-            gate_w = gate_all[active_idx]
-            up_w = up_all[active_idx]
-
-            g = paddle.bmm(tok, gate_w.transpose([0, 2, 1]))
+            tok = x_bf16.unsqueeze(1)                         # [M, 1, hidden]
+            g = paddle.bmm(tok, gate_w.transpose([0, 2, 1]))  # [M, 1, interm]
             u = paddle.bmm(tok, up_w.transpose([0, 2, 1]))
             del tok, gate_w, up_w
 
             sw = paddle.nn.functional.swiglu(paddle.concat([g, u], -1))
             del g, u
 
-            down_w = down_all[active_idx]
-            o = paddle.bmm(sw, down_w.transpose([0, 2, 1]))
-            del sw, down_w, active_idx
+            o = paddle.bmm(sw, down_w.transpose([0, 2, 1]))  # [M, 1, hidden]
+            del sw, down_w
 
-            wt = paddle.to_tensor(all_wts, dtype="float32").reshape([A, n_tok, 1])
-            wo = o.cast("float32") * wt
-            del o, wt
-            wo = wo.reshape([A * n_tok, hidden_size])
-
-            ffn_out = paddle.index_put(ffn_out, [tok_idx], wo, accumulate=True)
-            del wo, tok_idx
+            wo = o.cast("float32").squeeze(1) * wt.unsqueeze(1) * mask.unsqueeze(1)
+            del o, wt, mask
+            ffn_out = ffn_out + wo
+            del wo
 
         if ep_group is not None:
             paddle.distributed.all_reduce(ffn_out, group=ep_group)
