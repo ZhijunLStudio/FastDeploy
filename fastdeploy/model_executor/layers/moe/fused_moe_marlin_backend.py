@@ -794,15 +794,20 @@ class MarlinWeightOnlyMoEMethod(QuantMethodBase):
             )
             mask = valid.cast("float32")                      # [M]
 
-            # Reshape to 2D before gather to avoid gather_nd on 3D tensors
+            # Use matmul with one-hot encoding instead of gather/index_select
+            # to avoid gather_nd OOM during CUDA graph capture
             interm_size = gate_all.shape[1]
             gate_flat = gate_all.reshape([num_local, -1])        # [E, interm*hidden]
             up_flat = up_all.reshape([num_local, -1])
             down_flat = down_all.reshape([num_local, -1])        # [E, hidden*interm]
 
-            gate_w = paddle.gather(gate_flat, safe_eid, axis=0).reshape([M, interm_size, hidden_size])
-            up_w = paddle.gather(up_flat, safe_eid, axis=0).reshape([M, interm_size, hidden_size])
-            down_w = paddle.gather(down_flat, safe_eid, axis=0).reshape([M, hidden_size, interm_size])
+            # One-hot encode expert indices: [M] -> [M, E]
+            one_hot = paddle.nn.functional.one_hot(safe_eid, num_local).cast("bfloat16")
+            # Select via matmul: [M, E] x [E, interm*hidden] -> [M, interm*hidden]
+            gate_w = paddle.matmul(one_hot, gate_flat).reshape([M, interm_size, hidden_size])
+            up_w = paddle.matmul(one_hot, up_flat).reshape([M, interm_size, hidden_size])
+            down_w = paddle.matmul(one_hot, down_flat).reshape([M, hidden_size, interm_size])
+            del one_hot, gate_flat, up_flat, down_flat
 
             tok = x_bf16.unsqueeze(1)                         # [M, 1, hidden]
             g = paddle.bmm(tok, gate_w.transpose([0, 2, 1]))  # [M, 1, interm]
