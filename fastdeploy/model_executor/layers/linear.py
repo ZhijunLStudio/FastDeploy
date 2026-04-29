@@ -28,12 +28,12 @@ from fastdeploy.distributed.communication import (
 from fastdeploy.model_executor.layers.quantization.quant_base import QuantMethodBase
 from fastdeploy.model_executor.utils import (
     default_weight_loader,
+    get_sm_version,
     h2d_copy,
     process_weight_transpose,
     set_weight_attrs,
     slice_fn,
 )
-from fastdeploy.model_executor.utils import get_sm_version
 from fastdeploy.platforms import current_platform
 
 from .utils import _set_var_distributed, divide, get_tensor, modules_to_convert
