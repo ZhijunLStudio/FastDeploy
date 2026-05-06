@@ -187,7 +187,7 @@ def deep_gemm_fp8_gemm_nt(
                 linear_out,
             )
             if bias is not None:
-                linear_out = paddle.add(linear_out, bias)
+                linear_out.add_(bias)
     else:
         fp8_gemm_nt(
             (x, x_scale_tensor),
@@ -441,7 +441,7 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
             )
             x_scale_tensor = x_scale_tensor.T[: x.shape[0], ...]
 
-        if get_sm_version() == 100 and current_platform.is_cuda():
+        if get_sm_version() >= 100 and current_platform.is_cuda():
             deep_gemm_fp8_gemm_nt(
                 x,
                 x_scale_tensor,
@@ -462,5 +462,4 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
             )
             if layer.with_bias:
                 linear_out = paddle.add(linear_out, layer.bias)
-
         return linear_out
