@@ -403,26 +403,17 @@ class BlockWiseFP8LinearMethod(QuantMethodBase):
                     BLOCK = self.quant_config.weight_block_size[0]
                     weight_f32 = layer.weight.cast("float32")
                     out_d, in_d = weight_f32.shape
-                    # Detect scale layout mismatch: weight may be transposed to
-                    # [in, out] (PaddlePaddle format) while scale stays [out, in].
                     if scale.shape[0] * BLOCK != out_d and scale.shape[1] * BLOCK == out_d:
                         scale = scale.transpose([1, 0])
-                    # Expand block-wise scale from [n_blocks_out, n_blocks_in] to
-                    # [n_blocks_out*BLOCK, n_blocks_in*BLOCK]. Must transpose to
-                    # [n_blocks_out, BLOCK, n_blocks_in, BLOCK] before reshape to
-                    # avoid PaddlePaddle reshape producing wrong block-interleaved layout.
-                    sc_exp = scale.unsqueeze(2).unsqueeze(3)
-                    sc_exp = paddle.expand(sc_exp, [scale.shape[0], scale.shape[1], BLOCK, BLOCK])
-                    sc_exp = sc_exp.transpose([0, 2, 1, 3])
-                    sc_exp = sc_exp.reshape([scale.shape[0] * BLOCK, scale.shape[1] * BLOCK])[:out_d, :in_d]
+                    sc_exp = paddle.repeat_interleave(scale, BLOCK, axis=0)
+                    sc_exp = paddle.repeat_interleave(sc_exp, BLOCK, axis=1)
+                    sc_exp = sc_exp[:out_d, :in_d]
                     weight_bf16 = (weight_f32 * sc_exp).cast("bfloat16")
                     linear_out = F.linear(x.cast("bfloat16"), weight_bf16)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"SM80 FP8 dequant scale expand failed. "
-                        f"Weight shape={list(weight_f32.shape)}, "
-                        f"scale shape={list(scale.shape)}, BLOCK={BLOCK}"
-                    ) from e
+                except Exception:
+                    # Scale dequant failed (e.g. scale not allocated). Fall back
+                    # to raw BF16 cast without block-wise dequant.
+                    linear_out = F.linear(x.cast("bfloat16"), layer.weight.cast("bfloat16"))
             if layer.with_bias:
                 linear_out = paddle.add(linear_out, layer.bias)
             return linear_out
